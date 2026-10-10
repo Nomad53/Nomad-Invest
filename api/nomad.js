@@ -3,7 +3,7 @@
 const http = require('node:http');
 const crypto = require('node:crypto');
 
-const VERSION = '0.2.4';
+const VERSION = '0.2.5';
 
 const PSX_API_BASE =
   process.env.PSX_API_BASE ||
@@ -786,6 +786,12 @@ h1 {
   padding: 15px 18px;
 }
 
+button,
+input,
+select {
+  font: inherit;
+}
+
 button {
   background: #173f58;
   color: white;
@@ -793,21 +799,31 @@ button {
   border-radius: 7px;
   padding: 11px 16px;
   cursor: pointer;
-  font: inherit;
 }
 
 button:disabled {
-  opacity: .6;
+  opacity: .5;
+  cursor: not-allowed;
 }
 
-input {
+input,
+select {
   width: 100%;
-  max-width: 440px;
   padding: 11px;
   border: 1px solid #b9c8d5;
   border-radius: 7px;
   box-sizing: border-box;
-  font: inherit;
+  background: white;
+}
+
+.filters {
+  display: grid;
+  grid-template-columns:
+    minmax(220px, 2fr)
+    minmax(180px, 1fr)
+    minmax(200px, 1fr);
+  gap: 12px;
+  margin: 18px 0;
 }
 
 table {
@@ -826,6 +842,14 @@ td {
 
 th {
   background: #f7f9fb;
+}
+
+tbody tr {
+  cursor: pointer;
+}
+
+tbody tr:hover {
+  background: #f2f7fb;
 }
 
 .scroll {
@@ -858,11 +882,46 @@ th {
   margin: 16px 0;
 }
 
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 18px;
+}
+
+.paginationControls {
+  display: flex;
+  gap: 8px;
+}
+
 pre {
   overflow-x: auto;
   background: #f6f8fa;
   padding: 15px;
   border-radius: 8px;
+  white-space: pre-wrap;
+}
+
+@media(max-width: 800px) {
+
+  main {
+    padding: 16px;
+  }
+
+  header {
+    display: block;
+  }
+
+  .filters {
+    grid-template-columns: 1fr;
+  }
+
+  .pagination {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
 }
 
 </style>
@@ -908,43 +967,20 @@ Checking connection...
 
 <p id="error"></p>
 
-<section class="card">
+<!-- STOCK RESEARCH FIRST -->
 
-<h2>
-Explore PSX
-</h2>
-
-<div class="actions">
-
-<button id="loadMarket">
-Load market data
-</button>
-
-</div>
-
-<input
-  id="search"
-  type="search"
-  placeholder="Search symbol or sector"
+<section
+  class="card"
+  id="researchSection"
 >
 
-<p
-  id="coverage"
-  class="muted"
-></p>
-
-<div
-  id="stocks"
-  class="scroll"
-></div>
-
-</section>
-
-<section class="card">
-
 <h2>
-Stock research
+Stock Research
 </h2>
+
+<p class="muted">
+Search a stock directly or click any row in the PSX table below.
+</p>
 
 <input
   id="stockSymbol"
@@ -971,6 +1007,133 @@ Fundamentals
 
 </section>
 
+<!-- MARKET -->
+
+<section class="card">
+
+<h2>
+Explore PSX
+</h2>
+
+<div class="actions">
+
+<button id="loadMarket">
+Load market data
+</button>
+
+</div>
+
+<div class="filters">
+
+<div>
+
+<label>
+Search
+</label>
+
+<input
+  id="search"
+  type="search"
+  placeholder="Symbol or sector"
+>
+
+</div>
+
+<div>
+
+<label>
+Sector
+</label>
+
+<select id="sectorFilter">
+
+<option value="">
+All sectors
+</option>
+
+</select>
+
+</div>
+
+<div>
+
+<label>
+Sort
+</label>
+
+<select id="sort">
+
+<option value="symbolAsc">
+Symbol A-Z
+</option>
+
+<option value="priceAsc">
+Lowest price
+</option>
+
+<option value="priceDesc">
+Highest price
+</option>
+
+<option value="changeDesc">
+Best 1Y growth
+</option>
+
+<option value="changeAsc">
+Worst 1Y performance
+</option>
+
+<option value="dividendDesc">
+Highest dividend yield
+</option>
+
+<option value="peAsc">
+Lowest P/E
+</option>
+
+<option value="volumeDesc">
+Highest 30D volume
+</option>
+
+</select>
+
+</div>
+
+</div>
+
+<p
+  id="coverage"
+  class="muted"
+></p>
+
+<div
+  id="stocks"
+  class="scroll"
+></div>
+
+<div class="pagination">
+
+<div
+  id="pageInfo"
+  class="muted"
+></div>
+
+<div class="paginationControls">
+
+<button id="previousPage">
+Previous
+</button>
+
+<button id="nextPage">
+Next
+</button>
+
+</div>
+
+</div>
+
+</section>
+
 </main>
 
 <script>
@@ -979,6 +1142,14 @@ const $ =
   id => document.getElementById(id);
 
 let marketRows = [];
+
+let currentPage = 1;
+
+const PAGE_SIZE = 50;
+
+/* ---------------------------------------
+   Formatting
+--------------------------------------- */
 
 function escapeHtml(value) {
   return String(value).replace(
@@ -1030,6 +1201,10 @@ function formatPercent(value) {
   );
 }
 
+/* ---------------------------------------
+   API
+--------------------------------------- */
+
 async function api(
   action,
   params = {}
@@ -1076,28 +1251,192 @@ async function api(
   return result;
 }
 
-function renderStocks() {
+/* ---------------------------------------
+   Filter / sort
+--------------------------------------- */
+
+function getFilteredRows() {
   const query =
     $('search')
       .value
       .trim()
       .toLowerCase();
 
-  const rows =
+  const sector =
+    $('sectorFilter')
+      .value;
+
+  let rows =
     marketRows.filter(
-      stock =>
-        (
-          stock.symbol +
-          ' ' +
-          stock.sector
-        )
-          .toLowerCase()
-          .includes(query)
+      stock => {
+
+        const matchesSearch =
+          (
+            stock.symbol +
+            ' ' +
+            stock.sector
+          )
+            .toLowerCase()
+            .includes(query);
+
+        const matchesSector =
+          !sector ||
+          stock.sector === sector;
+
+        return (
+          matchesSearch &&
+          matchesSector
+        );
+      }
     );
 
-  if (!rows.length) {
+  const sort =
+    $('sort').value;
+
+  rows =
+    [...rows];
+
+  switch (sort) {
+
+    case 'priceAsc':
+
+      rows.sort(
+        (a, b) =>
+          (a.price ?? Infinity) -
+          (b.price ?? Infinity)
+      );
+
+      break;
+
+    case 'priceDesc':
+
+      rows.sort(
+        (a, b) =>
+          (b.price ?? -Infinity) -
+          (a.price ?? -Infinity)
+      );
+
+      break;
+
+    case 'changeDesc':
+
+      rows.sort(
+        (a, b) =>
+          (b.change1yPct ?? -Infinity) -
+          (a.change1yPct ?? -Infinity)
+      );
+
+      break;
+
+    case 'changeAsc':
+
+      rows.sort(
+        (a, b) =>
+          (a.change1yPct ?? Infinity) -
+          (b.change1yPct ?? Infinity)
+      );
+
+      break;
+
+    case 'dividendDesc':
+
+      rows.sort(
+        (a, b) =>
+          (b.dividendYield ?? -Infinity) -
+          (a.dividendYield ?? -Infinity)
+      );
+
+      break;
+
+    case 'peAsc':
+
+      rows =
+        rows
+          .filter(
+            stock =>
+              stock.peRatio !== null &&
+              stock.peRatio > 0
+          )
+          .sort(
+            (a, b) =>
+              a.peRatio -
+              b.peRatio
+          );
+
+      break;
+
+    case 'volumeDesc':
+
+      rows.sort(
+        (a, b) =>
+          (b.averageVolume30d ?? -Infinity) -
+          (a.averageVolume30d ?? -Infinity)
+      );
+
+      break;
+
+    default:
+
+      rows.sort(
+        (a, b) =>
+          a.symbol.localeCompare(
+            b.symbol
+          )
+      );
+
+  }
+
+  return rows;
+}
+
+/* ---------------------------------------
+   Render table
+--------------------------------------- */
+
+function renderStocks() {
+  const rows =
+    getFilteredRows();
+
+  const pageCount =
+    Math.max(
+      1,
+      Math.ceil(
+        rows.length /
+        PAGE_SIZE
+      )
+    );
+
+  if (
+    currentPage >
+    pageCount
+  ) {
+    currentPage =
+      pageCount;
+  }
+
+  const start =
+    (
+      currentPage - 1
+    ) * PAGE_SIZE;
+
+  const pageRows =
+    rows.slice(
+      start,
+      start + PAGE_SIZE
+    );
+
+  if (!pageRows.length) {
     $('stocks').innerHTML =
       '<p>No matching stocks.</p>';
+
+    $('pageInfo').textContent =
+      '0 results';
+
+    $('previousPage').disabled =
+      true;
+
+    $('nextPage').disabled =
+      true;
 
     return;
   }
@@ -1123,7 +1462,7 @@ function renderStocks() {
 
     '<tbody>' +
 
-    rows.map(stock => {
+    pageRows.map(stock => {
 
       const changeClass =
         stock.change1yPct > 0
@@ -1133,13 +1472,17 @@ function renderStocks() {
             : '';
 
       return (
-        '<tr>' +
-
-        '<td>' +
+        '<tr data-symbol="' +
         escapeHtml(
           stock.symbol
         ) +
-        '</td>' +
+        '">' +
+
+        '<td><strong>' +
+        escapeHtml(
+          stock.symbol
+        ) +
+        '</strong></td>' +
 
         '<td>' +
         escapeHtml(
@@ -1188,7 +1531,107 @@ function renderStocks() {
     '</tbody>' +
 
     '</table>';
+
+  const firstResult =
+    start + 1;
+
+  const lastResult =
+    Math.min(
+      start + PAGE_SIZE,
+      rows.length
+    );
+
+  $('pageInfo').textContent =
+    firstResult +
+    '-' +
+    lastResult +
+    ' of ' +
+    rows.length +
+    ' results | Page ' +
+    currentPage +
+    ' of ' +
+    pageCount;
+
+  $('previousPage').disabled =
+    currentPage <= 1;
+
+  $('nextPage').disabled =
+    currentPage >= pageCount;
+
+  document
+    .querySelectorAll(
+      '#stocks tbody tr'
+    )
+    .forEach(
+      row => {
+
+        row.addEventListener(
+          'click',
+          () => {
+
+            const symbol =
+              row.dataset.symbol;
+
+            $('stockSymbol').value =
+              symbol;
+
+            $('researchSection')
+              .scrollIntoView({
+                behavior: 'smooth',
+                block: 'start'
+              });
+
+          }
+        );
+
+      }
+    );
 }
+
+/* ---------------------------------------
+   Sectors
+--------------------------------------- */
+
+function populateSectors() {
+  const sectors =
+    [
+      ...new Set(
+        marketRows
+          .map(
+            stock =>
+              stock.sector
+          )
+          .filter(
+            sector =>
+              sector &&
+              sector !== 'Unknown'
+          )
+      )
+    ]
+      .sort();
+
+  $('sectorFilter').innerHTML =
+    '<option value="">All sectors</option>' +
+
+    sectors
+      .map(
+        sector =>
+          '<option value="' +
+          escapeHtml(
+            sector
+          ) +
+          '">' +
+          escapeHtml(
+            sector
+          ) +
+          '</option>'
+      )
+      .join('');
+}
+
+/* ---------------------------------------
+   Market load
+--------------------------------------- */
 
 $('loadMarket').onclick =
   async () => {
@@ -1208,24 +1651,126 @@ $('loadMarket').onclick =
       marketRows =
         result.stocks || [];
 
+      currentPage =
+        1;
+
       $('coverage').textContent =
         result.totalStocks +
         ' usable stocks | Updated ' +
         result.asOf;
 
+      populateSectors();
+
       renderStocks();
 
     } catch (error) {
+
       $('error').textContent =
         error.message;
+
     } finally {
+
       $('loadMarket').disabled =
         false;
+
     }
   };
 
+/* ---------------------------------------
+   Filters
+--------------------------------------- */
+
 $('search').oninput =
-  renderStocks;
+  () => {
+
+    currentPage =
+      1;
+
+    renderStocks();
+
+  };
+
+$('sectorFilter').onchange =
+  () => {
+
+    currentPage =
+      1;
+
+    renderStocks();
+
+  };
+
+$('sort').onchange =
+  () => {
+
+    currentPage =
+      1;
+
+    renderStocks();
+
+  };
+
+/* ---------------------------------------
+   Pagination
+--------------------------------------- */
+
+$('previousPage').onclick =
+  () => {
+
+    if (
+      currentPage > 1
+    ) {
+      currentPage--;
+
+      renderStocks();
+
+      document
+        .querySelector(
+          '#stocks'
+        )
+        .scrollIntoView({
+          behavior: 'smooth',
+          block: 'start'
+        });
+    }
+
+  };
+
+$('nextPage').onclick =
+  () => {
+
+    const rows =
+      getFilteredRows();
+
+    const pageCount =
+      Math.ceil(
+        rows.length /
+        PAGE_SIZE
+      );
+
+    if (
+      currentPage <
+      pageCount
+    ) {
+      currentPage++;
+
+      renderStocks();
+
+      document
+        .querySelector(
+          '#stocks'
+        )
+        .scrollIntoView({
+          behavior: 'smooth',
+          block: 'start'
+        });
+    }
+
+  };
+
+/* ---------------------------------------
+   Research
+--------------------------------------- */
 
 $('loadQuote').onclick =
   async () => {
@@ -1254,8 +1799,10 @@ $('loadQuote').onclick =
         );
 
     } catch (error) {
+
       $('error').textContent =
         error.message;
+
     }
   };
 
@@ -1286,8 +1833,10 @@ $('loadHistory').onclick =
         );
 
     } catch (error) {
+
       $('error').textContent =
         error.message;
+
     }
   };
 
@@ -1318,23 +1867,33 @@ $('loadFundamentals').onclick =
         );
 
     } catch (error) {
+
       $('error').textContent =
         error.message;
+
     }
   };
+
+/* ---------------------------------------
+   Health
+--------------------------------------- */
 
 api('health')
   .then(
     result => {
+
       $('status').textContent =
         'Market: connected | Prediction engine: ' +
         result.predictionEngine;
+
     }
   )
   .catch(
     error => {
+
       $('status').textContent =
         error.message;
+
     }
   );
 
