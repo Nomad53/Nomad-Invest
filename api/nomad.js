@@ -3,7 +3,7 @@
 const http = require('node:http');
 const crypto = require('node:crypto');
 
-const VERSION = '0.2.1';
+const VERSION = '0.2.2';
 
 const PSX_API_BASE =
   process.env.PSX_API_BASE ||
@@ -11,6 +11,13 @@ const PSX_API_BASE =
 
 const PSX_SYMBOLS_URL =
   'https://dps.psx.com.pk/symbols';
+
+const PSX_HEADERS = {
+  Accept: 'application/json,text/plain,*/*',
+  'User-Agent': 'Mozilla/5.0',
+  Referer: 'https://dps.psx.com.pk/',
+  'X-Requested-With': 'XMLHttpRequest'
+};
 
 let marketCache = null;
 let symbolsCache = null;
@@ -104,10 +111,8 @@ async function fetchJSON(url, headers = {}) {
   const response = await fetch(url, {
     headers: {
       Accept: 'application/json',
-      'User-Agent': 'NOMAD-Invest/0.2.1',
       ...headers
     },
-
     signal: AbortSignal.timeout(20000)
   });
 
@@ -130,6 +135,19 @@ async function fetchJSON(url, headers = {}) {
     bad(message, response.status);
   }
 
+  const contentType =
+    response.headers.get('content-type') || '';
+
+  if (
+    !contentType.includes('application/json') &&
+    !contentType.includes('text/json')
+  ) {
+    bad(
+      'Data service returned an unexpected response format.',
+      502
+    );
+  }
+
   return response.json();
 }
 
@@ -147,7 +165,8 @@ async function loadSymbolMetadata() {
 
   const rows =
     await fetchJSON(
-      PSX_SYMBOLS_URL
+      PSX_SYMBOLS_URL,
+      PSX_HEADERS
     );
 
   if (!Array.isArray(rows)) {
@@ -346,16 +365,10 @@ async function loadPSXMarket() {
     return marketCache.data;
   }
 
-  const [
-    screener,
-    metadata
-  ] = await Promise.all([
-    fetchJSON(
+  const screener =
+    await fetchJSON(
       `${PSX_API_BASE}/screener`
-    ),
-
-    loadSymbolMetadata()
-  ]);
+    );
 
   if (
     !screener ||
@@ -365,6 +378,23 @@ async function loadPSXMarket() {
       'PSX screener returned an unexpected format.',
       502
     );
+  }
+
+  let metadata = new Map();
+  let metadataStatus = 'unavailable';
+
+  try {
+    metadata =
+      await loadSymbolMetadata();
+
+    metadataStatus =
+      'connected';
+  } catch (error) {
+    metadata =
+      new Map();
+
+    metadataStatus =
+      'fallback mode';
   }
 
   const timestamp =
@@ -393,13 +423,15 @@ async function loadPSXMarket() {
 
   const result = {
     sourceName:
-      'psxdata-api + PSX symbols',
+      'psxdata-api',
 
     sourceUrl:
       PSX_API_BASE,
 
     metadataSource:
       PSX_SYMBOLS_URL,
+
+    metadataStatus,
 
     asOf:
       timestamp,
@@ -437,18 +469,21 @@ async function getQuote(stockSymbol) {
       `${PSX_API_BASE}/stocks/${encodeURIComponent(sym)}/quote`
     );
 
-  const metadata =
-    await loadSymbolMetadata();
+  let company = null;
+
+  try {
+    const metadata =
+      await loadSymbolMetadata();
+
+    company =
+      metadata.get(sym) || null;
+  } catch {}
 
   return {
     symbol: sym,
-
-    company:
-      metadata.get(sym) || null,
-
+    company,
     quote:
       result.data || null,
-
     meta:
       result.meta || null
   };
@@ -527,19 +562,24 @@ async function getFundamentals(
       `${PSX_API_BASE}/stocks/${encodeURIComponent(sym)}/fundamentals`
     );
 
-  const metadata =
-    await loadSymbolMetadata();
+  let company = null;
+
+  try {
+    const metadata =
+      await loadSymbolMetadata();
+
+    company =
+      metadata.get(sym) || null;
+  } catch {}
 
   return {
     symbol: sym,
-
-    company:
-      metadata.get(sym) || null,
+    company,
 
     data:
       Array.isArray(result.data)
         ? result.data
-        : [],
+        : result.data || null,
 
     meta:
       result.meta || null
@@ -1280,7 +1320,9 @@ $('loadMarket').onclick =
 
       $('coverage').textContent =
         result.totalStocks +
-        ' usable stocks | Updated ' +
+        ' usable stocks | Metadata: ' +
+        result.metadataStatus +
+        ' | Updated ' +
         result.asOf;
 
       renderStocks();
@@ -1299,6 +1341,8 @@ $('search').oninput =
 
 $('loadQuote').onclick =
   async () => {
+
+    $('error').textContent = '';
 
     try {
       const result =
@@ -1329,6 +1373,8 @@ $('loadQuote').onclick =
 $('loadHistory').onclick =
   async () => {
 
+    $('error').textContent = '';
+
     try {
       const result =
         await api(
@@ -1357,6 +1403,8 @@ $('loadHistory').onclick =
 
 $('loadFundamentals').onclick =
   async () => {
+
+    $('error').textContent = '';
 
     try {
       const result =
@@ -1388,7 +1436,7 @@ api('health')
   .then(
     result => {
       $('status').textContent =
-        'Market: connected | Company metadata: connected | Prediction engine: ' +
+        'Market: connected | Prediction engine: ' +
         result.predictionEngine;
     }
   )
