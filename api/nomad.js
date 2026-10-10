@@ -3,7 +3,7 @@
 const http = require('node:http');
 const crypto = require('node:crypto');
 
-const VERSION = '0.2.3';
+const VERSION = '0.2.4';
 
 const PSX_API_BASE =
   process.env.PSX_API_BASE ||
@@ -41,42 +41,6 @@ function safeNumber(value) {
   return Number.isFinite(parsed)
     ? parsed
     : null;
-}
-
-function pick(object, keys) {
-  if (!object || typeof object !== 'object') {
-    return null;
-  }
-
-  for (const key of keys) {
-    if (
-      object[key] !== undefined &&
-      object[key] !== null
-    ) {
-      return object[key];
-    }
-  }
-
-  return null;
-}
-
-function text(object, keys, fallback = '') {
-  const value = pick(object, keys);
-
-  if (
-    value === null ||
-    value === undefined
-  ) {
-    return fallback;
-  }
-
-  return String(value).trim();
-}
-
-function number(object, keys) {
-  return safeNumber(
-    pick(object, keys)
-  );
 }
 
 function normalizeSymbol(value) {
@@ -144,23 +108,21 @@ async function loadSectorMap() {
       `${PSX_API_BASE}/sectors`
     );
 
-  if (!Array.isArray(response.data)) {
-    return new Map();
-  }
+  const map = new Map();
 
-  const sectorMap = new Map();
+  if (!Array.isArray(response.data)) {
+    return map;
+  }
 
   for (const sectorRow of response.data) {
     const sectorName =
-      text(
-        sectorRow,
-        [
-          'sector',
-          'name',
-          'sector_name',
-          'sectorName'
-        ]
-      );
+      String(
+        sectorRow.sector ||
+        sectorRow.name ||
+        sectorRow.sector_name ||
+        sectorRow.sectorName ||
+        ''
+      ).trim();
 
     if (!sectorName) {
       continue;
@@ -177,20 +139,18 @@ async function loadSectorMap() {
       }
 
       for (const item of stocksResponse.data) {
-        const sym =
+        const symbol =
           typeof item === 'string'
             ? normalizeSymbol(item)
             : normalizeSymbol(
-                pick(item, [
-                  'symbol',
-                  'SYMBOL',
-                  'ticker'
-                ])
+                item.symbol ||
+                item.SYMBOL ||
+                item.ticker
               );
 
-        if (sym) {
-          sectorMap.set(
-            sym,
+        if (symbol) {
+          map.set(
+            symbol,
             sectorName
           );
         }
@@ -202,14 +162,14 @@ async function loadSectorMap() {
 
   sectorCache = {
     fetchedAt: Date.now(),
-    data: sectorMap
+    data: map
   };
 
-  return sectorMap;
+  return map;
 }
 
 /* --------------------------------------------------
-   Screener row
+   Screener mapping
 -------------------------------------------------- */
 
 function normalizeScreenerRow(
@@ -217,60 +177,19 @@ function normalizeScreenerRow(
   sectorMap,
   timestamp
 ) {
-  const sym =
+  const symbol =
     normalizeSymbol(
-      pick(row, [
-        'symbol',
-        'SYMBOL'
-      ])
+      row.symbol
     );
 
-  if (!sym) {
+  if (!symbol) {
     return null;
   }
 
-  const ldcp =
-    number(row, [
-      'ldcp',
-      'LDCP'
-    ]);
-
-  const current =
-    number(row, [
-      'current',
-      'CURRENT',
-      'price',
-      'PRICE'
-    ]);
-
-  const open =
-    number(row, [
-      'open',
-      'OPEN'
-    ]);
-
-  const high =
-    number(row, [
-      'high',
-      'HIGH'
-    ]);
-
-  const low =
-    number(row, [
-      'low',
-      'LOW'
-    ]);
-
-  const volume =
-    number(row, [
-      'volume',
-      'VOLUME'
-    ]);
-
   const price =
-    current !== null
-      ? current
-      : ldcp;
+    safeNumber(
+      row.price
+    );
 
   if (
     price === null ||
@@ -279,44 +198,62 @@ function normalizeScreenerRow(
     return null;
   }
 
-  let change = null;
-  let changePercent = null;
-
-  if (
-    current !== null &&
-    ldcp !== null &&
-    ldcp !== 0
-  ) {
-    change =
-      current - ldcp;
-
-    changePercent =
-      (change / ldcp) * 100;
-  }
-
   return {
-    symbol: sym,
-
-    name: sym,
+    symbol,
 
     sector:
-      sectorMap.get(sym) ||
+      sectorMap.get(symbol) ||
       'Unknown',
 
+    sectorCode:
+      safeNumber(
+        row.sector
+      ),
+
+    listedIn:
+      String(
+        row.listed_in || ''
+      ).trim(),
+
     price,
-    ldcp,
-    open,
-    high,
-    low,
-    volume,
-    change,
-    changePercent,
-    asOf: timestamp
+
+    peRatio:
+      safeNumber(
+        row.pe_ratio
+      ),
+
+    dividendYield:
+      safeNumber(
+        row.dividend_yield
+      ),
+
+    marketCap:
+      safeNumber(
+        row.market_cap
+      ),
+
+    freeFloat:
+      safeNumber(
+        row.free_float
+      ),
+
+    averageVolume30d:
+      safeNumber(
+        row.volume_avg_30d
+      ),
+
+    change1yPct:
+      safeNumber(
+        row.change_1y_pct
+      ),
+
+    asOf:
+      timestamp
   };
 }
 
 /* --------------------------------------------------
-   Market
+   Market universe
 -------------------------------------------------- */
 
 async function loadPSXMarket() {
@@ -393,24 +330,28 @@ async function loadPSXMarket() {
 }
 
 /* --------------------------------------------------
-   Research endpoints
+   Individual stock research
 -------------------------------------------------- */
 
 async function getQuote(stockSymbol) {
-  const sym =
-    normalizeSymbol(stockSymbol);
+  const symbol =
+    normalizeSymbol(
+      stockSymbol
+    );
 
-  if (!sym) {
-    bad('Enter a PSX symbol.');
+  if (!symbol) {
+    bad(
+      'Enter a PSX symbol.'
+    );
   }
 
   const result =
     await fetchJSON(
-      `${PSX_API_BASE}/stocks/${encodeURIComponent(sym)}/quote`
+      `${PSX_API_BASE}/stocks/${encodeURIComponent(symbol)}/quote`
     );
 
   return {
-    symbol: sym,
+    symbol,
     data:
       result.data || null,
     meta:
@@ -423,11 +364,15 @@ async function getHistory(
   start,
   end
 ) {
-  const sym =
-    normalizeSymbol(stockSymbol);
+  const symbol =
+    normalizeSymbol(
+      stockSymbol
+    );
 
-  if (!sym) {
-    bad('Enter a PSX symbol.');
+  if (!symbol) {
+    bad(
+      'Enter a PSX symbol.'
+    );
   }
 
   const params =
@@ -452,7 +397,7 @@ async function getHistory(
 
   const result =
     await fetchJSON(
-      `${PSX_API_BASE}/stocks/${encodeURIComponent(sym)}/historical${
+      `${PSX_API_BASE}/stocks/${encodeURIComponent(symbol)}/historical${
         query
           ? `?${query}`
           : ''
@@ -460,35 +405,43 @@ async function getHistory(
     );
 
   return {
-    symbol: sym,
+    symbol,
+
     data:
       Array.isArray(result.data)
         ? result.data
         : [],
+
     meta:
       result.meta || null
   };
 }
 
-async function getFundamentals(stockSymbol) {
-  const sym =
-    normalizeSymbol(stockSymbol);
+async function getFundamentals(
+  stockSymbol
+) {
+  const symbol =
+    normalizeSymbol(
+      stockSymbol
+    );
 
-  if (!sym) {
-    bad('Enter a PSX symbol.');
+  if (!symbol) {
+    bad(
+      'Enter a PSX symbol.'
+    );
   }
 
   const result =
     await fetchJSON(
-      `${PSX_API_BASE}/stocks/${encodeURIComponent(sym)}/fundamentals`
+      `${PSX_API_BASE}/stocks/${encodeURIComponent(symbol)}/fundamentals`
     );
 
   return {
-    symbol: sym,
+    symbol,
+
     data:
-      Array.isArray(result.data)
-        ? result.data
-        : result.data || null,
+      result.data || null,
+
     meta:
       result.meta || null
   };
@@ -536,11 +489,12 @@ function authorize(
       Buffer
         .from(
           (
-            request
-              .headers
-              .authorization || ''
-          )
-            .replace(/^Basic /, ''),
+            request.headers.authorization ||
+            ''
+          ).replace(
+            /^Basic /,
+            ''
+          ),
           'base64'
         )
         .toString();
@@ -571,7 +525,7 @@ function authorize(
 }
 
 /* --------------------------------------------------
-   JSON response
+   Response
 -------------------------------------------------- */
 
 function sendJSON(
@@ -763,11 +717,12 @@ async function handler(
 }
 
 /* --------------------------------------------------
-   Interface
+   Browser UI
 -------------------------------------------------- */
 
 function page() {
   return `<!doctype html>
+
 <html lang="en">
 
 <head>
@@ -779,7 +734,9 @@ function page() {
   content="width=device-width,initial-scale=1"
 >
 
-<title>NOMAD Invest</title>
+<title>
+NOMAD Invest
+</title>
 
 <style>
 
@@ -796,15 +753,15 @@ body {
 }
 
 main {
-  max-width: 1150px;
+  max-width: 1200px;
   margin: auto;
   padding: 28px;
 }
 
 header {
   display: flex;
-  justify-content: space-between;
   align-items: center;
+  justify-content: space-between;
 }
 
 h1 {
@@ -920,7 +877,9 @@ pre {
 
 <div>
 
-<h1>NOMAD Invest</h1>
+<h1>
+NOMAD Invest
+</h1>
 
 <div class="sub">
 PSX research and personal investment intelligence
@@ -936,9 +895,10 @@ Build ${VERSION}
 
 <p class="notice">
 
-Market data is connected.
-Prediction and recommendation models are still disabled
-until we build and validate them.
+PSX market data is connected.
+
+The recommendation and prediction engines
+are still disabled until we build and validate them.
 
 </p>
 
@@ -1033,7 +993,10 @@ function escapeHtml(value) {
   );
 }
 
-function formatNumber(value) {
+function formatNumber(
+  value,
+  digits = 2
+) {
   if (
     value === null ||
     value === undefined
@@ -1045,9 +1008,26 @@ function formatNumber(value) {
     .toLocaleString(
       'en-PK',
       {
-        maximumFractionDigits: 2
+        maximumFractionDigits:
+          digits
       }
     );
+}
+
+function formatPercent(value) {
+  if (
+    value === null ||
+    value === undefined
+  ) {
+    return '-';
+  }
+
+  return (
+    formatNumber(
+      value,
+      2
+    ) + '%'
+  );
 }
 
 async function api(
@@ -1126,24 +1106,29 @@ function renderStocks() {
     '<table>' +
 
     '<thead>' +
+
     '<tr>' +
+
     '<th>Symbol</th>' +
     '<th>Sector</th>' +
     '<th>Price</th>' +
-    '<th>Change</th>' +
-    '<th>Change %</th>' +
-    '<th>Volume</th>' +
+    '<th>P/E</th>' +
+    '<th>Dividend Yield</th>' +
+    '<th>30D Avg Volume</th>' +
+    '<th>1Y Change</th>' +
+
     '</tr>' +
+
     '</thead>' +
 
     '<tbody>' +
 
     rows.map(stock => {
 
-      const className =
-        stock.change > 0
+      const changeClass =
+        stock.change1yPct > 0
           ? 'positive'
-          : stock.change < 0
+          : stock.change1yPct < 0
             ? 'negative'
             : '';
 
@@ -1151,37 +1136,48 @@ function renderStocks() {
         '<tr>' +
 
         '<td>' +
-        escapeHtml(stock.symbol) +
-        '</td>' +
-
-        '<td>' +
-        escapeHtml(stock.sector) +
-        '</td>' +
-
-        '<td>' +
-        formatNumber(stock.price) +
-        '</td>' +
-
-        '<td class="' +
-        className +
-        '">' +
-        formatNumber(stock.change) +
-        '</td>' +
-
-        '<td class="' +
-        className +
-        '">' +
-        (
-          stock.changePercent === null
-            ? '-'
-            : formatNumber(
-                stock.changePercent
-              ) + '%'
+        escapeHtml(
+          stock.symbol
         ) +
         '</td>' +
 
         '<td>' +
-        formatNumber(stock.volume) +
+        escapeHtml(
+          stock.sector
+        ) +
+        '</td>' +
+
+        '<td>' +
+        formatNumber(
+          stock.price
+        ) +
+        '</td>' +
+
+        '<td>' +
+        formatNumber(
+          stock.peRatio
+        ) +
+        '</td>' +
+
+        '<td>' +
+        formatPercent(
+          stock.dividendYield
+        ) +
+        '</td>' +
+
+        '<td>' +
+        formatNumber(
+          stock.averageVolume30d,
+          0
+        ) +
+        '</td>' +
+
+        '<td class="' +
+        changeClass +
+        '">' +
+        formatPercent(
+          stock.change1yPct
+        ) +
         '</td>' +
 
         '</tr>'
@@ -1197,8 +1193,11 @@ function renderStocks() {
 $('loadMarket').onclick =
   async () => {
 
-    $('error').textContent = '';
-    $('loadMarket').disabled = true;
+    $('error').textContent =
+      '';
+
+    $('loadMarket').disabled =
+      true;
 
     try {
       const result =
@@ -1231,7 +1230,8 @@ $('search').oninput =
 $('loadQuote').onclick =
   async () => {
 
-    $('error').textContent = '';
+    $('error').textContent =
+      '';
 
     try {
       const result =
@@ -1262,7 +1262,8 @@ $('loadQuote').onclick =
 $('loadHistory').onclick =
   async () => {
 
-    $('error').textContent = '';
+    $('error').textContent =
+      '';
 
     try {
       const result =
@@ -1293,7 +1294,8 @@ $('loadHistory').onclick =
 $('loadFundamentals').onclick =
   async () => {
 
-    $('error').textContent = '';
+    $('error').textContent =
+      '';
 
     try {
       const result =
@@ -1353,7 +1355,9 @@ if (require.main === module) {
     );
 
   http
-    .createServer(handler)
+    .createServer(
+      handler
+    )
     .listen(
       port,
       '127.0.0.1',
