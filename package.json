@@ -1,0 +1,11 @@
+{
+  "name": "nomad-invest",
+  "version": "0.1.0",
+  "private": true,
+  "description": "PSX intelligence engine foundation. No trading or bank integrations.",
+  "engines": { "node": "22.x" },
+  "scripts": {
+    "start": "node api/nomad.js",
+    "test": "node api/nomad.js --test"
+  }
+}

@@ -1,0 +1,226 @@
+TAP version 13
+# Subtest: Exact paise parsing and formatting
+ok 1 - Exact paise parsing and formatting
+  ---
+  duration_ms: 1.232596
+  type: 'test'
+  ...
+# Subtest: Reject malformed or negative money rather than inventing a budget
+ok 2 - Reject malformed or negative money rather than inventing a budget
+  ---
+  duration_ms: 0.358508
+  type: 'test'
+  ...
+# Subtest: Fees must be explicitly supplied
+ok 3 - Fees must be explicitly supplied
+  ---
+  duration_ms: 1.078115
+  type: 'test'
+  ...
+# Subtest: Fees include minimum commission, tax, fixed charge and buffer with conservative rounding
+ok 4 - Fees include minimum commission, tax, fixed charge and buffer with conservative rounding
+  ---
+  duration_ms: 0.35381
+  type: 'test'
+  ...
+# Subtest: Explicit zero-fee model is allowed; missing fees are not assumed zero
+ok 5 - Explicit zero-fee model is allowed; missing fees are not assumed zero
+  ---
+  duration_ms: 0.198837
+  type: 'test'
+  ...
+# Subtest: No portfolio is required and there is no preset budget
+ok 6 - No portfolio is required and there is no preset budget
+  ---
+  duration_ms: 11.831756
+  type: 'test'
+  ...
+# Subtest: An insufficient amount keeps cash rather than forcing a cheap stock
+ok 7 - An insufficient amount keeps cash rather than forcing a cheap stock
+  ---
+  duration_ms: 1.433788
+  type: 'test'
+  ...
+# Subtest: Whole-share quantities, market lots and fee-inclusive budgets are respected
+ok 8 - Whole-share quantities, market lots and fee-inclusive budgets are respected
+  ---
+  duration_ms: 2.56343
+  type: 'test'
+  ...
+# Subtest: Final company and sector exposure obey cash-inclusive caps after costs
+ok 9 - Final company and sector exposure obey cash-inclusive caps after costs
+  ---
+  duration_ms: 2.007979
+  type: 'test'
+  ...
+# Subtest: No approved model means no recommendations, regardless of budget
+ok 10 - No approved model means no recommendations, regardless of budget
+  ---
+  duration_ms: 1.590202
+  type: 'test'
+  ...
+# Subtest: Horizon and risk filters do not quietly substitute other signals
+ok 11 - Horizon and risk filters do not quietly substitute other signals
+  ---
+  duration_ms: 0.645637
+  type: 'test'
+  ...
+# Subtest: Risk policies can switch without changing the investment amount
+ok 12 - Risk policies can switch without changing the investment amount
+  ---
+  duration_ms: 3.732151
+  type: 'test'
+  ...
+# Subtest: Stale quotes cannot be used for a candidate purchase plan
+ok 13 - Stale quotes cannot be used for a candidate purchase plan
+  ---
+  duration_ms: 0.66724
+  type: 'test'
+  ...
+# Subtest: Missing portfolio quotes never silently become zero valuations
+ok 14 - Missing portfolio quotes never silently become zero valuations
+  ---
+  duration_ms: 0.44049
+  type: 'test'
+  ...
+# Subtest: Malformed and future-dated quote rows are quarantined
+ok 15 - Malformed and future-dated quote rows are quarantined
+  ---
+  duration_ms: 0.309704
+  type: 'test'
+  ...
+# Subtest: Duplicate symbols fail the snapshot rather than double-counting stocks
+ok 16 - Duplicate symbols fail the snapshot rather than double-counting stocks
+  ---
+  duration_ms: 0.195983
+  type: 'test'
+  ...
+# Subtest: Quote metadata must include status, lot and liquidity
+ok 17 - Quote metadata must include status, lot and liquidity
+  ---
+  duration_ms: 0.242163
+  type: 'test'
+  ...
+# Subtest: Expired, unreviewed and out-of-entry-range signals are excluded
+ok 18 - Expired, unreviewed and out-of-entry-range signals are excluded
+  ---
+  duration_ms: 0.859418
+  type: 'test'
+  ...
+# Subtest: Signals cannot cite evidence that only became available later
+ok 19 - Signals cannot cite evidence that only became available later
+  ---
+  duration_ms: 0.344987
+  type: 'test'
+  ...
+# Subtest: Funding from existing cash cannot exceed recorded cash
+ok 20 - Funding from existing cash cannot exceed recorded cash
+  ---
+  duration_ms: 0.271306
+  type: 'test'
+  ...
+# Subtest: PKR 5000 existing-holding what-if: external versus existing cash
+ok 21 - PKR 5000 existing-holding what-if: external versus existing cash
+  ---
+  duration_ms: 1.115271
+  type: 'test'
+  ...
+# Subtest: What-if never mutates stored holdings and uses additional cost in basis
+ok 22 - What-if never mutates stored holdings and uses additional cost in basis
+  ---
+  duration_ms: 0.3535
+  type: 'test'
+  ...
+# Subtest: Single-stock downside differs from whole-market downside
+ok 23 - Single-stock downside differs from whole-market downside
+  ---
+  duration_ms: 0.817755
+  type: 'test'
+  ...
+# Subtest: A zero-budget what-if has no purchase charges
+ok 24 - A zero-budget what-if has no purchase charges
+  ---
+  duration_ms: 0.231266
+  type: 'test'
+  ...
+# Subtest: Randomized budget invariants hold across 250 distinct inputs
+ok 25 - Randomized budget invariants hold across 250 distinct inputs
+  ---
+  duration_ms: 142.091357
+  type: 'test'
+  ...
+# Subtest: UI is truthful about missing forecast and market connections
+ok 26 - UI is truthful about missing forecast and market connections
+  ---
+  duration_ms: 0.76096
+  type: 'test'
+  ...
+# Subtest: A derivatives quote is never treated as an ordinary cash-equity purchase
+ok 27 - A derivatives quote is never treated as an ordinary cash-equity purchase
+  ---
+  duration_ms: 0.362873
+  type: 'test'
+  ...
+# Subtest: Zero liquidity and suspended stocks are not purchasable
+ok 28 - Zero liquidity and suspended stocks are not purchasable
+  ---
+  duration_ms: 0.268722
+  type: 'test'
+  ...
+# Subtest: Health accurately reports disconnected services without requiring a portfolio
+ok 29 - Health accurately reports disconnected services without requiring a portfolio
+  ---
+  duration_ms: 0.535482
+  type: 'test'
+  ...
+# Subtest: No provider configured returns an explicit service-unavailable response
+ok 30 - No provider configured returns an explicit service-unavailable response
+  ---
+  duration_ms: 0.29396
+  type: 'test'
+  ...
+# Subtest: API never fabricates a plan when no model is registered
+ok 31 - API never fabricates a plan when no model is registered
+  ---
+  duration_ms: 0.215112
+  type: 'test'
+  ...
+# Subtest: The API rejects malformed money
+ok 32 - The API rejects malformed money
+  ---
+  duration_ms: 0.188091
+  type: 'test'
+  ...
+# Subtest: There is no order-execution endpoint
+ok 33 - There is no order-execution endpoint
+  ---
+  duration_ms: 0.170415
+  type: 'test'
+  ...
+# Subtest: Unexpected origins cannot invoke the API
+ok 34 - Unexpected origins cannot invoke the API
+  ---
+  duration_ms: 0.117326
+  type: 'test'
+  ...
+# Subtest: App response has CSP, no-store and no embedded model credentials
+ok 35 - App response has CSP, no-store and no embedded model credentials
+  ---
+  duration_ms: 0.378237
+  type: 'test'
+  ...
+# Subtest: A Vercel deployment refuses access until a private password is set
+ok 36 - A Vercel deployment refuses access until a private password is set
+  ---
+  duration_ms: 0.144987
+  type: 'test'
+  ...
+1..36
+# tests 36
+# suites 0
+# pass 36
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 199.103851

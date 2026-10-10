@@ -1,0 +1,16 @@
+{
+  "browser": "Chromium",
+  "transport": "Offline JS bridge to real Node handler; localhost navigation is blocked by browser policy. Local-storage calls used a test stub.",
+  "javascript_errors": [],
+  "passed": [
+    "initial missing-feed status",
+    "amount-input allocation route",
+    "unvalidated-model block",
+    "manual holding save",
+    "local-storage write",
+    "simulator holding selector",
+    "honest market-data failure",
+    "390px mobile layout"
+  ],
+  "live_provider_connection_tested": false
+}
