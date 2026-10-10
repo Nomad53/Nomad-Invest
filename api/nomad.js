@@ -3,7 +3,7 @@
 const http = require('node:http');
 const crypto = require('node:crypto');
 
-const VERSION = '0.3.1';
+const VERSION = '0.4.0';
 
 const PSX_API_BASE =
   process.env.PSX_API_BASE ||
@@ -12,6 +12,9 @@ const PSX_API_BASE =
 const PSX_META_BASE =
   process.env.PSX_META_BASE ||
   'https://psx-rest-api.onrender.com';
+
+const PSX_ELIGIBLE_SCRIPS_URL =
+  'https://dps.psx.com.pk/eligible-scrips';
 
 const PYPSX_API_KEY_ID =
   process.env.PYPSX_API_KEY_ID ||
@@ -125,8 +128,61 @@ async function fetchJSON(
   return response.json();
 }
 
+async function fetchText(
+  url,
+  timeout = 20000,
+  headers = {}
+) {
+  const response = await fetch(url, {
+    headers: {
+      Accept: 'text/html,application/xhtml+xml',
+      'User-Agent':
+        'Mozilla/5.0 NOMAD-Invest/0.4',
+      ...headers
+    },
+    signal: AbortSignal.timeout(timeout)
+  });
+
+  if (!response.ok) {
+    bad(
+      `Data service returned HTTP ${response.status}.`,
+      response.status
+    );
+  }
+
+  return response.text();
+}
+
+function decodeHtml(value) {
+  return String(value || '')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&apos;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&#(\d+);/g, (_, code) =>
+      String.fromCharCode(Number(code))
+    )
+    .replace(/&#x([0-9a-f]+);/gi, (_, code) =>
+      String.fromCharCode(parseInt(code, 16))
+    );
+}
+
+function cleanHtmlCell(value) {
+  return decodeHtml(
+    String(value || '')
+      .replace(/<script[\s\S]*?<\/script>/gi, '')
+      .replace(/<style[\s\S]*?<\/style>/gi, '')
+      .replace(/<[^>]+>/g, ' ')
+  )
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 /* --------------------------------------------------
-   PYPSX NEAR-LIVE PRICE
+   PYPSX MARKET DATA
 -------------------------------------------------- */
 
 function pyPSXHeaders() {
@@ -163,7 +219,8 @@ function extractPyPSXRows(result) {
   }
 
   if (Array.isArray(result?.results)) {
-    const first = result.results[0];
+    const first =
+      result.results[0];
 
     if (Array.isArray(first?.candles)) {
       return first.candles;
@@ -249,14 +306,113 @@ function pyPSXTimeValue(value) {
       : value * 1000;
   }
 
-  const parsed = Date.parse(value);
+  const parsed =
+    Date.parse(value);
 
   return Number.isFinite(parsed)
     ? parsed
     : 0;
 }
 
-async function getPyPSXLivePrice(
+function karachiDateKey(value) {
+  const timestamp =
+    pyPSXTimeValue(value);
+
+  if (!timestamp) {
+    return '';
+  }
+
+  const parts =
+    new Intl.DateTimeFormat(
+      'en-US',
+      {
+        timeZone:
+          'Asia/Karachi',
+        year:
+          'numeric',
+        month:
+          '2-digit',
+        day:
+          '2-digit'
+      }
+    )
+      .formatToParts(
+        new Date(timestamp)
+      );
+
+  const get =
+    type =>
+      parts.find(
+        part =>
+          part.type === type
+      )?.value || '';
+
+  return (
+    get('year') +
+    '-' +
+    get('month') +
+    '-' +
+    get('day')
+  );
+}
+
+async function getPyPSXMarketStatus() {
+  try {
+    const result =
+      await fetchJSON(
+        `${getPyPSXBase()}/market/status`,
+        12000,
+        pyPSXHeaders()
+      );
+
+    return {
+      known:
+        true,
+
+      isOpen:
+        result?.is_open === true,
+
+      status:
+        String(
+          result?.status ||
+          ''
+        ),
+
+      statusText:
+        String(
+          result?.status_text ||
+          (
+            result?.is_open === true
+              ? 'Market Open'
+              : 'Market Closed'
+          )
+        ),
+
+      holidayName:
+        result?.holiday_name ||
+        null
+    };
+  } catch (error) {
+    return {
+      known:
+        false,
+
+      isOpen:
+        false,
+
+      status:
+        'UNKNOWN',
+
+      statusText:
+        'Market status unavailable',
+
+      holidayName:
+        null
+    };
+  }
+}
+
+async function getPyPSXIntraday(
   stockSymbol
 ) {
   const symbol =
@@ -270,18 +426,25 @@ async function getPyPSXLivePrice(
     );
   }
 
-  const result =
-    await fetchJSON(
-      `${getPyPSXBase()}/intraday/${encodeURIComponent(
-        symbol
-      )}`,
-      20000,
-      pyPSXHeaders()
-    );
+  const [
+    raw,
+    marketStatus
+  ] =
+    await Promise.all([
+      fetchJSON(
+        `${getPyPSXBase()}/intraday/${encodeURIComponent(
+          symbol
+        )}`,
+        20000,
+        pyPSXHeaders()
+      ),
+
+      getPyPSXMarketStatus()
+    ]);
 
   const rows =
     extractPyPSXRows(
-      result
+      raw
     )
       .map(
         normalizePyPSXRow
@@ -289,7 +452,19 @@ async function getPyPSXLivePrice(
       .filter(
         row =>
           row.close !== null &&
-          row.close > 0
+          row.close > 0 &&
+          pyPSXTimeValue(
+            row.timestamp
+          ) > 0
+      )
+      .sort(
+        (a, b) =>
+          pyPSXTimeValue(
+            a.timestamp
+          ) -
+          pyPSXTimeValue(
+            b.timestamp
+          )
       );
 
   if (!rows.length) {
@@ -299,24 +474,89 @@ async function getPyPSXLivePrice(
     );
   }
 
-  rows.sort(
-    (a, b) =>
-      pyPSXTimeValue(
-        a.timestamp
-      ) -
-      pyPSXTimeValue(
-        b.timestamp
-      )
-  );
-
   const latest =
     rows[
       rows.length - 1
     ];
 
-  const timestampMs =
+  const latestSessionKey =
+    karachiDateKey(
+      latest.timestamp
+    );
+
+  const sessionRows =
+    rows.filter(
+      row =>
+        karachiDateKey(
+          row.timestamp
+        ) ===
+        latestSessionKey
+    );
+
+  const latestTimestamp =
     pyPSXTimeValue(
       latest.timestamp
+    );
+
+  const ageSeconds =
+    Math.max(
+      0,
+      Math.round(
+        (
+          Date.now() -
+          latestTimestamp
+        ) /
+        1000
+      )
+    );
+
+  let feedState =
+    'LATEST';
+
+  let feedLabel =
+    'Latest available';
+
+  if (
+    marketStatus.known &&
+    marketStatus.isOpen &&
+    ageSeconds <= 180
+  ) {
+    feedState =
+      'LIVE';
+
+    feedLabel =
+      'Live';
+  } else if (
+    marketStatus.known &&
+    marketStatus.isOpen
+  ) {
+    feedState =
+      'DELAYED';
+
+    feedLabel =
+      'Delayed market data';
+  } else if (
+    marketStatus.known &&
+    !marketStatus.isOpen
+  ) {
+    feedState =
+      'CLOSED';
+
+    feedLabel =
+      'Last market price';
+  }
+
+  const volumes =
+    sessionRows.map(
+      row =>
+        row.volume || 0
+    );
+
+  const totalVolume =
+    volumes.reduce(
+      (sum, value) =>
+        sum + value,
+      0
     );
 
   return {
@@ -325,49 +565,102 @@ async function getPyPSXLivePrice(
     provider:
       'pyPSX',
 
-    mode:
-      PYPSX_API_KEY_ID.startsWith('AK_')
-        ? 'live-key'
-        : 'paper-key',
+    sourceType:
+      '1-minute intraday candles',
+
+    marketStatus,
+
+    feedState,
+
+    feedLabel,
 
     price:
       latest.close,
 
-    open:
-      latest.open,
-
-    high:
-      latest.high,
-
-    low:
-      latest.low,
-
-    volume:
-      latest.volume,
-
     timestamp:
-      timestampMs
-        ? new Date(
-            timestampMs
-          ).toISOString()
-        : latest.timestamp,
+      new Date(
+        latestTimestamp
+      ).toISOString(),
 
-    ageSeconds:
-      timestampMs
-        ? Math.max(
-            0,
-            Math.round(
-              (
-                Date.now() -
-                timestampMs
-              ) /
-              1000
+    ageSeconds,
+
+    sessionDate:
+      latestSessionKey,
+
+    session: {
+      open:
+        sessionRows[0]?.open ??
+        sessionRows[0]?.close ??
+        null,
+
+      high:
+        sessionRows.length
+          ? Math.max(
+              ...sessionRows
+                .map(
+                  row =>
+                    row.high ??
+                    row.close
+                )
+                .filter(
+                  value =>
+                    value !== null
+                )
             )
-          )
-        : null,
+          : null,
 
-    sourceType:
-      'latest 1-minute intraday candle'
+      low:
+        sessionRows.length
+          ? Math.min(
+              ...sessionRows
+                .map(
+                  row =>
+                    row.low ??
+                    row.close
+                )
+                .filter(
+                  value =>
+                    value !== null
+                )
+            )
+          : null,
+
+      close:
+        latest.close,
+
+      volume:
+        totalVolume,
+
+      candles:
+        sessionRows.length
+    },
+
+    data:
+      sessionRows.map(
+        row => ({
+          timestamp:
+            new Date(
+              pyPSXTimeValue(
+                row.timestamp
+              )
+            ).toISOString(),
+
+          open:
+            row.open,
+
+          high:
+            row.high,
+
+          low:
+            row.low,
+
+          close:
+            row.close,
+
+          volume:
+            row.volume || 0
+        })
+      )
   };
 }
 
@@ -388,21 +681,226 @@ async function loadCompanyMap() {
   const map =
     new Map();
 
+  /*
+    PRIMARY SOURCE:
+    Official PSX Market Eligible Scrips page.
+  */
+
+  try {
+    const html =
+      await fetchText(
+        PSX_ELIGIBLE_SCRIPS_URL,
+        30000
+      );
+
+    const rowRegex =
+      /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
+
+    let rowMatch;
+
+    while (
+      (
+        rowMatch =
+          rowRegex.exec(
+            html
+          )
+      ) !== null
+    ) {
+      const cells =
+        [];
+
+      const cellRegex =
+        /<td[^>]*>([\s\S]*?)<\/td>/gi;
+
+      let cellMatch;
+
+      while (
+        (
+          cellMatch =
+            cellRegex.exec(
+              rowMatch[1]
+            )
+        ) !== null
+      ) {
+        cells.push(
+          cleanHtmlCell(
+            cellMatch[1]
+          )
+        );
+      }
+
+      if (
+        cells.length < 2
+      ) {
+        continue;
+      }
+
+      const symbol =
+        normalizeSymbol(
+          cells[0]
+        );
+
+      const name =
+        String(
+          cells[1] ||
+          ''
+        ).trim();
+
+      if (
+        !symbol ||
+        !name ||
+        symbol === 'SYMBOL' ||
+        name.toLowerCase() ===
+          'name'
+      ) {
+        continue;
+      }
+
+      if (
+        /^[A-Z0-9.-]{1,20}$/.test(
+          symbol
+        )
+      ) {
+        map.set(
+          symbol,
+          {
+            name,
+
+            sector:
+              '',
+
+            source:
+              'PSX official eligible scrips'
+          }
+        );
+      }
+    }
+  } catch (error) {
+    console.error(
+      'Official PSX company metadata unavailable:',
+      error.message
+    );
+  }
+
+  /*
+    SECONDARY SOURCE:
+    pyPSX /symbols.
+  */
+
   try {
     const response =
       await fetchJSON(
-        `${PSX_META_BASE}/symbols`,
+        `${getPyPSXBase()}/symbols`,
+        20000
+      );
+
+    const rows =
+      Array.isArray(
+        response
+      )
+        ? response
+        : Array.isArray(
+            response?.data
+          )
+          ? response.data
+          : Array.isArray(
+              response?.symbols
+            )
+            ? response.symbols
+            : [];
+
+    for (
+      const row
+      of rows
+    ) {
+      if (
+        !row ||
+        typeof row === 'string'
+      ) {
+        continue;
+      }
+
+      const symbol =
+        normalizeSymbol(
+          row.symbol ||
+          row.ticker ||
+          row.code
+        );
+
+      const name =
+        String(
+          row.name ||
+          row.company_name ||
+          row.companyName ||
+          ''
+        ).trim();
+
+      if (
+        !symbol ||
+        !name
+      ) {
+        continue;
+      }
+
+      const existing =
+        map.get(
+          symbol
+        );
+
+      map.set(
+        symbol,
+        {
+          name:
+            existing?.name ||
+            name,
+
+          sector:
+            String(
+              row.sector ||
+              existing?.sector ||
+              ''
+            ).trim(),
+
+          source:
+            existing?.source ||
+            'pyPSX symbols'
+        }
+      );
+    }
+  } catch (error) {
+    console.error(
+      'pyPSX symbol metadata unavailable:',
+      error.message
+    );
+  }
+
+  /*
+    FINAL FALLBACK:
+    Community metadata service.
+  */
+
+  try {
+    const response =
+      await fetchJSON(
+        `${PSX_META_BASE}/symbols?limit=5000`,
         30000
       );
 
     const rows =
-      Array.isArray(response)
+      Array.isArray(
+        response
+      )
         ? response
-        : Array.isArray(response?.data)
+        : Array.isArray(
+            response?.data
+          )
           ? response.data
           : [];
 
-    for (const row of rows) {
+    for (
+      const row
+      of rows
+    ) {
       const symbol =
         normalizeSymbol(
           row.symbol
@@ -412,36 +910,37 @@ async function loadCompanyMap() {
         continue;
       }
 
+      const existing =
+        map.get(
+          symbol
+        );
+
       map.set(
         symbol,
         {
           name:
+            existing?.name ||
             String(
               row.name ||
               symbol
             ).trim(),
 
           sector:
+            existing?.sector ||
             String(
               row.sector ||
               ''
             ).trim(),
 
-          isETF:
-            Boolean(
-              row.is_etf
-            ),
-
-          isDebt:
-            Boolean(
-              row.is_debt
-            )
+          source:
+            existing?.source ||
+            'psx-rest-api'
         }
       );
     }
   } catch (error) {
     console.error(
-      'Company metadata unavailable:',
+      'Fallback company metadata unavailable:',
       error.message
     );
   }
@@ -449,6 +948,7 @@ async function loadCompanyMap() {
   companyCache = {
     fetchedAt:
       Date.now(),
+
     data:
       map
   };
@@ -524,7 +1024,8 @@ async function loadSectorMap() {
         of stocksResponse.data
       ) {
         const symbol =
-          typeof item === 'string'
+          typeof item ===
+          'string'
             ? normalizeSymbol(
                 item
               )
@@ -547,6 +1048,7 @@ async function loadSectorMap() {
   sectorCache = {
     fetchedAt:
       Date.now(),
+
     data:
       map
   };
@@ -709,7 +1211,9 @@ async function loadPSXMarket() {
             timestamp
           )
       )
-      .filter(Boolean);
+      .filter(
+        Boolean
+      );
 
   if (!stocks.length) {
     bad(
@@ -737,6 +1241,7 @@ async function loadPSXMarket() {
   marketCache = {
     fetchedAt:
       Date.now(),
+
     data:
       result
   };
@@ -764,7 +1269,8 @@ async function getQuote(
 
   const [
     result,
-    companyMap
+    companyMap,
+    sectorMap
   ] =
     await Promise.all([
       fetchJSON(
@@ -773,16 +1279,32 @@ async function getQuote(
         )}/quote`
       ),
 
-      loadCompanyMap()
+      loadCompanyMap(),
+
+      loadSectorMap()
     ]);
+
+  const company =
+    companyMap.get(
+      symbol
+    );
 
   return {
     symbol,
 
     company:
-      companyMap.get(
-        symbol
-      ) || null,
+      company
+        ? {
+            ...company,
+
+            sector:
+              company.sector ||
+              sectorMap.get(
+                symbol
+              ) ||
+              ''
+          }
+        : null,
 
     data:
       result.data ||
@@ -836,7 +1358,8 @@ async function getHistory(
 
   const [
     result,
-    companyMap
+    companyMap,
+    sectorMap
   ] =
     await Promise.all([
       fetchJSON(
@@ -849,7 +1372,9 @@ async function getHistory(
         }`
       ),
 
-      loadCompanyMap()
+      loadCompanyMap(),
+
+      loadSectorMap()
     ]);
 
   const rawRows =
@@ -911,12 +1436,18 @@ async function getHistory(
 
     const normalized = {
       date,
+
       open,
+
       high,
+
       low,
+
       close,
+
       volume:
         volume || 0,
+
       isAnomaly:
         suspicious
     };
@@ -934,9 +1465,13 @@ async function getHistory(
 
   cleaned.sort(
     (a, b) =>
-      String(a.date)
+      String(
+        a.date
+      )
         .localeCompare(
-          String(b.date)
+          String(
+            b.date
+          )
         )
   );
 
@@ -951,7 +1486,8 @@ async function getHistory(
 
     const last =
       cleaned[
-        cleaned.length - 1
+        cleaned.length -
+        1
       ];
 
     const prices =
@@ -963,7 +1499,8 @@ async function getHistory(
     const volumes =
       cleaned.map(
         row =>
-          row.volume || 0
+          row.volume ||
+          0
       );
 
     const change =
@@ -975,7 +1512,8 @@ async function getHistory(
         ? (
             change /
             first.close
-          ) * 100
+          ) *
+          100
         : null;
 
     summary = {
@@ -1029,13 +1567,27 @@ async function getHistory(
     };
   }
 
+  const company =
+    companyMap.get(
+      symbol
+    );
+
   return {
     symbol,
 
     company:
-      companyMap.get(
-        symbol
-      ) || null,
+      company
+        ? {
+            ...company,
+
+            sector:
+              company.sector ||
+              sectorMap.get(
+                symbol
+              ) ||
+              ''
+          }
+        : null,
 
     summary,
 
@@ -1070,7 +1622,8 @@ async function getFundamentals(
 
   const [
     result,
-    companyMap
+    companyMap,
+    sectorMap
   ] =
     await Promise.all([
       fetchJSON(
@@ -1079,16 +1632,32 @@ async function getFundamentals(
         )}/fundamentals`
       ),
 
-      loadCompanyMap()
+      loadCompanyMap(),
+
+      loadSectorMap()
     ]);
+
+  const company =
+    companyMap.get(
+      symbol
+    );
 
   return {
     symbol,
 
     company:
-      companyMap.get(
-        symbol
-      ) || null,
+      company
+        ? {
+            ...company,
+
+            sector:
+              company.sector ||
+              sectorMap.get(
+                symbol
+              ) ||
+              ''
+          }
+        : null,
 
     data:
       result.data ||
@@ -1115,14 +1684,20 @@ function safeEqual(
           'sha256'
         )
         .update(
-          String(value)
+          String(
+            value
+          )
         )
         .digest();
 
   return crypto
     .timingSafeEqual(
-      hash(a),
-      hash(b)
+      hash(
+        a
+      ),
+      hash(
+        b
+      )
     );
 }
 
@@ -1257,12 +1832,14 @@ async function handler(
     const action =
       url.searchParams.get(
         'action'
-      ) || 'app';
+      ) ||
+      'app';
 
     if (
       request.method ===
         'GET' &&
-      action === 'app'
+      action ===
+        'app'
     ) {
       response.setHeader(
         'Content-Type',
@@ -1290,20 +1867,13 @@ async function handler(
             'psxdata-api',
 
           companyMetadata:
-            'psx-rest-api',
+            'PSX official eligible scrips + fallbacks',
 
           pyPSXConfigured:
             Boolean(
               PYPSX_API_KEY_ID &&
               PYPSX_API_SECRET_KEY
             ),
-
-          pyPSXMode:
-            PYPSX_API_KEY_ID.startsWith('AK_')
-              ? 'live-key'
-              : PYPSX_API_KEY_ID.startsWith('PK_')
-                ? 'paper-key'
-                : 'not-configured',
 
           predictionEngine:
             'NOT_IMPLEMENTED',
@@ -1326,9 +1896,61 @@ async function handler(
       action ===
         'live-price'
     ) {
+      const result =
+        await getPyPSXIntraday(
+          url.searchParams.get(
+            'symbol'
+          )
+        );
+
       return sendJSON(
         response,
-        await getPyPSXLivePrice(
+        {
+          symbol:
+            result.symbol,
+
+          provider:
+            result.provider,
+
+          sourceType:
+            result.sourceType,
+
+          marketStatus:
+            result.marketStatus,
+
+          feedState:
+            result.feedState,
+
+          feedLabel:
+            result.feedLabel,
+
+          price:
+            result.price,
+
+          timestamp:
+            result.timestamp,
+
+          ageSeconds:
+            result.ageSeconds,
+
+          sessionDate:
+            result.sessionDate,
+
+          session:
+            result.session
+        }
+      );
+    }
+
+    if (
+      request.method ===
+        'GET' &&
+      action ===
+        'live-chart'
+    ) {
+      return sendJSON(
+        response,
+        await getPyPSXIntraday(
           url.searchParams.get(
             'symbol'
           )
@@ -1421,7 +2043,7 @@ async function handler(
       },
 
       error.status ||
-        500
+      500
     );
   }
 }
@@ -1538,6 +2160,7 @@ select {
     minmax(240px,2fr)
     minmax(180px,1fr)
     minmax(210px,1fr);
+
   gap: 12px;
   margin: 18px 0;
 }
@@ -1631,11 +2254,13 @@ tbody tr:hover {
 
 .summaryGrid {
   display: grid;
+
   grid-template-columns:
     repeat(
       auto-fit,
       minmax(150px,1fr)
     );
+
   gap: 12px;
   margin: 18px 0;
 }
@@ -1661,33 +2286,61 @@ tbody tr:hover {
 .liveStrip {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
   flex-wrap: wrap;
-  margin: 10px 0 4px;
   min-height: 24px;
+  margin: 12px 0 2px;
 }
 
-.liveDot {
+.feedDot {
   width: 9px;
   height: 9px;
   border-radius: 50%;
-  background: #11823b;
   display: inline-block;
-  box-shadow: 0 0 0 4px rgba(17,130,59,.10);
 }
 
-.livePrice {
+.feedDot.live {
+  background: #11823b;
+
+  box-shadow:
+    0 0 0 4px
+    rgba(17,130,59,.10);
+}
+
+.feedDot.closed {
+  background: #778899;
+}
+
+.feedDot.delayed {
+  background: #bd8728;
+}
+
+.feedPrice {
   font-weight: 700;
 }
 
-.liveMeta {
+.feedMeta {
   color: #66788a;
   font-size: 13px;
 }
 
-.liveWarning {
+.feedWarning {
   color: #9a6718;
   font-size: 13px;
+}
+
+.liveChartHeader {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 15px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
+.liveChartPrice {
+  font-size: 28px;
+  font-weight: 750;
 }
 
 .chartBox {
@@ -1869,6 +2522,10 @@ Enter a symbol or click any company below.
 Overview
 </button>
 
+<button id="loadLiveChart">
+Live Chart
+</button>
+
 <button id="loadHistory">
 History Chart
 </button>
@@ -2034,13 +2691,17 @@ let liveRefreshTimer =
 let liveRefreshSymbol =
   null;
 
+let liveView =
+  null;
+
 /* ---------------------------------------
    HELPERS
 --------------------------------------- */
 
 function escapeHtml(value) {
   return String(
-    value ?? ''
+    value ??
+    ''
   ).replace(
     /[&<>"']/g,
     character => ({
@@ -2116,8 +2777,10 @@ function formatDate(
       {
         day:
           'numeric',
+
         month:
           'short',
+
         year:
           'numeric'
       }
@@ -2138,7 +2801,8 @@ function formatDateTime(
     )
   ) {
     return String(
-      value || ''
+      value ||
+      ''
     );
   }
 
@@ -2146,15 +2810,57 @@ function formatDateTime(
     .toLocaleString(
       'en-PK',
       {
+        timeZone:
+          'Asia/Karachi',
+
         day:
           'numeric',
+
         month:
           'short',
+
+        year:
+          'numeric',
+
         hour:
-          '2-digit',
+          'numeric',
+
         minute:
           '2-digit',
+
         second:
+          '2-digit'
+      }
+    );
+}
+
+function formatTime(
+  value
+) {
+  const date =
+    new Date(
+      value
+    );
+
+  if (
+    Number.isNaN(
+      date.getTime()
+    )
+  ) {
+    return '';
+  }
+
+  return date
+    .toLocaleTimeString(
+      'en-PK',
+      {
+        timeZone:
+          'Asia/Karachi',
+
+        hour:
+          'numeric',
+
+        minute:
           '2-digit'
       }
     );
@@ -2175,7 +2881,10 @@ async function api(
   );
 
   for (
-    const [key,value]
+    const [
+      key,
+      value
+    ]
     of Object.entries(
       params
     )
@@ -2213,11 +2922,13 @@ async function api(
 }
 
 /* ---------------------------------------
-   NEAR-LIVE PRICE
+   LIVE / LATEST MARKET DATA
 --------------------------------------- */
 
 function stopLiveRefresh() {
-  if (liveRefreshTimer) {
+  if (
+    liveRefreshTimer
+  ) {
     clearInterval(
       liveRefreshTimer
     );
@@ -2228,69 +2939,65 @@ function stopLiveRefresh() {
 
   liveRefreshSymbol =
     null;
+
+  liveView =
+    null;
 }
 
-function liveAgeLabel(
-  ageSeconds
-) {
-  if (
-    ageSeconds === null ||
-    ageSeconds === undefined
-  ) {
-    return 'timestamp unavailable';
-  }
-
-  if (ageSeconds < 60) {
-    return ageSeconds +
-      ' sec old';
-  }
-
-  if (ageSeconds < 3600) {
-    return Math.floor(
-      ageSeconds / 60
-    ) +
-      ' min old';
-  }
-
-  return Math.floor(
-    ageSeconds / 3600
-  ) +
-    ' hr old';
-}
-
-function renderLivePrice(
+function renderFeedStatus(
   result
 ) {
-  const timestamp =
-    result.timestamp
-      ? formatDateTime(
-          result.timestamp
-        )
-      : 'Unknown time';
+  const state =
+    result.feedState ||
+    'LATEST';
+
+  const dotClass =
+    state === 'LIVE'
+      ? 'live'
+      : state ===
+          'DELAYED'
+        ? 'delayed'
+        : 'closed';
+
+  const marketNote =
+    result.marketStatus
+      ?.holidayName
+      ? ' • ' +
+        result.marketStatus
+          .holidayName
+      : '';
 
   $('liveStatus')
     .innerHTML =
-      '<span class="liveDot"></span>' +
-      '<span class="livePrice">' +
-      'pyPSX: PKR ' +
+      '<span class="feedDot ' +
+      dotClass +
+      '"></span>' +
+
+      '<span class="feedPrice">' +
+      escapeHtml(
+        result.feedLabel ||
+        'Latest available'
+      ) +
+      ': PKR ' +
       formatNumber(
         result.price
       ) +
       '</span>' +
-      '<span class="liveMeta">' +
+
+      '<span class="feedMeta">' +
+      'Updated ' +
       escapeHtml(
-        timestamp
-      ) +
-      ' • ' +
-      escapeHtml(
-        liveAgeLabel(
-          result.ageSeconds
+        formatDateTime(
+          result.timestamp
         )
+      ) +
+      escapeHtml(
+        marketNote
       ) +
       '</span>';
 }
 
-async function refreshLivePrice(
+async function refreshLiveOverview(
   symbol,
   silent = false
 ) {
@@ -2307,7 +3014,7 @@ async function refreshLivePrice(
       liveRefreshSymbol ===
       symbol
     ) {
-      renderLivePrice(
+      renderFeedStatus(
         result
       );
     }
@@ -2315,8 +3022,8 @@ async function refreshLivePrice(
     if (!silent) {
       $('liveStatus')
         .innerHTML =
-          '<span class="liveWarning">' +
-          'pyPSX live price unavailable: ' +
+          '<span class="feedWarning">' +
+          'Latest pyPSX price unavailable: ' +
           escapeHtml(
             error.message
           ) +
@@ -2325,7 +3032,7 @@ async function refreshLivePrice(
   }
 }
 
-function startLiveRefresh(
+function startLiveOverview(
   symbol
 ) {
   stopLiveRefresh();
@@ -2337,18 +3044,533 @@ function startLiveRefresh(
   liveRefreshSymbol =
     symbol;
 
+  liveView =
+    'overview';
+
   $('liveStatus')
     .innerHTML =
-      '<span class="liveMeta">Loading latest pyPSX price...</span>';
+      '<span class="feedMeta">' +
+      'Loading latest pyPSX price...' +
+      '</span>';
 
-  refreshLivePrice(
+  refreshLiveOverview(
     symbol
   );
 
   liveRefreshTimer =
     setInterval(
       () =>
-        refreshLivePrice(
+        refreshLiveOverview(
+          symbol,
+          true
+        ),
+      15000
+    );
+}
+
+function buildIntradayChart(
+  rows
+) {
+  if (
+    !rows ||
+    rows.length < 2
+  ) {
+    return (
+      '<p class="muted">' +
+      'Not enough intraday data to draw the chart.' +
+      '</p>'
+    );
+  }
+
+  const width =
+    1000;
+
+  const height =
+    330;
+
+  const paddingLeft =
+    65;
+
+  const paddingRight =
+    20;
+
+  const paddingTop =
+    20;
+
+  const paddingBottom =
+    42;
+
+  const usableWidth =
+    width -
+    paddingLeft -
+    paddingRight;
+
+  const usableHeight =
+    height -
+    paddingTop -
+    paddingBottom;
+
+  const closes =
+    rows.map(
+      row =>
+        Number(
+          row.close
+        )
+    );
+
+  let min =
+    Math.min(
+      ...closes
+    );
+
+  let max =
+    Math.max(
+      ...closes
+    );
+
+  if (
+    min === max
+  ) {
+    min *=
+      .995;
+
+    max *=
+      1.005;
+  }
+
+  const range =
+    max -
+    min;
+
+  const margin =
+    Math.max(
+      range *
+      .08,
+
+      max *
+      .002
+    );
+
+  min -= margin;
+
+  max += margin;
+
+  const x =
+    index =>
+      paddingLeft +
+      (
+        index /
+        (
+          rows.length -
+          1
+        )
+      ) *
+      usableWidth;
+
+  const y =
+    price =>
+      paddingTop +
+      (
+        1 -
+        (
+          (
+            price -
+            min
+          ) /
+          (
+            max -
+            min
+          )
+        )
+      ) *
+      usableHeight;
+
+  const points =
+    rows
+      .map(
+        (
+          row,
+          index
+        ) =>
+          x(
+            index
+          ) +
+          ',' +
+          y(
+            row.close
+          )
+      )
+      .join(
+        ' '
+      );
+
+  const firstX =
+    x(
+      0
+    );
+
+  const lastX =
+    x(
+      rows.length -
+      1
+    );
+
+  const bottomY =
+    paddingTop +
+    usableHeight;
+
+  const areaPoints =
+    firstX +
+    ',' +
+    bottomY +
+    ' ' +
+    points +
+    ' ' +
+    lastX +
+    ',' +
+    bottomY;
+
+  let horizontalLines =
+    '';
+
+  for (
+    let index = 0;
+    index < 5;
+    index++
+  ) {
+    const fraction =
+      index /
+      4;
+
+    const price =
+      max -
+      fraction *
+      (
+        max -
+        min
+      );
+
+    const lineY =
+      paddingTop +
+      fraction *
+      usableHeight;
+
+    horizontalLines +=
+      '<line x1="' +
+      paddingLeft +
+      '" x2="' +
+      (
+        width -
+        paddingRight
+      ) +
+      '" y1="' +
+      lineY +
+      '" y2="' +
+      lineY +
+      '" class="chartAxis" />' +
+
+      '<text x="5" y="' +
+      (
+        lineY +
+        4
+      ) +
+      '" class="chartLabel">' +
+
+      formatNumber(
+        price,
+        2
+      ) +
+
+      '</text>';
+  }
+
+  const firstTime =
+    formatTime(
+      rows[0]
+        .timestamp
+    );
+
+  const middleTime =
+    formatTime(
+      rows[
+        Math.floor(
+          rows.length /
+          2
+        )
+      ].timestamp
+    );
+
+  const lastTime =
+    formatTime(
+      rows[
+        rows.length -
+        1
+      ].timestamp
+    );
+
+  return (
+    '<div class="chartBox">' +
+
+    '<div class="chartTitle">' +
+    'Intraday price (PKR) • 1-minute candles' +
+    '</div>' +
+
+    '<svg class="priceChart" ' +
+    'viewBox="0 0 ' +
+    width +
+    ' ' +
+    height +
+    '" preserveAspectRatio="none">' +
+
+    horizontalLines +
+
+    '<polygon points="' +
+    areaPoints +
+    '" class="chartArea" />' +
+
+    '<polyline points="' +
+    points +
+    '" class="chartLine" />' +
+
+    '<text x="' +
+    paddingLeft +
+    '" y="' +
+    (
+      height -
+      8
+    ) +
+    '" class="chartLabel">' +
+
+    escapeHtml(
+      firstTime
+    ) +
+
+    '</text>' +
+
+    '<text x="' +
+    (
+      width /
+      2
+    ) +
+    '" y="' +
+    (
+      height -
+      8
+    ) +
+    '" text-anchor="middle" ' +
+    'class="chartLabel">' +
+
+    escapeHtml(
+      middleTime
+    ) +
+
+    '</text>' +
+
+    '<text x="' +
+    (
+      width -
+      paddingRight
+    ) +
+    '" y="' +
+    (
+      height -
+      8
+    ) +
+    '" text-anchor="end" ' +
+    'class="chartLabel">' +
+
+    escapeHtml(
+      lastTime
+    ) +
+
+    '</text>' +
+
+    '</svg>' +
+
+    '</div>'
+  );
+}
+
+function renderLiveChart(
+  result
+) {
+  renderFeedStatus(
+    result
+  );
+
+  const stateNote =
+    result.feedState ===
+    'LIVE'
+      ? 'Market open • auto-refreshing every 15 seconds'
+
+      : result.feedState ===
+        'DELAYED'
+        ? 'Market open, but the latest pyPSX candle is delayed'
+
+        : result.marketStatus
+            ?.known
+          ? 'Market closed • showing the latest trading session'
+
+          : 'Showing the latest available trading session';
+
+  $('research')
+    .innerHTML =
+
+      '<div class="liveChartHeader">' +
+
+      '<div>' +
+
+      '<div class="muted">' +
+      escapeHtml(
+        stateNote
+      ) +
+      '</div>' +
+
+      '<div class="liveChartPrice">' +
+      'PKR ' +
+      formatNumber(
+        result.price
+      ) +
+      '</div>' +
+
+      '<div class="feedMeta">' +
+      escapeHtml(
+        result.sessionDate ||
+        ''
+      ) +
+      ' • pyPSX' +
+      '</div>' +
+
+      '</div>' +
+
+      '</div>' +
+
+      '<div class="summaryGrid">' +
+
+      '<div class="metric">' +
+      '<div class="metricLabel">' +
+      'Session open' +
+      '</div>' +
+      '<div class="metricValue">' +
+      'PKR ' +
+      formatNumber(
+        result.session
+          ?.open
+      ) +
+      '</div>' +
+      '</div>' +
+
+      '<div class="metric">' +
+      '<div class="metricLabel">' +
+      'Session high' +
+      '</div>' +
+      '<div class="metricValue">' +
+      'PKR ' +
+      formatNumber(
+        result.session
+          ?.high
+      ) +
+      '</div>' +
+      '</div>' +
+
+      '<div class="metric">' +
+      '<div class="metricLabel">' +
+      'Session low' +
+      '</div>' +
+      '<div class="metricValue">' +
+      'PKR ' +
+      formatNumber(
+        result.session
+          ?.low
+      ) +
+      '</div>' +
+      '</div>' +
+
+      '<div class="metric">' +
+      '<div class="metricLabel">' +
+      'Session volume' +
+      '</div>' +
+      '<div class="metricValue">' +
+      formatNumber(
+        result.session
+          ?.volume,
+        0
+      ) +
+      '</div>' +
+      '</div>' +
+
+      '</div>' +
+
+      buildIntradayChart(
+        result.data
+      );
+}
+
+async function refreshLiveChart(
+  symbol,
+  silent = false
+) {
+  try {
+    const result =
+      await api(
+        'live-chart',
+        {
+          symbol
+        }
+      );
+
+    if (
+      liveRefreshSymbol ===
+        symbol &&
+      liveView ===
+        'chart'
+    ) {
+      renderLiveChart(
+        result
+      );
+    }
+  } catch (error) {
+    if (!silent) {
+      $('research')
+        .innerHTML =
+          '';
+
+      $('error')
+        .textContent =
+          error.message;
+    }
+  }
+}
+
+function startLiveChart(
+  symbol
+) {
+  stopLiveRefresh();
+
+  if (!symbol) {
+    return;
+  }
+
+  liveRefreshSymbol =
+    symbol;
+
+  liveView =
+    'chart';
+
+  $('research')
+    .innerHTML =
+      '<p class="muted">' +
+      'Loading intraday chart...' +
+      '</p>';
+
+  refreshLiveChart(
+    symbol
+  );
+
+  liveRefreshTimer =
+    setInterval(
+      () =>
+        refreshLiveChart(
           symbol,
           true
         ),
@@ -2449,16 +3671,21 @@ function getFilteredRows() {
     );
 
   rows =
-    [...rows];
+    [
+      ...rows
+    ];
 
   switch (
-    $('sort').value
+    $('sort')
+      .value
   ) {
-
     case 'priceAsc':
 
       rows.sort(
-        (a,b) =>
+        (
+          a,
+          b
+        ) =>
           (
             a.price ??
             Infinity
@@ -2474,7 +3701,10 @@ function getFilteredRows() {
     case 'priceDesc':
 
       rows.sort(
-        (a,b) =>
+        (
+          a,
+          b
+        ) =>
           (
             b.price ??
             -Infinity
@@ -2490,7 +3720,10 @@ function getFilteredRows() {
     case 'changeDesc':
 
       rows.sort(
-        (a,b) =>
+        (
+          a,
+          b
+        ) =>
           (
             b.change1yPct ??
             -Infinity
@@ -2506,7 +3739,10 @@ function getFilteredRows() {
     case 'changeAsc':
 
       rows.sort(
-        (a,b) =>
+        (
+          a,
+          b
+        ) =>
           (
             a.change1yPct ??
             Infinity
@@ -2522,7 +3758,10 @@ function getFilteredRows() {
     case 'dividendDesc':
 
       rows.sort(
-        (a,b) =>
+        (
+          a,
+          b
+        ) =>
           (
             b.dividendYield ??
             -Infinity
@@ -2541,11 +3780,16 @@ function getFilteredRows() {
         rows
           .filter(
             row =>
-              row.peRatio !== null &&
-              row.peRatio > 0
+              row.peRatio !==
+                null &&
+              row.peRatio >
+                0
           )
           .sort(
-            (a,b) =>
+            (
+              a,
+              b
+            ) =>
               a.peRatio -
               b.peRatio
           );
@@ -2555,7 +3799,10 @@ function getFilteredRows() {
     case 'volumeDesc':
 
       rows.sort(
-        (a,b) =>
+        (
+          a,
+          b
+        ) =>
           (
             b.averageVolume30d ??
             -Infinity
@@ -2571,7 +3818,10 @@ function getFilteredRows() {
     default:
 
       rows.sort(
-        (a,b) =>
+        (
+          a,
+          b
+        ) =>
           a.symbol
             .localeCompare(
               b.symbol
@@ -2741,19 +3991,23 @@ function renderStocks() {
             );
           }
         )
-        .join('') +
+        .join(
+          ''
+        ) +
 
       '</tbody>' +
 
       '</table>';
 
   const first =
-    start + 1;
+    start +
+    1;
 
   const last =
     Math.min(
       start +
       PAGE_SIZE,
+
       rows.length
     );
 
@@ -2790,7 +4044,8 @@ function renderStocks() {
           () => {
 
             const symbol =
-              row.dataset.symbol;
+              row.dataset
+                .symbol;
 
             $('stockSymbol')
               .value =
@@ -2804,6 +4059,7 @@ function renderStocks() {
               .scrollIntoView({
                 behavior:
                   'smooth',
+
                 block:
                   'start'
               });
@@ -2837,7 +4093,9 @@ function populateSectors() {
 
   $('sectorFilter')
     .innerHTML =
-      '<option value="">All sectors</option>' +
+      '<option value="">' +
+      'All sectors' +
+      '</option>' +
 
       sectors
         .map(
@@ -2852,7 +4110,9 @@ function populateSectors() {
             ) +
             '</option>'
         )
-        .join('');
+        .join(
+          ''
+        );
 }
 
 /* ---------------------------------------
@@ -2917,6 +4177,7 @@ $('loadMarket')
 $('search')
   .oninput =
     () => {
+
       currentPage =
         1;
 
@@ -2926,6 +4187,7 @@ $('search')
 $('sectorFilter')
   .onchange =
     () => {
+
       currentPage =
         1;
 
@@ -2935,6 +4197,7 @@ $('sectorFilter')
 $('sort')
   .onchange =
     () => {
+
       currentPage =
         1;
 
@@ -2992,7 +4255,7 @@ function buildPriceChart(
   if (
     !rows ||
     rows.length <
-      2
+    2
   ) {
     return (
       '<p class="muted">' +
@@ -3058,7 +4321,8 @@ function buildPriceChart(
   }
 
   const range =
-    max - min;
+    max -
+    min;
 
   const margin =
     range *
@@ -3107,16 +4371,22 @@ function buildPriceChart(
           row,
           index
         ) =>
-          x(index) +
+          x(
+            index
+          ) +
           ',' +
           y(
             row.close
           )
       )
-      .join(' ');
+      .join(
+        ' '
+      );
 
   const firstX =
-    x(0);
+    x(
+      0
+    );
 
   const lastX =
     x(
@@ -3145,8 +4415,10 @@ function buildPriceChart(
   for (
     let index =
       0;
+
     index <
       5;
+
     index++
   ) {
     const fraction =
@@ -3194,10 +4466,12 @@ function buildPriceChart(
       ) +
       '" ' +
       'class="chartLabel">' +
+
       formatNumber(
         price,
         2
       ) +
+
       '</text>';
   }
 
@@ -3260,11 +4534,13 @@ function buildPriceChart(
     ) +
     '" ' +
     'class="chartLabel">' +
+
     escapeHtml(
       formatDate(
         firstDate
       )
     ) +
+
     '</text>' +
 
     '<text ' +
@@ -3282,11 +4558,13 @@ function buildPriceChart(
     '" ' +
     'text-anchor="middle" ' +
     'class="chartLabel">' +
+
     escapeHtml(
       formatDate(
         middleDate
       )
     ) +
+
     '</text>' +
 
     '<text ' +
@@ -3304,11 +4582,13 @@ function buildPriceChart(
     '" ' +
     'text-anchor="end" ' +
     'class="chartLabel">' +
+
     escapeHtml(
       formatDate(
         lastDate
       )
     ) +
+
     '</text>' +
 
     '</svg>' +
@@ -3328,7 +4608,8 @@ function renderHistory(
     result.summary;
 
   const companyName =
-    result.company?.name ||
+    result.company
+      ?.name ||
     result.symbol;
 
   $('selectedCompany')
@@ -3344,10 +4625,12 @@ function renderHistory(
         result.symbol
       ) +
       (
-        result.company?.sector
+        result.company
+          ?.sector
           ? ' • ' +
             escapeHtml(
-              result.company.sector
+              result.company
+                .sector
             )
           : ''
       ) +
@@ -3356,14 +4639,16 @@ function renderHistory(
   if (!summary) {
     $('research')
       .innerHTML =
-        '<p>No valid historical price data was available.</p>';
+        '<p>' +
+        'No valid historical price data was available.' +
+        '</p>';
 
     return;
   }
 
   const changeClass =
     summary.changePct >
-      0
+    0
       ? 'positive'
       : summary.changePct <
         0
@@ -3376,8 +4661,11 @@ function renderHistory(
       '<div class="summaryGrid">' +
 
       '<div class="metric">' +
-      '<div class="metricLabel">Latest historical close</div>' +
-      '<div class="metricValue">PKR ' +
+      '<div class="metricLabel">' +
+      'Latest historical close' +
+      '</div>' +
+      '<div class="metricValue">' +
+      'PKR ' +
       formatNumber(
         summary.endPrice
       ) +
@@ -3385,7 +4673,9 @@ function renderHistory(
       '</div>' +
 
       '<div class="metric">' +
-      '<div class="metricLabel">Period change</div>' +
+      '<div class="metricLabel">' +
+      'Period change' +
+      '</div>' +
       '<div class="metricValue ' +
       changeClass +
       '">' +
@@ -3396,8 +4686,11 @@ function renderHistory(
       '</div>' +
 
       '<div class="metric">' +
-      '<div class="metricLabel">Period high</div>' +
-      '<div class="metricValue">PKR ' +
+      '<div class="metricLabel">' +
+      'Period high' +
+      '</div>' +
+      '<div class="metricValue">' +
+      'PKR ' +
       formatNumber(
         summary.high
       ) +
@@ -3405,8 +4698,11 @@ function renderHistory(
       '</div>' +
 
       '<div class="metric">' +
-      '<div class="metricLabel">Period low</div>' +
-      '<div class="metricValue">PKR ' +
+      '<div class="metricLabel">' +
+      'Period low' +
+      '</div>' +
+      '<div class="metricValue">' +
+      'PKR ' +
       formatNumber(
         summary.low
       ) +
@@ -3414,7 +4710,9 @@ function renderHistory(
       '</div>' +
 
       '<div class="metric">' +
-      '<div class="metricLabel">Average volume</div>' +
+      '<div class="metricLabel">' +
+      'Average volume' +
+      '</div>' +
       '<div class="metricValue">' +
       formatNumber(
         summary.averageVolume,
@@ -3436,6 +4734,7 @@ function renderHistory(
             summary.excludedAnomalies +
             ' suspicious historical rows were excluded from this chart.' +
             '</div>'
+
           : ''
       ) +
 
@@ -3475,6 +4774,14 @@ $('loadQuote')
           .value
           .trim()
           .toUpperCase();
+
+      if (!symbol) {
+        $('error')
+          .textContent =
+            'Enter a PSX symbol.';
+
+        return;
+      }
 
       showSelectedCompany(
         symbol
@@ -3528,8 +4835,11 @@ $('loadQuote')
             '<div class="summaryGrid">' +
 
             '<div class="metric">' +
-            '<div class="metricLabel">Price</div>' +
-            '<div class="metricValue">PKR ' +
+            '<div class="metricLabel">' +
+            'Price' +
+            '</div>' +
+            '<div class="metricValue">' +
+            'PKR ' +
             formatNumber(
               data.price
             ) +
@@ -3537,7 +4847,9 @@ $('loadQuote')
             '</div>' +
 
             '<div class="metric">' +
-            '<div class="metricLabel">P/E</div>' +
+            '<div class="metricLabel">' +
+            'P/E' +
+            '</div>' +
             '<div class="metricValue">' +
             formatNumber(
               data.pe_ratio
@@ -3546,7 +4858,9 @@ $('loadQuote')
             '</div>' +
 
             '<div class="metric">' +
-            '<div class="metricLabel">Dividend yield</div>' +
+            '<div class="metricLabel">' +
+            'Dividend yield' +
+            '</div>' +
             '<div class="metricValue">' +
             formatPercent(
               data.dividend_yield
@@ -3555,7 +4869,9 @@ $('loadQuote')
             '</div>' +
 
             '<div class="metric">' +
-            '<div class="metricLabel">30D avg volume</div>' +
+            '<div class="metricLabel">' +
+            '30D avg volume' +
+            '</div>' +
             '<div class="metricValue">' +
             formatNumber(
               data.volume_avg_30d,
@@ -3565,7 +4881,9 @@ $('loadQuote')
             '</div>' +
 
             '<div class="metric">' +
-            '<div class="metricLabel">1Y change</div>' +
+            '<div class="metricLabel">' +
+            '1Y change' +
+            '</div>' +
             '<div class="metricValue ' +
             (
               data.change_1y_pct >
@@ -3586,7 +4904,11 @@ $('loadQuote')
             '</div>' +
 
             '<details>' +
-            '<summary>View raw quote data</summary>' +
+
+            '<summary>' +
+            'View raw quote data' +
+            '</summary>' +
+
             '<pre>' +
             escapeHtml(
               JSON.stringify(
@@ -3596,9 +4918,10 @@ $('loadQuote')
               )
             ) +
             '</pre>' +
+
             '</details>';
 
-        startLiveRefresh(
+        startLiveOverview(
           symbol
         );
 
@@ -3608,6 +4931,41 @@ $('loadQuote')
           .textContent =
             error.message;
       }
+    };
+
+/* ---------------------------------------
+   LIVE CHART BUTTON
+--------------------------------------- */
+
+$('loadLiveChart')
+  .onclick =
+    async () => {
+
+      $('error')
+        .textContent =
+          '';
+
+      const symbol =
+        $('stockSymbol')
+          .value
+          .trim()
+          .toUpperCase();
+
+      if (!symbol) {
+        $('error')
+          .textContent =
+            'Enter a PSX symbol.';
+
+        return;
+      }
+
+      showSelectedCompany(
+        symbol
+      );
+
+      startLiveChart(
+        symbol
+      );
     };
 
 /* ---------------------------------------
@@ -3628,6 +4986,14 @@ $('loadHistory')
           .trim()
           .toUpperCase();
 
+      if (!symbol) {
+        $('error')
+          .textContent =
+            'Enter a PSX symbol.';
+
+        return;
+      }
+
       stopLiveRefresh();
 
       $('liveStatus')
@@ -3640,7 +5006,9 @@ $('loadHistory')
 
       $('research')
         .innerHTML =
-          '<p class="muted">Loading historical chart...</p>';
+          '<p class="muted">' +
+          'Loading historical chart...' +
+          '</p>';
 
       try {
         const result =
@@ -3685,6 +5053,14 @@ $('loadFundamentals')
           .trim()
           .toUpperCase();
 
+      if (!symbol) {
+        $('error')
+          .textContent =
+            'Enter a PSX symbol.';
+
+        return;
+      }
+
       stopLiveRefresh();
 
       $('liveStatus')
@@ -3705,13 +5081,15 @@ $('loadFundamentals')
           );
 
         if (
-          result.company?.name
+          result.company
+            ?.name
         ) {
           $('selectedCompany')
             .innerHTML =
               '<strong>' +
               escapeHtml(
-                result.company.name
+                result.company
+                  .name
               ) +
               '</strong>' +
 
@@ -3720,10 +5098,12 @@ $('loadFundamentals')
                 result.symbol
               ) +
               (
-                result.company.sector
+                result.company
+                  .sector
                   ? ' • ' +
                     escapeHtml(
-                      result.company.sector
+                      result.company
+                        .sector
                     )
                   : ''
               ) +
@@ -3761,6 +5141,7 @@ $('loadFundamentals')
 $('stockSymbol')
   .oninput =
     () => {
+
       stopLiveRefresh();
 
       $('liveStatus')
@@ -3780,7 +5161,7 @@ api(
 
       $('status')
         .textContent =
-          'Market: connected | Company names: connected | pyPSX: ' +
+          'Market: connected | Company names: official PSX metadata | pyPSX: ' +
           (
             result.pyPSXConfigured
               ? 'configured'
