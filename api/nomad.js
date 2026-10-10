@@ -3,7 +3,7 @@
 const http = require('node:http');
 const crypto = require('node:crypto');
 
-const VERSION = '0.4.0';
+const VERSION = '0.4.1';
 
 const PSX_API_BASE =
   process.env.PSX_API_BASE ||
@@ -137,7 +137,7 @@ async function fetchText(
     headers: {
       Accept: 'text/html,application/xhtml+xml',
       'User-Agent':
-        'Mozilla/5.0 NOMAD-Invest/0.4',
+        'Mozilla/5.0 NOMAD-Invest/0.4.1',
       ...headers
     },
     signal: AbortSignal.timeout(timeout)
@@ -546,8 +546,64 @@ async function getPyPSXIntraday(
       'Last market price';
   }
 
-  const volumes =
+  const normalizedSessionRows =
     sessionRows.map(
+      row => {
+        const close =
+          row.close;
+
+        const open =
+          row.open ??
+          close;
+
+        const high =
+          row.high ??
+          Math.max(
+            open,
+            close
+          );
+
+        const low =
+          row.low ??
+          Math.min(
+            open,
+            close
+          );
+
+        return {
+          timestamp:
+            new Date(
+              pyPSXTimeValue(
+                row.timestamp
+              )
+            ).toISOString(),
+
+          open,
+
+          high:
+            Math.max(
+              high,
+              open,
+              close
+            ),
+
+          low:
+            Math.min(
+              low,
+              open,
+              close
+            ),
+
+          close,
+
+          volume:
+            row.volume || 0
+        };
+      }
+    );
+
+  const volumes =
+    normalizedSessionRows.map(
       row =>
         row.volume || 0
     );
@@ -589,39 +645,27 @@ async function getPyPSXIntraday(
 
     session: {
       open:
-        sessionRows[0]?.open ??
-        sessionRows[0]?.close ??
+        normalizedSessionRows[0]?.open ??
+        normalizedSessionRows[0]?.close ??
         null,
 
       high:
-        sessionRows.length
+        normalizedSessionRows.length
           ? Math.max(
-              ...sessionRows
-                .map(
-                  row =>
-                    row.high ??
-                    row.close
-                )
-                .filter(
-                  value =>
-                    value !== null
-                )
+              ...normalizedSessionRows.map(
+                row =>
+                  row.high
+              )
             )
           : null,
 
       low:
-        sessionRows.length
+        normalizedSessionRows.length
           ? Math.min(
-              ...sessionRows
-                .map(
-                  row =>
-                    row.low ??
-                    row.close
-                )
-                .filter(
-                  value =>
-                    value !== null
-                )
+              ...normalizedSessionRows.map(
+                row =>
+                  row.low
+              )
             )
           : null,
 
@@ -632,35 +676,11 @@ async function getPyPSXIntraday(
         totalVolume,
 
       candles:
-        sessionRows.length
+        normalizedSessionRows.length
     },
 
     data:
-      sessionRows.map(
-        row => ({
-          timestamp:
-            new Date(
-              pyPSXTimeValue(
-                row.timestamp
-              )
-            ).toISOString(),
-
-          open:
-            row.open,
-
-          high:
-            row.high,
-
-          low:
-            row.low,
-
-          close:
-            row.close,
-
-          volume:
-            row.volume || 0
-        })
-      )
+      normalizedSessionRows
   };
 }
 
@@ -791,7 +811,8 @@ async function loadCompanyMap() {
     const response =
       await fetchJSON(
         `${getPyPSXBase()}/symbols`,
-        20000
+        20000,
+        pyPSXHeaders()
       );
 
     const rows =
@@ -1024,8 +1045,7 @@ async function loadSectorMap() {
         of stocksResponse.data
       ) {
         const symbol =
-          typeof item ===
-          'string'
+          typeof item === 'string'
             ? normalizeSymbol(
                 item
               )
@@ -1048,7 +1068,6 @@ async function loadSectorMap() {
   sectorCache = {
     fetchedAt:
       Date.now(),
-
     data:
       map
   };
@@ -1211,9 +1230,7 @@ async function loadPSXMarket() {
             timestamp
           )
       )
-      .filter(
-        Boolean
-      );
+      .filter(Boolean);
 
   if (!stocks.length) {
     bad(
@@ -1241,7 +1258,6 @@ async function loadPSXMarket() {
   marketCache = {
     fetchedAt:
       Date.now(),
-
     data:
       result
   };
@@ -1436,18 +1452,12 @@ async function getHistory(
 
     const normalized = {
       date,
-
       open,
-
       high,
-
       low,
-
       close,
-
       volume:
         volume || 0,
-
       isAnomaly:
         suspicious
     };
@@ -1465,13 +1475,9 @@ async function getHistory(
 
   cleaned.sort(
     (a, b) =>
-      String(
-        a.date
-      )
+      String(a.date)
         .localeCompare(
-          String(
-            b.date
-          )
+          String(b.date)
         )
   );
 
@@ -1486,8 +1492,7 @@ async function getHistory(
 
     const last =
       cleaned[
-        cleaned.length -
-        1
+        cleaned.length - 1
       ];
 
     const prices =
@@ -1499,8 +1504,7 @@ async function getHistory(
     const volumes =
       cleaned.map(
         row =>
-          row.volume ||
-          0
+          row.volume || 0
       );
 
     const change =
@@ -1512,8 +1516,7 @@ async function getHistory(
         ? (
             change /
             first.close
-          ) *
-          100
+          ) * 100
         : null;
 
     summary = {
@@ -1567,21 +1570,22 @@ async function getHistory(
     };
   }
 
-  const company =
-    companyMap.get(
-      symbol
-    );
-
   return {
     symbol,
 
     company:
-      company
+      companyMap.get(
+        symbol
+      )
         ? {
-            ...company,
+            ...companyMap.get(
+              symbol
+            ),
 
             sector:
-              company.sector ||
+              companyMap.get(
+                symbol
+              ).sector ||
               sectorMap.get(
                 symbol
               ) ||
@@ -1684,20 +1688,14 @@ function safeEqual(
           'sha256'
         )
         .update(
-          String(
-            value
-          )
+          String(value)
         )
         .digest();
 
   return crypto
     .timingSafeEqual(
-      hash(
-        a
-      ),
-      hash(
-        b
-      )
+      hash(a),
+      hash(b)
     );
 }
 
@@ -1832,14 +1830,12 @@ async function handler(
     const action =
       url.searchParams.get(
         'action'
-      ) ||
-      'app';
+      ) || 'app';
 
     if (
       request.method ===
         'GET' &&
-      action ===
-        'app'
+      action === 'app'
     ) {
       response.setHeader(
         'Content-Type',
@@ -2043,7 +2039,7 @@ async function handler(
       },
 
       error.status ||
-      500
+        500
     );
   }
 }
@@ -2160,7 +2156,6 @@ select {
     minmax(240px,2fr)
     minmax(180px,1fr)
     minmax(210px,1fr);
-
   gap: 12px;
   margin: 18px 0;
 }
@@ -2254,13 +2249,11 @@ tbody tr:hover {
 
 .summaryGrid {
   display: grid;
-
   grid-template-columns:
     repeat(
       auto-fit,
       minmax(150px,1fr)
     );
-
   gap: 12px;
   margin: 18px 0;
 }
@@ -2341,6 +2334,92 @@ tbody tr:hover {
 .liveChartPrice {
   font-size: 28px;
   font-weight: 750;
+}
+
+.chartModeToggle {
+  display: inline-flex;
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid #d9e2e9;
+  border-radius: 9px;
+  background: #f7f9fb;
+}
+
+.chartModeButton {
+  background: transparent;
+  color: #44596b;
+  padding: 7px 12px;
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+.chartModeButton.active {
+  background: #173f58;
+  color: white;
+}
+
+.chartLegend {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  color: #66788a;
+  font-size: 12px;
+  margin-bottom: 8px;
+}
+
+.legendSwatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  display: inline-block;
+  margin-right: 5px;
+}
+
+.legendSwatch.up {
+  background: #11823b;
+}
+
+.legendSwatch.down {
+  background: #c73737;
+}
+
+.candleChart {
+  display: block;
+  width: 100%;
+  height: 420px;
+}
+
+.candleUp {
+  fill: #11823b;
+  stroke: #11823b;
+}
+
+.candleDown {
+  fill: #c73737;
+  stroke: #c73737;
+}
+
+.candleFlat {
+  fill: #778899;
+  stroke: #778899;
+}
+
+.volumeUp {
+  fill: rgba(17,130,59,.45);
+}
+
+.volumeDown {
+  fill: rgba(199,55,55,.45);
+}
+
+.volumeFlat {
+  fill: rgba(119,136,153,.4);
+}
+
+.volumeSeparator {
+  stroke: #dfe6ec;
+  stroke-width: 1;
 }
 
 .chartBox {
@@ -2438,6 +2517,10 @@ pre {
 
   .priceChart {
     height: 260px;
+  }
+
+  .candleChart {
+    height: 340px;
   }
 
 }
@@ -2694,14 +2777,19 @@ let liveRefreshSymbol =
 let liveView =
   null;
 
+let liveChartMode =
+  'candles';
+
+let lastLiveChartResult =
+  null;
+
 /* ---------------------------------------
    HELPERS
 --------------------------------------- */
 
 function escapeHtml(value) {
   return String(
-    value ??
-    ''
+    value ?? ''
   ).replace(
     /[&<>"']/g,
     character => ({
@@ -2777,10 +2865,8 @@ function formatDate(
       {
         day:
           'numeric',
-
         month:
           'short',
-
         year:
           'numeric'
       }
@@ -2881,10 +2967,7 @@ async function api(
   );
 
   for (
-    const [
-      key,
-      value
-    ]
+    const [key,value]
     of Object.entries(
       params
     )
@@ -2942,6 +3025,9 @@ function stopLiveRefresh() {
 
   liveView =
     null;
+
+  lastLiveChartResult =
+    null;
 }
 
 function renderFeedStatus(
@@ -2954,8 +3040,7 @@ function renderFeedStatus(
   const dotClass =
     state === 'LIVE'
       ? 'live'
-      : state ===
-          'DELAYED'
+      : state === 'DELAYED'
         ? 'delayed'
         : 'closed';
 
@@ -2997,6 +3082,45 @@ function renderFeedStatus(
       '</span>';
 }
 
+function shouldAutoRefresh(
+  result
+) {
+  return Boolean(
+    result?.marketStatus?.known &&
+    result?.marketStatus?.isOpen
+  );
+}
+
+function scheduleLiveRefresh(
+  callback,
+  result
+) {
+  if (
+    liveRefreshTimer
+  ) {
+    clearInterval(
+      liveRefreshTimer
+    );
+
+    liveRefreshTimer =
+      null;
+  }
+
+  if (
+    !shouldAutoRefresh(
+      result
+    )
+  ) {
+    return;
+  }
+
+  liveRefreshTimer =
+    setInterval(
+      callback,
+      15000
+    );
+}
+
 async function refreshLiveOverview(
   symbol,
   silent = false
@@ -3012,12 +3136,30 @@ async function refreshLiveOverview(
 
     if (
       liveRefreshSymbol ===
-      symbol
+        symbol &&
+      liveView ===
+        'overview'
     ) {
       renderFeedStatus(
         result
       );
+
+      if (
+        liveRefreshTimer &&
+        !shouldAutoRefresh(
+          result
+        )
+      ) {
+        clearInterval(
+          liveRefreshTimer
+        );
+
+        liveRefreshTimer =
+          null;
+      }
     }
+
+    return result;
   } catch (error) {
     if (!silent) {
       $('liveStatus')
@@ -3029,10 +3171,12 @@ async function refreshLiveOverview(
           ) +
           '</span>';
     }
+
+    return null;
   }
 }
 
-function startLiveOverview(
+async function startLiveOverview(
   symbol
 ) {
   stopLiveRefresh();
@@ -3053,22 +3197,122 @@ function startLiveOverview(
       'Loading latest pyPSX price...' +
       '</span>';
 
-  refreshLiveOverview(
-    symbol
-  );
+  const result =
+    await refreshLiveOverview(
+      symbol
+    );
 
-  liveRefreshTimer =
-    setInterval(
+  if (
+    result &&
+    liveRefreshSymbol ===
+      symbol &&
+    liveView ===
+      'overview'
+  ) {
+    scheduleLiveRefresh(
       () =>
         refreshLiveOverview(
           symbol,
           true
         ),
-      15000
+      result
     );
+  }
 }
 
-function buildIntradayChart(
+function chartDirectionClass(
+  row,
+  prefix
+) {
+  const open =
+    Number(
+      row.open
+    );
+
+  const close =
+    Number(
+      row.close
+    );
+
+  if (close > open) {
+    return prefix +
+      'Up';
+  }
+
+  if (close < open) {
+    return prefix +
+      'Down';
+  }
+
+  return prefix +
+    'Flat';
+}
+
+function buildPriceGrid(
+  min,
+  max,
+  width,
+  paddingLeft,
+  paddingRight,
+  paddingTop,
+  priceHeight
+) {
+  let lines =
+    '';
+
+  for (
+    let index = 0;
+    index < 5;
+    index++
+  ) {
+    const fraction =
+      index /
+      4;
+
+    const price =
+      max -
+      fraction *
+      (
+        max -
+        min
+      );
+
+    const lineY =
+      paddingTop +
+      fraction *
+      priceHeight;
+
+    lines +=
+      '<line x1="' +
+      paddingLeft +
+      '" x2="' +
+      (
+        width -
+        paddingRight
+      ) +
+      '" y1="' +
+      lineY +
+      '" y2="' +
+      lineY +
+      '" class="chartAxis" />' +
+
+      '<text x="5" y="' +
+      (
+        lineY +
+        4
+      ) +
+      '" class="chartLabel">' +
+      formatNumber(
+        price,
+        2
+      ) +
+      '</text>';
+  }
+
+  return lines;
+}
+
+function buildIntradayLineChart(
   rows
 ) {
   if (
@@ -3086,7 +3330,7 @@ function buildIntradayChart(
     1000;
 
   const height =
-    330;
+    410;
 
   const paddingLeft =
     65;
@@ -3097,18 +3341,19 @@ function buildIntradayChart(
   const paddingTop =
     20;
 
-  const paddingBottom =
-    42;
+  const priceHeight =
+    265;
+
+  const volumeTop =
+    310;
+
+  const volumeHeight =
+    58;
 
   const usableWidth =
     width -
     paddingLeft -
     paddingRight;
-
-  const usableHeight =
-    height -
-    paddingTop -
-    paddingBottom;
 
   const closes =
     rows.map(
@@ -3146,14 +3391,15 @@ function buildIntradayChart(
     Math.max(
       range *
       .08,
-
       max *
       .002
     );
 
-  min -= margin;
+  min -=
+    margin;
 
-  max += margin;
+  max +=
+    margin;
 
   const x =
     index =>
@@ -3183,7 +3429,7 @@ function buildIntradayChart(
           )
         )
       ) *
-      usableHeight;
+      priceHeight;
 
   const points =
     rows
@@ -3204,85 +3450,122 @@ function buildIntradayChart(
         ' '
       );
 
-  const firstX =
-    x(
-      0
-    );
-
-  const lastX =
-    x(
-      rows.length -
-      1
-    );
-
   const bottomY =
     paddingTop +
-    usableHeight;
+    priceHeight;
 
   const areaPoints =
-    firstX +
+    x(0) +
     ',' +
     bottomY +
     ' ' +
     points +
     ' ' +
-    lastX +
+    x(
+      rows.length -
+      1
+    ) +
     ',' +
     bottomY;
 
-  let horizontalLines =
-    '';
+  const maxVolume =
+    Math.max(
+      1,
+      ...rows.map(
+        row =>
+          Number(
+            row.volume ||
+            0
+          )
+      )
+    );
 
-  for (
-    let index = 0;
-    index < 5;
-    index++
-  ) {
-    const fraction =
-      index /
-      4;
+  const step =
+    usableWidth /
+    rows.length;
 
-    const price =
-      max -
-      fraction *
-      (
-        max -
-        min
+  const barWidth =
+    Math.max(
+      1,
+      Math.min(
+        7,
+        step *
+        .72
+      )
+    );
+
+  const volumeBars =
+    rows
+      .map(
+        (
+          row,
+          index
+        ) => {
+          const volume =
+            Number(
+              row.volume ||
+              0
+            );
+
+          const barHeight =
+            maxVolume > 0
+              ? (
+                  volume /
+                  maxVolume
+                ) *
+                volumeHeight
+              : 0;
+
+          const barX =
+            paddingLeft +
+            index *
+            step +
+            (
+              step -
+              barWidth
+            ) /
+            2;
+
+          const barY =
+            volumeTop +
+            volumeHeight -
+            barHeight;
+
+          return (
+            '<rect x="' +
+            barX +
+            '" y="' +
+            barY +
+            '" width="' +
+            barWidth +
+            '" height="' +
+            Math.max(
+              .5,
+              barHeight
+            ) +
+            '" class="' +
+            chartDirectionClass(
+              row,
+              'volume'
+            ) +
+            '"><title>' +
+            escapeHtml(
+              formatTime(
+                row.timestamp
+              ) +
+              ' • Volume ' +
+              formatNumber(
+                volume,
+                0
+              )
+            ) +
+            '</title></rect>'
+          );
+        }
+      )
+      .join(
+        ''
       );
-
-    const lineY =
-      paddingTop +
-      fraction *
-      usableHeight;
-
-    horizontalLines +=
-      '<line x1="' +
-      paddingLeft +
-      '" x2="' +
-      (
-        width -
-        paddingRight
-      ) +
-      '" y1="' +
-      lineY +
-      '" y2="' +
-      lineY +
-      '" class="chartAxis" />' +
-
-      '<text x="5" y="' +
-      (
-        lineY +
-        4
-      ) +
-      '" class="chartLabel">' +
-
-      formatNumber(
-        price,
-        2
-      ) +
-
-      '</text>';
-  }
 
   const firstTime =
     formatTime(
@@ -3312,17 +3595,25 @@ function buildIntradayChart(
     '<div class="chartBox">' +
 
     '<div class="chartTitle">' +
-    'Intraday price (PKR) • 1-minute candles' +
+    'Intraday line + volume • 1-minute candles' +
     '</div>' +
 
-    '<svg class="priceChart" ' +
+    '<svg class="candleChart" ' +
     'viewBox="0 0 ' +
     width +
     ' ' +
     height +
     '" preserveAspectRatio="none">' +
 
-    horizontalLines +
+    buildPriceGrid(
+      min,
+      max,
+      width,
+      paddingLeft,
+      paddingRight,
+      paddingTop,
+      priceHeight
+    ) +
 
     '<polygon points="' +
     areaPoints +
@@ -3332,6 +3623,34 @@ function buildIntradayChart(
     points +
     '" class="chartLine" />' +
 
+    '<line x1="' +
+    paddingLeft +
+    '" x2="' +
+    (
+      width -
+      paddingRight
+    ) +
+    '" y1="' +
+    (
+      volumeTop -
+      10
+    ) +
+    '" y2="' +
+    (
+      volumeTop -
+      10
+    ) +
+    '" class="volumeSeparator" />' +
+
+    volumeBars +
+
+    '<text x="5" y="' +
+    (
+      volumeTop +
+      12
+    ) +
+    '" class="chartLabel">Vol</text>' +
+
     '<text x="' +
     paddingLeft +
     '" y="' +
@@ -3340,11 +3659,9 @@ function buildIntradayChart(
       8
     ) +
     '" class="chartLabel">' +
-
     escapeHtml(
       firstTime
     ) +
-
     '</text>' +
 
     '<text x="' +
@@ -3359,11 +3676,9 @@ function buildIntradayChart(
     ) +
     '" text-anchor="middle" ' +
     'class="chartLabel">' +
-
     escapeHtml(
       middleTime
     ) +
-
     '</text>' +
 
     '<text x="' +
@@ -3378,11 +3693,9 @@ function buildIntradayChart(
     ) +
     '" text-anchor="end" ' +
     'class="chartLabel">' +
-
     escapeHtml(
       lastTime
     ) +
-
     '</text>' +
 
     '</svg>' +
@@ -3391,9 +3704,551 @@ function buildIntradayChart(
   );
 }
 
+function buildIntradayCandlestickChart(
+  rows
+) {
+  if (
+    !rows ||
+    rows.length < 2
+  ) {
+    return (
+      '<p class="muted">' +
+      'Not enough intraday data to draw candlesticks.' +
+      '</p>'
+    );
+  }
+
+  const width =
+    1000;
+
+  const height =
+    430;
+
+  const paddingLeft =
+    65;
+
+  const paddingRight =
+    20;
+
+  const paddingTop =
+    20;
+
+  const priceHeight =
+    275;
+
+  const volumeTop =
+    322;
+
+  const volumeHeight =
+    64;
+
+  const usableWidth =
+    width -
+    paddingLeft -
+    paddingRight;
+
+  const normalized =
+    rows.map(
+      row => {
+        const close =
+          Number(
+            row.close
+          );
+
+        const open =
+          Number.isFinite(
+            Number(
+              row.open
+            )
+          )
+            ? Number(
+                row.open
+              )
+            : close;
+
+        const rawHigh =
+          Number.isFinite(
+            Number(
+              row.high
+            )
+          )
+            ? Number(
+                row.high
+              )
+            : Math.max(
+                open,
+                close
+              );
+
+        const rawLow =
+          Number.isFinite(
+            Number(
+              row.low
+            )
+          )
+            ? Number(
+                row.low
+              )
+            : Math.min(
+                open,
+                close
+              );
+
+        return {
+          ...row,
+
+          open,
+
+          high:
+            Math.max(
+              rawHigh,
+              open,
+              close
+            ),
+
+          low:
+            Math.min(
+              rawLow,
+              open,
+              close
+            ),
+
+          close,
+
+          volume:
+            Number(
+              row.volume ||
+              0
+            )
+        };
+      }
+    );
+
+  let min =
+    Math.min(
+      ...normalized.map(
+        row =>
+          row.low
+      )
+    );
+
+  let max =
+    Math.max(
+      ...normalized.map(
+        row =>
+          row.high
+      )
+    );
+
+  if (
+    min === max
+  ) {
+    min *=
+      .995;
+
+    max *=
+      1.005;
+  }
+
+  const range =
+    max -
+    min;
+
+  const margin =
+    Math.max(
+      range *
+      .06,
+      max *
+      .0015
+    );
+
+  min -=
+    margin;
+
+  max +=
+    margin;
+
+  const y =
+    price =>
+      paddingTop +
+      (
+        1 -
+        (
+          (
+            price -
+            min
+          ) /
+          (
+            max -
+            min
+          )
+        )
+      ) *
+      priceHeight;
+
+  const step =
+    usableWidth /
+    normalized.length;
+
+  const bodyWidth =
+    Math.max(
+      .8,
+      Math.min(
+        7,
+        step *
+        .68
+      )
+    );
+
+  const maxVolume =
+    Math.max(
+      1,
+      ...normalized.map(
+        row =>
+          row.volume
+      )
+    );
+
+  const candleSvg =
+    normalized
+      .map(
+        (
+          row,
+          index
+        ) => {
+          const centerX =
+            paddingLeft +
+            index *
+            step +
+            step /
+            2;
+
+          const openY =
+            y(
+              row.open
+            );
+
+          const closeY =
+            y(
+              row.close
+            );
+
+          const highY =
+            y(
+              row.high
+            );
+
+          const lowY =
+            y(
+              row.low
+            );
+
+          const bodyY =
+            Math.min(
+              openY,
+              closeY
+            );
+
+          const bodyHeight =
+            Math.max(
+              1,
+              Math.abs(
+                closeY -
+                openY
+              )
+            );
+
+          const directionClass =
+            chartDirectionClass(
+              row,
+              'candle'
+            );
+
+          const volumeClass =
+            chartDirectionClass(
+              row,
+              'volume'
+            );
+
+          const volumeHeightPx =
+            (
+              row.volume /
+              maxVolume
+            ) *
+            volumeHeight;
+
+          const volumeY =
+            volumeTop +
+            volumeHeight -
+            volumeHeightPx;
+
+          const title =
+            formatTime(
+              row.timestamp
+            ) +
+            ' • O ' +
+            formatNumber(
+              row.open
+            ) +
+            ' H ' +
+            formatNumber(
+              row.high
+            ) +
+            ' L ' +
+            formatNumber(
+              row.low
+            ) +
+            ' C ' +
+            formatNumber(
+              row.close
+            ) +
+            ' • Vol ' +
+            formatNumber(
+              row.volume,
+              0
+            );
+
+          return (
+            '<g>' +
+            '<title>' +
+            escapeHtml(
+              title
+            ) +
+            '</title>' +
+
+            '<line x1="' +
+            centerX +
+            '" x2="' +
+            centerX +
+            '" y1="' +
+            highY +
+            '" y2="' +
+            lowY +
+            '" class="' +
+            directionClass +
+            '" />' +
+
+            '<rect x="' +
+            (
+              centerX -
+              bodyWidth /
+              2
+            ) +
+            '" y="' +
+            bodyY +
+            '" width="' +
+            bodyWidth +
+            '" height="' +
+            bodyHeight +
+            '" class="' +
+            directionClass +
+            '" />' +
+
+            '<rect x="' +
+            (
+              centerX -
+              bodyWidth /
+              2
+            ) +
+            '" y="' +
+            volumeY +
+            '" width="' +
+            bodyWidth +
+            '" height="' +
+            Math.max(
+              .5,
+              volumeHeightPx
+            ) +
+            '" class="' +
+            volumeClass +
+            '" />' +
+
+            '</g>'
+          );
+        }
+      )
+      .join(
+        ''
+      );
+
+  const firstTime =
+    formatTime(
+      normalized[0]
+        .timestamp
+    );
+
+  const middleTime =
+    formatTime(
+      normalized[
+        Math.floor(
+          normalized.length /
+          2
+        )
+      ].timestamp
+    );
+
+  const lastTime =
+    formatTime(
+      normalized[
+        normalized.length -
+        1
+      ].timestamp
+    );
+
+  return (
+    '<div class="chartBox">' +
+
+    '<div class="chartTitle">' +
+    'Intraday candlesticks + volume • 1-minute candles' +
+    '</div>' +
+
+    '<div class="chartLegend">' +
+    '<span><span class="legendSwatch up"></span>' +
+    'Close ≥ open</span>' +
+    '<span><span class="legendSwatch down"></span>' +
+    'Close < open</span>' +
+    '<span>Hover a candle for OHLCV</span>' +
+    '</div>' +
+
+    '<svg class="candleChart" ' +
+    'viewBox="0 0 ' +
+    width +
+    ' ' +
+    height +
+    '" preserveAspectRatio="none">' +
+
+    buildPriceGrid(
+      min,
+      max,
+      width,
+      paddingLeft,
+      paddingRight,
+      paddingTop,
+      priceHeight
+    ) +
+
+    '<line x1="' +
+    paddingLeft +
+    '" x2="' +
+    (
+      width -
+      paddingRight
+    ) +
+    '" y1="' +
+    (
+      volumeTop -
+      10
+    ) +
+    '" y2="' +
+    (
+      volumeTop -
+      10
+    ) +
+    '" class="volumeSeparator" />' +
+
+    candleSvg +
+
+    '<text x="5" y="' +
+    (
+      volumeTop +
+      12
+    ) +
+    '" class="chartLabel">Vol</text>' +
+
+    '<text x="' +
+    paddingLeft +
+    '" y="' +
+    (
+      height -
+      8
+    ) +
+    '" class="chartLabel">' +
+    escapeHtml(
+      firstTime
+    ) +
+    '</text>' +
+
+    '<text x="' +
+    (
+      width /
+      2
+    ) +
+    '" y="' +
+    (
+      height -
+      8
+    ) +
+    '" text-anchor="middle" ' +
+    'class="chartLabel">' +
+    escapeHtml(
+      middleTime
+    ) +
+    '</text>' +
+
+    '<text x="' +
+    (
+      width -
+      paddingRight
+    ) +
+    '" y="' +
+    (
+      height -
+      8
+    ) +
+    '" text-anchor="end" ' +
+    'class="chartLabel">' +
+    escapeHtml(
+      lastTime
+    ) +
+    '</text>' +
+
+    '</svg>' +
+
+    '</div>'
+  );
+}
+
+function bindLiveChartModeButtons() {
+  document
+    .querySelectorAll(
+      '.chartModeButton'
+    )
+    .forEach(
+      button => {
+        button.onclick =
+          () => {
+            const mode =
+              button.dataset.mode;
+
+            if (
+              mode !== 'candles' &&
+              mode !== 'line'
+            ) {
+              return;
+            }
+
+            liveChartMode =
+              mode;
+
+            if (
+              lastLiveChartResult &&
+              liveView === 'chart'
+            ) {
+              renderLiveChart(
+                lastLiveChartResult
+              );
+            }
+          };
+      }
+    );
+}
+
 function renderLiveChart(
   result
 ) {
+  lastLiveChartResult =
+    result;
+
   renderFeedStatus(
     result
   );
@@ -3402,16 +4257,23 @@ function renderLiveChart(
     result.feedState ===
     'LIVE'
       ? 'Market open • auto-refreshing every 15 seconds'
-
       : result.feedState ===
         'DELAYED'
         ? 'Market open, but the latest pyPSX candle is delayed'
-
         : result.marketStatus
             ?.known
           ? 'Market closed • showing the latest trading session'
-
           : 'Showing the latest available trading session';
+
+  const chartMarkup =
+    liveChartMode ===
+      'candles'
+      ? buildIntradayCandlestickChart(
+          result.data
+        )
+      : buildIntradayLineChart(
+          result.data
+        );
 
   $('research')
     .innerHTML =
@@ -3440,6 +4302,36 @@ function renderLiveChart(
       ) +
       ' • pyPSX' +
       '</div>' +
+
+      '</div>' +
+
+      '<div class="chartModeToggle" ' +
+      'role="group" ' +
+      'aria-label="Chart type">' +
+
+      '<button type="button" ' +
+      'class="chartModeButton ' +
+      (
+        liveChartMode ===
+          'candles'
+          ? 'active'
+          : ''
+      ) +
+      '" data-mode="candles">' +
+      'Candles' +
+      '</button>' +
+
+      '<button type="button" ' +
+      'class="chartModeButton ' +
+      (
+        liveChartMode ===
+          'line'
+          ? 'active'
+          : ''
+      ) +
+      '" data-mode="line">' +
+      'Line' +
+      '</button>' +
 
       '</div>' +
 
@@ -3501,9 +4393,9 @@ function renderLiveChart(
 
       '</div>' +
 
-      buildIntradayChart(
-        result.data
-      );
+      chartMarkup;
+
+  bindLiveChartModeButtons();
 }
 
 async function refreshLiveChart(
@@ -3528,7 +4420,23 @@ async function refreshLiveChart(
       renderLiveChart(
         result
       );
+
+      if (
+        liveRefreshTimer &&
+        !shouldAutoRefresh(
+          result
+        )
+      ) {
+        clearInterval(
+          liveRefreshTimer
+        );
+
+        liveRefreshTimer =
+          null;
+      }
     }
+
+    return result;
   } catch (error) {
     if (!silent) {
       $('research')
@@ -3539,10 +4447,12 @@ async function refreshLiveChart(
         .textContent =
           error.message;
     }
+
+    return null;
   }
 }
 
-function startLiveChart(
+async function startLiveChart(
   symbol
 ) {
   stopLiveRefresh();
@@ -3557,25 +4467,36 @@ function startLiveChart(
   liveView =
     'chart';
 
+  liveChartMode =
+    'candles';
+
   $('research')
     .innerHTML =
       '<p class="muted">' +
       'Loading intraday chart...' +
       '</p>';
 
-  refreshLiveChart(
-    symbol
-  );
+  const result =
+    await refreshLiveChart(
+      symbol
+    );
 
-  liveRefreshTimer =
-    setInterval(
+  if (
+    result &&
+    liveRefreshSymbol ===
+      symbol &&
+    liveView ===
+      'chart'
+  ) {
+    scheduleLiveRefresh(
       () =>
         refreshLiveChart(
           symbol,
           true
         ),
-      15000
+      result
     );
+  }
 }
 
 /* ---------------------------------------
@@ -3671,21 +4592,16 @@ function getFilteredRows() {
     );
 
   rows =
-    [
-      ...rows
-    ];
+    [...rows];
 
   switch (
-    $('sort')
-      .value
+    $('sort').value
   ) {
+
     case 'priceAsc':
 
       rows.sort(
-        (
-          a,
-          b
-        ) =>
+        (a,b) =>
           (
             a.price ??
             Infinity
@@ -3701,10 +4617,7 @@ function getFilteredRows() {
     case 'priceDesc':
 
       rows.sort(
-        (
-          a,
-          b
-        ) =>
+        (a,b) =>
           (
             b.price ??
             -Infinity
@@ -3720,10 +4633,7 @@ function getFilteredRows() {
     case 'changeDesc':
 
       rows.sort(
-        (
-          a,
-          b
-        ) =>
+        (a,b) =>
           (
             b.change1yPct ??
             -Infinity
@@ -3739,10 +4649,7 @@ function getFilteredRows() {
     case 'changeAsc':
 
       rows.sort(
-        (
-          a,
-          b
-        ) =>
+        (a,b) =>
           (
             a.change1yPct ??
             Infinity
@@ -3758,10 +4665,7 @@ function getFilteredRows() {
     case 'dividendDesc':
 
       rows.sort(
-        (
-          a,
-          b
-        ) =>
+        (a,b) =>
           (
             b.dividendYield ??
             -Infinity
@@ -3780,16 +4684,11 @@ function getFilteredRows() {
         rows
           .filter(
             row =>
-              row.peRatio !==
-                null &&
-              row.peRatio >
-                0
+              row.peRatio !== null &&
+              row.peRatio > 0
           )
           .sort(
-            (
-              a,
-              b
-            ) =>
+            (a,b) =>
               a.peRatio -
               b.peRatio
           );
@@ -3799,10 +4698,7 @@ function getFilteredRows() {
     case 'volumeDesc':
 
       rows.sort(
-        (
-          a,
-          b
-        ) =>
+        (a,b) =>
           (
             b.averageVolume30d ??
             -Infinity
@@ -3818,10 +4714,7 @@ function getFilteredRows() {
     default:
 
       rows.sort(
-        (
-          a,
-          b
-        ) =>
+        (a,b) =>
           a.symbol
             .localeCompare(
               b.symbol
@@ -3991,23 +4884,19 @@ function renderStocks() {
             );
           }
         )
-        .join(
-          ''
-        ) +
+        .join('') +
 
       '</tbody>' +
 
       '</table>';
 
   const first =
-    start +
-    1;
+    start + 1;
 
   const last =
     Math.min(
       start +
       PAGE_SIZE,
-
       rows.length
     );
 
@@ -4044,8 +4933,7 @@ function renderStocks() {
           () => {
 
             const symbol =
-              row.dataset
-                .symbol;
+              row.dataset.symbol;
 
             $('stockSymbol')
               .value =
@@ -4059,7 +4947,6 @@ function renderStocks() {
               .scrollIntoView({
                 behavior:
                   'smooth',
-
                 block:
                   'start'
               });
@@ -4093,9 +4980,7 @@ function populateSectors() {
 
   $('sectorFilter')
     .innerHTML =
-      '<option value="">' +
-      'All sectors' +
-      '</option>' +
+      '<option value="">All sectors</option>' +
 
       sectors
         .map(
@@ -4110,9 +4995,7 @@ function populateSectors() {
             ) +
             '</option>'
         )
-        .join(
-          ''
-        );
+        .join('');
 }
 
 /* ---------------------------------------
@@ -4177,7 +5060,6 @@ $('loadMarket')
 $('search')
   .oninput =
     () => {
-
       currentPage =
         1;
 
@@ -4187,7 +5069,6 @@ $('search')
 $('sectorFilter')
   .onchange =
     () => {
-
       currentPage =
         1;
 
@@ -4197,7 +5078,6 @@ $('sectorFilter')
 $('sort')
   .onchange =
     () => {
-
       currentPage =
         1;
 
@@ -4255,7 +5135,7 @@ function buildPriceChart(
   if (
     !rows ||
     rows.length <
-    2
+      2
   ) {
     return (
       '<p class="muted">' +
@@ -4321,8 +5201,7 @@ function buildPriceChart(
   }
 
   const range =
-    max -
-    min;
+    max - min;
 
   const margin =
     range *
@@ -4371,22 +5250,16 @@ function buildPriceChart(
           row,
           index
         ) =>
-          x(
-            index
-          ) +
+          x(index) +
           ',' +
           y(
             row.close
           )
       )
-      .join(
-        ' '
-      );
+      .join(' ');
 
   const firstX =
-    x(
-      0
-    );
+    x(0);
 
   const lastX =
     x(
@@ -4415,10 +5288,8 @@ function buildPriceChart(
   for (
     let index =
       0;
-
     index <
       5;
-
     index++
   ) {
     const fraction =
@@ -4466,12 +5337,10 @@ function buildPriceChart(
       ) +
       '" ' +
       'class="chartLabel">' +
-
       formatNumber(
         price,
         2
       ) +
-
       '</text>';
   }
 
@@ -4534,13 +5403,11 @@ function buildPriceChart(
     ) +
     '" ' +
     'class="chartLabel">' +
-
     escapeHtml(
       formatDate(
         firstDate
       )
     ) +
-
     '</text>' +
 
     '<text ' +
@@ -4558,13 +5425,11 @@ function buildPriceChart(
     '" ' +
     'text-anchor="middle" ' +
     'class="chartLabel">' +
-
     escapeHtml(
       formatDate(
         middleDate
       )
     ) +
-
     '</text>' +
 
     '<text ' +
@@ -4582,13 +5447,11 @@ function buildPriceChart(
     '" ' +
     'text-anchor="end" ' +
     'class="chartLabel">' +
-
     escapeHtml(
       formatDate(
         lastDate
       )
     ) +
-
     '</text>' +
 
     '</svg>' +
@@ -4608,8 +5471,7 @@ function renderHistory(
     result.summary;
 
   const companyName =
-    result.company
-      ?.name ||
+    result.company?.name ||
     result.symbol;
 
   $('selectedCompany')
@@ -4625,12 +5487,10 @@ function renderHistory(
         result.symbol
       ) +
       (
-        result.company
-          ?.sector
+        result.company?.sector
           ? ' • ' +
             escapeHtml(
-              result.company
-                .sector
+              result.company.sector
             )
           : ''
       ) +
@@ -4639,16 +5499,14 @@ function renderHistory(
   if (!summary) {
     $('research')
       .innerHTML =
-        '<p>' +
-        'No valid historical price data was available.' +
-        '</p>';
+        '<p>No valid historical price data was available.</p>';
 
     return;
   }
 
   const changeClass =
     summary.changePct >
-    0
+      0
       ? 'positive'
       : summary.changePct <
         0
@@ -4661,11 +5519,8 @@ function renderHistory(
       '<div class="summaryGrid">' +
 
       '<div class="metric">' +
-      '<div class="metricLabel">' +
-      'Latest historical close' +
-      '</div>' +
-      '<div class="metricValue">' +
-      'PKR ' +
+      '<div class="metricLabel">Latest historical close</div>' +
+      '<div class="metricValue">PKR ' +
       formatNumber(
         summary.endPrice
       ) +
@@ -4673,9 +5528,7 @@ function renderHistory(
       '</div>' +
 
       '<div class="metric">' +
-      '<div class="metricLabel">' +
-      'Period change' +
-      '</div>' +
+      '<div class="metricLabel">Period change</div>' +
       '<div class="metricValue ' +
       changeClass +
       '">' +
@@ -4686,11 +5539,8 @@ function renderHistory(
       '</div>' +
 
       '<div class="metric">' +
-      '<div class="metricLabel">' +
-      'Period high' +
-      '</div>' +
-      '<div class="metricValue">' +
-      'PKR ' +
+      '<div class="metricLabel">Period high</div>' +
+      '<div class="metricValue">PKR ' +
       formatNumber(
         summary.high
       ) +
@@ -4698,11 +5548,8 @@ function renderHistory(
       '</div>' +
 
       '<div class="metric">' +
-      '<div class="metricLabel">' +
-      'Period low' +
-      '</div>' +
-      '<div class="metricValue">' +
-      'PKR ' +
+      '<div class="metricLabel">Period low</div>' +
+      '<div class="metricValue">PKR ' +
       formatNumber(
         summary.low
       ) +
@@ -4710,9 +5557,7 @@ function renderHistory(
       '</div>' +
 
       '<div class="metric">' +
-      '<div class="metricLabel">' +
-      'Average volume' +
-      '</div>' +
+      '<div class="metricLabel">Average volume</div>' +
       '<div class="metricValue">' +
       formatNumber(
         summary.averageVolume,
@@ -4734,7 +5579,6 @@ function renderHistory(
             summary.excludedAnomalies +
             ' suspicious historical rows were excluded from this chart.' +
             '</div>'
-
           : ''
       ) +
 
@@ -4835,11 +5679,8 @@ $('loadQuote')
             '<div class="summaryGrid">' +
 
             '<div class="metric">' +
-            '<div class="metricLabel">' +
-            'Price' +
-            '</div>' +
-            '<div class="metricValue">' +
-            'PKR ' +
+            '<div class="metricLabel">Price</div>' +
+            '<div class="metricValue">PKR ' +
             formatNumber(
               data.price
             ) +
@@ -4847,9 +5688,7 @@ $('loadQuote')
             '</div>' +
 
             '<div class="metric">' +
-            '<div class="metricLabel">' +
-            'P/E' +
-            '</div>' +
+            '<div class="metricLabel">P/E</div>' +
             '<div class="metricValue">' +
             formatNumber(
               data.pe_ratio
@@ -4858,9 +5697,7 @@ $('loadQuote')
             '</div>' +
 
             '<div class="metric">' +
-            '<div class="metricLabel">' +
-            'Dividend yield' +
-            '</div>' +
+            '<div class="metricLabel">Dividend yield</div>' +
             '<div class="metricValue">' +
             formatPercent(
               data.dividend_yield
@@ -4869,9 +5706,7 @@ $('loadQuote')
             '</div>' +
 
             '<div class="metric">' +
-            '<div class="metricLabel">' +
-            '30D avg volume' +
-            '</div>' +
+            '<div class="metricLabel">30D avg volume</div>' +
             '<div class="metricValue">' +
             formatNumber(
               data.volume_avg_30d,
@@ -4881,9 +5716,7 @@ $('loadQuote')
             '</div>' +
 
             '<div class="metric">' +
-            '<div class="metricLabel">' +
-            '1Y change' +
-            '</div>' +
+            '<div class="metricLabel">1Y change</div>' +
             '<div class="metricValue ' +
             (
               data.change_1y_pct >
@@ -4904,11 +5737,7 @@ $('loadQuote')
             '</div>' +
 
             '<details>' +
-
-            '<summary>' +
-            'View raw quote data' +
-            '</summary>' +
-
+            '<summary>View raw quote data</summary>' +
             '<pre>' +
             escapeHtml(
               JSON.stringify(
@@ -4918,7 +5747,6 @@ $('loadQuote')
               )
             ) +
             '</pre>' +
-
             '</details>';
 
         startLiveOverview(
@@ -5006,9 +5834,7 @@ $('loadHistory')
 
       $('research')
         .innerHTML =
-          '<p class="muted">' +
-          'Loading historical chart...' +
-          '</p>';
+          '<p class="muted">Loading historical chart...</p>';
 
       try {
         const result =
@@ -5081,15 +5907,13 @@ $('loadFundamentals')
           );
 
         if (
-          result.company
-            ?.name
+          result.company?.name
         ) {
           $('selectedCompany')
             .innerHTML =
               '<strong>' +
               escapeHtml(
-                result.company
-                  .name
+                result.company.name
               ) +
               '</strong>' +
 
@@ -5098,12 +5922,10 @@ $('loadFundamentals')
                 result.symbol
               ) +
               (
-                result.company
-                  .sector
+                result.company.sector
                   ? ' • ' +
                     escapeHtml(
-                      result.company
-                        .sector
+                      result.company.sector
                     )
                   : ''
               ) +
