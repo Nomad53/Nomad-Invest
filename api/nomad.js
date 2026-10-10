@@ -3,7 +3,7 @@
 const http = require('node:http');
 const crypto = require('node:crypto');
 
-const VERSION = '0.3.0';
+const VERSION = '0.3.1';
 
 const PSX_API_BASE =
   process.env.PSX_API_BASE ||
@@ -12,6 +12,24 @@ const PSX_API_BASE =
 const PSX_META_BASE =
   process.env.PSX_META_BASE ||
   'https://psx-rest-api.onrender.com';
+
+const PYPSX_API_KEY_ID =
+  process.env.PYPSX_API_KEY_ID ||
+  '';
+
+const PYPSX_API_SECRET_KEY =
+  process.env.PYPSX_API_SECRET_KEY ||
+  '';
+
+function getPyPSXBase() {
+  if (process.env.PYPSX_BASE) {
+    return process.env.PYPSX_BASE;
+  }
+
+  return PYPSX_API_KEY_ID.startsWith('AK_')
+    ? 'https://api.pypsx.com'
+    : 'https://paper-api.pypsx.com';
+}
 
 let marketCache = null;
 let sectorCache = null;
@@ -68,11 +86,13 @@ function normalizeTimestamp(value) {
 
 async function fetchJSON(
   url,
-  timeout = 20000
+  timeout = 20000,
+  headers = {}
 ) {
   const response = await fetch(url, {
     headers: {
-      Accept: 'application/json'
+      Accept: 'application/json',
+      ...headers
     },
     signal: AbortSignal.timeout(timeout)
   });
@@ -103,6 +123,252 @@ async function fetchJSON(
   }
 
   return response.json();
+}
+
+/* --------------------------------------------------
+   PYPSX NEAR-LIVE PRICE
+-------------------------------------------------- */
+
+function pyPSXHeaders() {
+  if (
+    !PYPSX_API_KEY_ID ||
+    !PYPSX_API_SECRET_KEY
+  ) {
+    bad(
+      'pyPSX credentials are not configured.',
+      503
+    );
+  }
+
+  return {
+    'PYPSX-API-KEY-ID':
+      PYPSX_API_KEY_ID,
+
+    'PYPSX-API-SECRET-KEY':
+      PYPSX_API_SECRET_KEY
+  };
+}
+
+function extractPyPSXRows(result) {
+  if (Array.isArray(result)) {
+    return result;
+  }
+
+  if (Array.isArray(result?.data)) {
+    return result.data;
+  }
+
+  if (Array.isArray(result?.candles)) {
+    return result.candles;
+  }
+
+  if (Array.isArray(result?.results)) {
+    const first = result.results[0];
+
+    if (Array.isArray(first?.candles)) {
+      return first.candles;
+    }
+  }
+
+  return [];
+}
+
+function normalizePyPSXRow(row) {
+  if (Array.isArray(row)) {
+    return {
+      timestamp:
+        row[0] || null,
+
+      open:
+        safeNumber(row[1]),
+
+      high:
+        safeNumber(row[2]),
+
+      low:
+        safeNumber(row[3]),
+
+      close:
+        safeNumber(row[4]),
+
+      volume:
+        safeNumber(row[5])
+    };
+  }
+
+  return {
+    timestamp:
+      row?.datetime ||
+      row?.timestamp ||
+      row?.ts ||
+      row?.time ||
+      row?.date ||
+      null,
+
+    open:
+      safeNumber(
+        row?.open ??
+        row?.o
+      ),
+
+    high:
+      safeNumber(
+        row?.high ??
+        row?.h
+      ),
+
+    low:
+      safeNumber(
+        row?.low ??
+        row?.l
+      ),
+
+    close:
+      safeNumber(
+        row?.close ??
+        row?.price ??
+        row?.last ??
+        row?.p
+      ),
+
+    volume:
+      safeNumber(
+        row?.volume ??
+        row?.v
+      )
+  };
+}
+
+function pyPSXTimeValue(value) {
+  if (
+    typeof value === 'number' &&
+    Number.isFinite(value)
+  ) {
+    return value > 100000000000
+      ? value
+      : value * 1000;
+  }
+
+  const parsed = Date.parse(value);
+
+  return Number.isFinite(parsed)
+    ? parsed
+    : 0;
+}
+
+async function getPyPSXLivePrice(
+  stockSymbol
+) {
+  const symbol =
+    normalizeSymbol(
+      stockSymbol
+    );
+
+  if (!symbol) {
+    bad(
+      'Enter a PSX symbol.'
+    );
+  }
+
+  const result =
+    await fetchJSON(
+      `${getPyPSXBase()}/intraday/${encodeURIComponent(
+        symbol
+      )}`,
+      20000,
+      pyPSXHeaders()
+    );
+
+  const rows =
+    extractPyPSXRows(
+      result
+    )
+      .map(
+        normalizePyPSXRow
+      )
+      .filter(
+        row =>
+          row.close !== null &&
+          row.close > 0
+      );
+
+  if (!rows.length) {
+    bad(
+      `pyPSX returned no intraday price data for ${symbol}.`,
+      502
+    );
+  }
+
+  rows.sort(
+    (a, b) =>
+      pyPSXTimeValue(
+        a.timestamp
+      ) -
+      pyPSXTimeValue(
+        b.timestamp
+      )
+  );
+
+  const latest =
+    rows[
+      rows.length - 1
+    ];
+
+  const timestampMs =
+    pyPSXTimeValue(
+      latest.timestamp
+    );
+
+  return {
+    symbol,
+
+    provider:
+      'pyPSX',
+
+    mode:
+      PYPSX_API_KEY_ID.startsWith('AK_')
+        ? 'live-key'
+        : 'paper-key',
+
+    price:
+      latest.close,
+
+    open:
+      latest.open,
+
+    high:
+      latest.high,
+
+    low:
+      latest.low,
+
+    volume:
+      latest.volume,
+
+    timestamp:
+      timestampMs
+        ? new Date(
+            timestampMs
+          ).toISOString()
+        : latest.timestamp,
+
+    ageSeconds:
+      timestampMs
+        ? Math.max(
+            0,
+            Math.round(
+              (
+                Date.now() -
+                timestampMs
+              ) /
+              1000
+            )
+          )
+        : null,
+
+    sourceType:
+      'latest 1-minute intraday candle'
+  };
 }
 
 /* --------------------------------------------------
@@ -1026,6 +1292,19 @@ async function handler(
           companyMetadata:
             'psx-rest-api',
 
+          pyPSXConfigured:
+            Boolean(
+              PYPSX_API_KEY_ID &&
+              PYPSX_API_SECRET_KEY
+            ),
+
+          pyPSXMode:
+            PYPSX_API_KEY_ID.startsWith('AK_')
+              ? 'live-key'
+              : PYPSX_API_KEY_ID.startsWith('PK_')
+                ? 'paper-key'
+                : 'not-configured',
+
           predictionEngine:
             'NOT_IMPLEMENTED',
 
@@ -1038,6 +1317,22 @@ async function handler(
           tradeExecution:
             false
         }
+      );
+    }
+
+    if (
+      request.method ===
+        'GET' &&
+      action ===
+        'live-price'
+    ) {
+      return sendJSON(
+        response,
+        await getPyPSXLivePrice(
+          url.searchParams.get(
+            'symbol'
+          )
+        )
       );
     }
 
@@ -1363,6 +1658,38 @@ tbody tr:hover {
   font-weight: 700;
 }
 
+.liveStrip {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin: 10px 0 4px;
+  min-height: 24px;
+}
+
+.liveDot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #11823b;
+  display: inline-block;
+  box-shadow: 0 0 0 4px rgba(17,130,59,.10);
+}
+
+.livePrice {
+  font-weight: 700;
+}
+
+.liveMeta {
+  color: #66788a;
+  font-size: 13px;
+}
+
+.liveWarning {
+  color: #9a6718;
+  font-size: 13px;
+}
+
 .chartBox {
   border: 1px solid #e1e7ec;
   border-radius: 10px;
@@ -1531,6 +1858,11 @@ Enter a symbol or click any company below.
   class="companyHeader"
 ></div>
 
+<div
+  id="liveStatus"
+  class="liveStrip"
+></div>
+
 <div class="actions">
 
 <button id="loadQuote">
@@ -1696,6 +2028,12 @@ let currentPage =
 const PAGE_SIZE =
   50;
 
+let liveRefreshTimer =
+  null;
+
+let liveRefreshSymbol =
+  null;
+
 /* ---------------------------------------
    HELPERS
 --------------------------------------- */
@@ -1786,6 +2124,42 @@ function formatDate(
     );
 }
 
+function formatDateTime(
+  value
+) {
+  const date =
+    new Date(
+      value
+    );
+
+  if (
+    Number.isNaN(
+      date.getTime()
+    )
+  ) {
+    return String(
+      value || ''
+    );
+  }
+
+  return date
+    .toLocaleString(
+      'en-PK',
+      {
+        day:
+          'numeric',
+        month:
+          'short',
+        hour:
+          '2-digit',
+        minute:
+          '2-digit',
+        second:
+          '2-digit'
+      }
+    );
+}
+
 async function api(
   action,
   params = {}
@@ -1836,6 +2210,150 @@ async function api(
   }
 
   return result;
+}
+
+/* ---------------------------------------
+   NEAR-LIVE PRICE
+--------------------------------------- */
+
+function stopLiveRefresh() {
+  if (liveRefreshTimer) {
+    clearInterval(
+      liveRefreshTimer
+    );
+  }
+
+  liveRefreshTimer =
+    null;
+
+  liveRefreshSymbol =
+    null;
+}
+
+function liveAgeLabel(
+  ageSeconds
+) {
+  if (
+    ageSeconds === null ||
+    ageSeconds === undefined
+  ) {
+    return 'timestamp unavailable';
+  }
+
+  if (ageSeconds < 60) {
+    return ageSeconds +
+      ' sec old';
+  }
+
+  if (ageSeconds < 3600) {
+    return Math.floor(
+      ageSeconds / 60
+    ) +
+      ' min old';
+  }
+
+  return Math.floor(
+    ageSeconds / 3600
+  ) +
+    ' hr old';
+}
+
+function renderLivePrice(
+  result
+) {
+  const timestamp =
+    result.timestamp
+      ? formatDateTime(
+          result.timestamp
+        )
+      : 'Unknown time';
+
+  $('liveStatus')
+    .innerHTML =
+      '<span class="liveDot"></span>' +
+      '<span class="livePrice">' +
+      'pyPSX: PKR ' +
+      formatNumber(
+        result.price
+      ) +
+      '</span>' +
+      '<span class="liveMeta">' +
+      escapeHtml(
+        timestamp
+      ) +
+      ' • ' +
+      escapeHtml(
+        liveAgeLabel(
+          result.ageSeconds
+        )
+      ) +
+      '</span>';
+}
+
+async function refreshLivePrice(
+  symbol,
+  silent = false
+) {
+  try {
+    const result =
+      await api(
+        'live-price',
+        {
+          symbol
+        }
+      );
+
+    if (
+      liveRefreshSymbol ===
+      symbol
+    ) {
+      renderLivePrice(
+        result
+      );
+    }
+  } catch (error) {
+    if (!silent) {
+      $('liveStatus')
+        .innerHTML =
+          '<span class="liveWarning">' +
+          'pyPSX live price unavailable: ' +
+          escapeHtml(
+            error.message
+          ) +
+          '</span>';
+    }
+  }
+}
+
+function startLiveRefresh(
+  symbol
+) {
+  stopLiveRefresh();
+
+  if (!symbol) {
+    return;
+  }
+
+  liveRefreshSymbol =
+    symbol;
+
+  $('liveStatus')
+    .innerHTML =
+      '<span class="liveMeta">Loading latest pyPSX price...</span>';
+
+  refreshLivePrice(
+    symbol
+  );
+
+  liveRefreshTimer =
+    setInterval(
+      () =>
+        refreshLivePrice(
+          symbol,
+          true
+        ),
+      15000
+    );
 }
 
 /* ---------------------------------------
@@ -3080,6 +3598,10 @@ $('loadQuote')
             '</pre>' +
             '</details>';
 
+        startLiveRefresh(
+          symbol
+        );
+
       } catch (error) {
 
         $('error')
@@ -3105,6 +3627,12 @@ $('loadHistory')
           .value
           .trim()
           .toUpperCase();
+
+      stopLiveRefresh();
+
+      $('liveStatus')
+        .innerHTML =
+          '';
 
       showSelectedCompany(
         symbol
@@ -3156,6 +3684,12 @@ $('loadFundamentals')
           .value
           .trim()
           .toUpperCase();
+
+      stopLiveRefresh();
+
+      $('liveStatus')
+        .innerHTML =
+          '';
 
       showSelectedCompany(
         symbol
@@ -3224,6 +3758,16 @@ $('loadFundamentals')
       }
     };
 
+$('stockSymbol')
+  .oninput =
+    () => {
+      stopLiveRefresh();
+
+      $('liveStatus')
+        .innerHTML =
+          '';
+    };
+
 /* ---------------------------------------
    HEALTH
 --------------------------------------- */
@@ -3236,7 +3780,13 @@ api(
 
       $('status')
         .textContent =
-          'Market: connected | Company names: connected | Prediction engine: ' +
+          'Market: connected | Company names: connected | pyPSX: ' +
+          (
+            result.pyPSXConfigured
+              ? 'configured'
+              : 'not configured'
+          ) +
+          ' | Prediction engine: ' +
           result.predictionEngine;
     }
   )
