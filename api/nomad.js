@@ -3,16 +3,20 @@
 const http = require('node:http');
 const crypto = require('node:crypto');
 
-const VERSION = '0.2.0';
+const VERSION = '0.2.1';
 
 const PSX_API_BASE =
   process.env.PSX_API_BASE ||
   'https://psxdata-api.fastapicloud.dev';
 
-let cache = null;
+const PSX_SYMBOLS_URL =
+  'https://dps.psx.com.pk/symbols';
+
+let marketCache = null;
+let symbolsCache = null;
 
 /* --------------------------------------------------
-   Basic helpers
+   Helpers
 -------------------------------------------------- */
 
 function bad(message, status = 400) {
@@ -22,7 +26,11 @@ function bad(message, status = 400) {
 }
 
 function safeNumber(value) {
-  if (value === null || value === undefined || value === '') {
+  if (
+    value === null ||
+    value === undefined ||
+    value === ''
+  ) {
     return null;
   }
 
@@ -33,16 +41,21 @@ function safeNumber(value) {
       .trim()
   );
 
-  return Number.isFinite(number) ? number : null;
+  return Number.isFinite(number)
+    ? number
+    : null;
 }
 
-function findValue(object, keys) {
+function pick(object, keys) {
   if (!object || typeof object !== 'object') {
     return null;
   }
 
   for (const key of keys) {
-    if (object[key] !== undefined && object[key] !== null) {
+    if (
+      object[key] !== undefined &&
+      object[key] !== null
+    ) {
       return object[key];
     }
   }
@@ -50,254 +63,354 @@ function findValue(object, keys) {
   return null;
 }
 
-function pickText(object, keys, fallback = '') {
-  const value = findValue(object, keys);
+function text(object, keys, fallback = '') {
+  const value = pick(object, keys);
 
-  if (value === null || value === undefined) {
+  if (
+    value === null ||
+    value === undefined
+  ) {
     return fallback;
   }
 
   return String(value).trim();
 }
 
-function pickNumber(object, keys) {
-  return safeNumber(findValue(object, keys));
+function number(object, keys) {
+  return safeNumber(
+    pick(object, keys)
+  );
 }
 
-function symbol(value) {
-  const text = String(value || '')
+function normalizeSymbol(value) {
+  return String(value || '')
     .trim()
     .toUpperCase();
-
-  if (!/^[A-Z0-9][A-Z0-9._-]{0,23}$/.test(text)) {
-    bad('Invalid stock symbol.');
-  }
-
-  return text;
 }
 
 function normalizeTimestamp(value) {
-  if (!value) {
-    return new Date().toISOString();
-  }
-
   const parsed = Date.parse(value);
 
-  if (!Number.isFinite(parsed)) {
-    return new Date().toISOString();
-  }
-
-  return new Date(parsed).toISOString();
+  return Number.isFinite(parsed)
+    ? new Date(parsed).toISOString()
+    : new Date().toISOString();
 }
 
 /* --------------------------------------------------
-   External HTTP
+   HTTP fetch
 -------------------------------------------------- */
 
-async function fetchJSON(url) {
+async function fetchJSON(url, headers = {}) {
   const response = await fetch(url, {
-    method: 'GET',
     headers: {
-      Accept: 'application/json'
+      Accept: 'application/json',
+      'User-Agent': 'NOMAD-Invest/0.2.1',
+      ...headers
     },
+
     signal: AbortSignal.timeout(20000)
   });
 
   if (!response.ok) {
-    let message = `PSX data service returned HTTP ${response.status}.`;
+    let message =
+      `Data service returned HTTP ${response.status}.`;
 
     try {
-      const errorBody = await response.json();
+      const body = await response.json();
 
-      if (errorBody?.error?.message) {
-        message = errorBody.error.message;
+      if (body?.error?.message) {
+        message = body.error.message;
       }
 
-      if (errorBody?.detail) {
-        message = String(errorBody.detail);
+      if (body?.detail) {
+        message = String(body.detail);
       }
     } catch {}
 
     bad(message, response.status);
   }
 
-  const contentType =
-    response.headers.get('content-type') || '';
-
-  if (!contentType.includes('application/json')) {
-    bad(
-      'PSX data service returned an unexpected response.',
-      502
-    );
-  }
-
   return response.json();
 }
 
 /* --------------------------------------------------
-   PSX data adapter
+   Company metadata
 -------------------------------------------------- */
 
-function normalizeScreenerRow(row, timestamp) {
-  const rawSymbol = pickText(row, [
-    'symbol',
-    'ticker',
-    'scrip',
-    'code',
-    'company_code'
-  ]);
+async function loadSymbolMetadata() {
+  if (
+    symbolsCache &&
+    Date.now() - symbolsCache.fetchedAt < 3600000
+  ) {
+    return symbolsCache.data;
+  }
 
-  if (!rawSymbol) {
+  const rows =
+    await fetchJSON(
+      PSX_SYMBOLS_URL
+    );
+
+  if (!Array.isArray(rows)) {
+    bad(
+      'PSX company metadata returned an unexpected format.',
+      502
+    );
+  }
+
+  const map = new Map();
+
+  for (const row of rows) {
+    const sym =
+      normalizeSymbol(
+        row.symbol
+      );
+
+    if (!sym) {
+      continue;
+    }
+
+    map.set(sym, {
+      symbol: sym,
+
+      name:
+        String(
+          row.name || sym
+        ).trim(),
+
+      sector:
+        String(
+          row.sectorName ||
+          'Unknown'
+        ).trim(),
+
+      isETF:
+        Boolean(row.isETF),
+
+      isDebt:
+        Boolean(row.isDebt)
+    });
+  }
+
+  symbolsCache = {
+    fetchedAt: Date.now(),
+    data: map
+  };
+
+  return map;
+}
+
+/* --------------------------------------------------
+   Screener mapping
+-------------------------------------------------- */
+
+function normalizeScreenerRow(
+  row,
+  metadata,
+  timestamp
+) {
+  const sym =
+    normalizeSymbol(
+      pick(row, [
+        'symbol',
+        'SYMBOL'
+      ])
+    );
+
+  if (!sym) {
     return null;
   }
 
-  let normalizedSymbol;
+  const meta =
+    metadata.get(sym) || {};
 
-  try {
-    normalizedSymbol = symbol(rawSymbol);
-  } catch {
+  const ldcp =
+    number(row, [
+      'ldcp',
+      'LDCP'
+    ]);
+
+  const current =
+    number(row, [
+      'current',
+      'CURRENT',
+      'price',
+      'PRICE'
+    ]);
+
+  const open =
+    number(row, [
+      'open',
+      'OPEN'
+    ]);
+
+  const high =
+    number(row, [
+      'high',
+      'HIGH'
+    ]);
+
+  const low =
+    number(row, [
+      'low',
+      'LOW'
+    ]);
+
+  const volume =
+    number(row, [
+      'volume',
+      'VOLUME'
+    ]);
+
+  const price =
+    current !== null
+      ? current
+      : ldcp;
+
+  if (
+    price === null ||
+    price <= 0
+  ) {
     return null;
   }
 
-  const name = pickText(
-    row,
-    [
-      'name',
-      'company',
-      'company_name',
-      'companyName',
-      'security_name'
-    ],
-    normalizedSymbol
-  );
+  let change = null;
+  let changePercent = null;
 
-  const sector = pickText(
-    row,
-    [
-      'sector',
-      'sector_name',
-      'sectorName',
-      'industry'
-    ],
-    'Unknown'
-  );
+  if (
+    current !== null &&
+    ldcp !== null &&
+    ldcp !== 0
+  ) {
+    change =
+      current - ldcp;
 
-  const price = pickNumber(row, [
-    'price',
-    'close',
-    'current',
-    'current_price',
-    'currentPrice',
-    'last',
-    'last_price',
-    'lastPrice',
-    'ldcp'
-  ]);
-
-  const volume = pickNumber(row, [
-    'volume',
-    'vol',
-    'current_volume',
-    'currentVolume',
-    'turnover'
-  ]);
-
-  const change = pickNumber(row, [
-    'change',
-    'net_change',
-    'netChange'
-  ]);
-
-  const changePercent = pickNumber(row, [
-    'change_percent',
-    'changePercent',
-    'change_pct',
-    'percentage_change',
-    'percent_change'
-  ]);
-
-  const open = pickNumber(row, [
-    'open',
-    'open_price',
-    'openPrice'
-  ]);
-
-  const high = pickNumber(row, [
-    'high',
-    'high_price',
-    'highPrice'
-  ]);
-
-  const low = pickNumber(row, [
-    'low',
-    'low_price',
-    'lowPrice'
-  ]);
-
-  if (price === null || price <= 0) {
-    return null;
+    changePercent =
+      (change / ldcp) * 100;
   }
 
   return {
-    symbol: normalizedSymbol,
-    name,
-    sector,
+    symbol: sym,
+
+    name:
+      meta.name || sym,
+
+    sector:
+      meta.sector ||
+      text(
+        row,
+        [
+          'sector_name',
+          'sectorName'
+        ],
+        'Unknown'
+      ),
+
+    sectorCode:
+      text(
+        row,
+        [
+          'sector',
+          'SECTOR'
+        ],
+        ''
+      ),
+
     price,
+    ldcp,
     open,
     high,
     low,
     volume,
     change,
     changePercent,
-    asOf: timestamp,
-    source: 'psxdata-api'
+
+    isETF:
+      meta.isETF || false,
+
+    isDebt:
+      meta.isDebt || false,
+
+    asOf: timestamp
   };
 }
 
+/* --------------------------------------------------
+   Market
+-------------------------------------------------- */
+
 async function loadPSXMarket() {
   if (
-    cache &&
-    Date.now() - cache.fetchedAt < 60000
+    marketCache &&
+    Date.now() - marketCache.fetchedAt < 60000
   ) {
-    return cache.data;
+    return marketCache.data;
   }
 
-  const payload = await fetchJSON(
-    `${PSX_API_BASE}/screener`
-  );
+  const [
+    screener,
+    metadata
+  ] = await Promise.all([
+    fetchJSON(
+      `${PSX_API_BASE}/screener`
+    ),
 
-  if (!payload || !Array.isArray(payload.data)) {
+    loadSymbolMetadata()
+  ]);
+
+  if (
+    !screener ||
+    !Array.isArray(screener.data)
+  ) {
     bad(
-      'PSX screener response format is not supported.',
+      'PSX screener returned an unexpected format.',
       502
     );
   }
 
-  const timestamp = normalizeTimestamp(
-    payload?.meta?.timestamp
-  );
+  const timestamp =
+    normalizeTimestamp(
+      screener?.meta?.timestamp
+    );
 
-  const stocks = payload.data
-    .map(row => normalizeScreenerRow(row, timestamp))
-    .filter(Boolean);
+  const stocks =
+    screener.data
+      .map(
+        row =>
+          normalizeScreenerRow(
+            row,
+            metadata,
+            timestamp
+          )
+      )
+      .filter(Boolean);
 
   if (!stocks.length) {
     bad(
-      'PSX data service returned no usable stock prices.',
+      'No usable PSX market records were returned.',
       502
     );
   }
 
   const result = {
-    sourceName: 'psxdata-api',
-    sourceUrl: PSX_API_BASE,
-    mode: 'public PSX data',
-    asOf: timestamp,
-    totalStocks: stocks.length,
+    sourceName:
+      'psxdata-api + PSX symbols',
+
+    sourceUrl:
+      PSX_API_BASE,
+
+    metadataSource:
+      PSX_SYMBOLS_URL,
+
+    asOf:
+      timestamp,
+
+    totalStocks:
+      stocks.length,
+
     stocks
   };
 
-  cache = {
+  marketCache = {
     fetchedAt: Date.now(),
     data: result
   };
@@ -306,70 +419,130 @@ async function loadPSXMarket() {
 }
 
 /* --------------------------------------------------
-   Individual stock endpoints
+   Individual research
 -------------------------------------------------- */
 
-async function getStockQuote(stockSymbol) {
-  const sym = symbol(stockSymbol);
+async function getQuote(stockSymbol) {
+  const sym =
+    normalizeSymbol(
+      stockSymbol
+    );
 
-  const payload = await fetchJSON(
-    `${PSX_API_BASE}/stocks/${encodeURIComponent(sym)}/quote`
-  );
+  if (!sym) {
+    bad('Enter a PSX symbol.');
+  }
+
+  const result =
+    await fetchJSON(
+      `${PSX_API_BASE}/stocks/${encodeURIComponent(sym)}/quote`
+    );
+
+  const metadata =
+    await loadSymbolMetadata();
 
   return {
     symbol: sym,
-    data: payload.data || null,
-    meta: payload.meta || null
+
+    company:
+      metadata.get(sym) || null,
+
+    quote:
+      result.data || null,
+
+    meta:
+      result.meta || null
   };
 }
 
-async function getStockHistory(
+async function getHistory(
   stockSymbol,
-  start = null,
-  end = null
+  start,
+  end
 ) {
-  const sym = symbol(stockSymbol);
+  const sym =
+    normalizeSymbol(
+      stockSymbol
+    );
 
-  const params = new URLSearchParams();
+  if (!sym) {
+    bad('Enter a PSX symbol.');
+  }
+
+  const params =
+    new URLSearchParams();
 
   if (start) {
-    params.set('start', start);
+    params.set(
+      'start',
+      start
+    );
   }
 
   if (end) {
-    params.set('end', end);
+    params.set(
+      'end',
+      end
+    );
   }
 
-  const query = params.toString();
+  const query =
+    params.toString();
 
-  const payload = await fetchJSON(
-    `${PSX_API_BASE}/stocks/${encodeURIComponent(sym)}/historical${
-      query ? `?${query}` : ''
-    }`
-  );
+  const result =
+    await fetchJSON(
+      `${PSX_API_BASE}/stocks/${encodeURIComponent(sym)}/historical${
+        query
+          ? `?${query}`
+          : ''
+      }`
+    );
 
   return {
     symbol: sym,
-    data: Array.isArray(payload.data)
-      ? payload.data
-      : [],
-    meta: payload.meta || null
+
+    data:
+      Array.isArray(result.data)
+        ? result.data
+        : [],
+
+    meta:
+      result.meta || null
   };
 }
 
-async function getStockFundamentals(stockSymbol) {
-  const sym = symbol(stockSymbol);
+async function getFundamentals(
+  stockSymbol
+) {
+  const sym =
+    normalizeSymbol(
+      stockSymbol
+    );
 
-  const payload = await fetchJSON(
-    `${PSX_API_BASE}/stocks/${encodeURIComponent(sym)}/fundamentals`
-  );
+  if (!sym) {
+    bad('Enter a PSX symbol.');
+  }
+
+  const result =
+    await fetchJSON(
+      `${PSX_API_BASE}/stocks/${encodeURIComponent(sym)}/fundamentals`
+    );
+
+  const metadata =
+    await loadSymbolMetadata();
 
   return {
     symbol: sym,
-    data: Array.isArray(payload.data)
-      ? payload.data
-      : [],
-    meta: payload.meta || null
+
+    company:
+      metadata.get(sym) || null,
+
+    data:
+      Array.isArray(result.data)
+        ? result.data
+        : [],
+
+    meta:
+      result.meta || null
   };
 }
 
@@ -390,8 +563,12 @@ function safeEqual(a, b) {
   );
 }
 
-function authorize(request, response) {
-  const password = process.env.NOMAD_PASSWORD;
+function authorize(
+  request,
+  response
+) {
+  const password =
+    process.env.NOMAD_PASSWORD;
 
   if (!password) {
     if (process.env.VERCEL) {
@@ -407,20 +584,36 @@ function authorize(request, response) {
   let login = '';
 
   try {
-    login = Buffer.from(
-      (request.headers.authorization || '')
-        .replace(/^Basic /, ''),
-      'base64'
-    ).toString();
-  } catch {
-    login = '';
-  }
+    login =
+      Buffer
+        .from(
+          (
+            request
+              .headers
+              .authorization || ''
+          )
+            .replace(
+              /^Basic /,
+              ''
+            ),
+          'base64'
+        )
+        .toString();
+  } catch {}
 
-  if (!safeEqual(login, `nomad:${password}`)) {
-    response.writeHead(401, {
-      'WWW-Authenticate':
-        'Basic realm="NOMAD Invest"'
-    });
+  if (
+    !safeEqual(
+      login,
+      `nomad:${password}`
+    )
+  ) {
+    response.writeHead(
+      401,
+      {
+        'WWW-Authenticate':
+          'Basic realm="NOMAD Invest"'
+      }
+    );
 
     response.end(
       'Sign in with username nomad.'
@@ -433,33 +626,16 @@ function authorize(request, response) {
 }
 
 /* --------------------------------------------------
-   Request helpers
+   Response
 -------------------------------------------------- */
 
-async function readBody(request) {
-  let text = '';
-
-  for await (const chunk of request) {
-    text += chunk;
-
-    if (text.length > 200000) {
-      bad('Request too large.', 413);
-    }
-  }
-
-  if (!text) {
-    return {};
-  }
-
-  try {
-    return JSON.parse(text);
-  } catch {
-    bad('Invalid JSON request.');
-  }
-}
-
-function sendJSON(response, data, status = 200) {
-  response.statusCode = status;
+function sendJSON(
+  response,
+  data,
+  status = 200
+) {
+  response.statusCode =
+    status;
 
   response.setHeader(
     'Content-Type',
@@ -472,10 +648,13 @@ function sendJSON(response, data, status = 200) {
 }
 
 /* --------------------------------------------------
-   HTTP handler
+   Main handler
 -------------------------------------------------- */
 
-async function handler(request, response) {
+async function handler(
+  request,
+  response
+) {
   response.setHeader(
     'Cache-Control',
     'no-store'
@@ -492,17 +671,25 @@ async function handler(request, response) {
   );
 
   try {
-    if (!authorize(request, response)) {
+    if (
+      !authorize(
+        request,
+        response
+      )
+    ) {
       return;
     }
 
-    const url = new URL(
-      request.url,
-      'http://localhost'
-    );
+    const url =
+      new URL(
+        request.url,
+        'http://localhost'
+      );
 
     const action =
-      url.searchParams.get('action') || 'app';
+      url.searchParams.get(
+        'action'
+      ) || 'app';
 
     if (
       request.method === 'GET' &&
@@ -522,22 +709,34 @@ async function handler(request, response) {
       request.method === 'GET' &&
       action === 'health'
     ) {
-      return sendJSON(response, {
-        version: VERSION,
-        marketDataProvider:
-          'psxdata-api',
-        providerBaseUrl:
-          PSX_API_BASE,
-        marketFeedConfigured: true,
-        approvedModels: [],
-        predictionEngine:
-          'NOT_IMPLEMENTED',
-        portfolioMode:
-          'manual only',
-        brokerConnection: false,
-        bankConnection: false,
-        tradeExecution: false
-      });
+      return sendJSON(
+        response,
+        {
+          version:
+            VERSION,
+
+          marketProvider:
+            'psxdata-api',
+
+          metadataProvider:
+            'PSX /symbols',
+
+          marketFeedConfigured:
+            true,
+
+          predictionEngine:
+            'NOT_IMPLEMENTED',
+
+          brokerConnection:
+            false,
+
+          bankConnection:
+            false,
+
+          tradeExecution:
+            false
+        }
+      );
     }
 
     if (
@@ -554,12 +753,13 @@ async function handler(request, response) {
       request.method === 'GET' &&
       action === 'quote'
     ) {
-      const stockSymbol =
-        url.searchParams.get('symbol');
-
       return sendJSON(
         response,
-        await getStockQuote(stockSymbol)
+        await getQuote(
+          url.searchParams.get(
+            'symbol'
+          )
+        )
       );
     }
 
@@ -567,21 +767,20 @@ async function handler(request, response) {
       request.method === 'GET' &&
       action === 'history'
     ) {
-      const stockSymbol =
-        url.searchParams.get('symbol');
-
-      const start =
-        url.searchParams.get('start');
-
-      const end =
-        url.searchParams.get('end');
-
       return sendJSON(
         response,
-        await getStockHistory(
-          stockSymbol,
-          start,
-          end
+        await getHistory(
+          url.searchParams.get(
+            'symbol'
+          ),
+
+          url.searchParams.get(
+            'start'
+          ),
+
+          url.searchParams.get(
+            'end'
+          )
         )
       );
     }
@@ -590,57 +789,14 @@ async function handler(request, response) {
       request.method === 'GET' &&
       action === 'fundamentals'
     ) {
-      const stockSymbol =
-        url.searchParams.get('symbol');
-
       return sendJSON(
         response,
-        await getStockFundamentals(
-          stockSymbol
+        await getFundamentals(
+          url.searchParams.get(
+            'symbol'
+          )
         )
       );
-    }
-
-    if (
-      request.method === 'POST' &&
-      action === 'portfolio'
-    ) {
-      const body =
-        await readBody(request);
-
-      return sendJSON(response, {
-        status: 'PORTFOLIO_RECEIVED',
-        portfolio: body.portfolio || null,
-        note:
-          'Portfolio intelligence will be added after market-data validation.'
-      });
-    }
-
-    if (
-      request.method === 'POST' &&
-      action === 'plan'
-    ) {
-      const body =
-        await readBody(request);
-
-      return sendJSON(response, {
-        status:
-          'BLOCKED_MODEL_VALIDATION',
-
-        input: {
-          budget:
-            body.budget ?? null,
-          horizon:
-            body.horizon ?? null,
-          risk:
-            body.risk ?? null
-        },
-
-        purchases: [],
-
-        reason:
-          'Market data is connected, but the prediction and allocation models are not validated yet. NOMAD Invest will not invent stock recommendations.'
-      });
     }
 
     bad(
@@ -651,18 +807,21 @@ async function handler(request, response) {
     sendJSON(
       response,
       {
-        status: 'UNAVAILABLE',
+        status:
+          'UNAVAILABLE',
+
         message:
           error.message ||
           'Operation failed.'
       },
+
       error.status || 500
     );
   }
 }
 
 /* --------------------------------------------------
-   Browser interface
+   Interface
 -------------------------------------------------- */
 
 function page() {
@@ -670,6 +829,7 @@ function page() {
 <html lang="en">
 
 <head>
+
 <meta charset="utf-8">
 
 <meta
@@ -694,7 +854,7 @@ body {
 }
 
 main {
-  max-width: 1100px;
+  max-width: 1150px;
   margin: auto;
   padding: 28px;
 }
@@ -703,19 +863,14 @@ header {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  gap: 20px;
 }
 
 h1 {
   margin: 0;
 }
 
-h2 {
-  margin-top: 0;
-}
-
 .sub {
-  color: #627487;
+  color: #617487;
 }
 
 .card {
@@ -729,13 +884,7 @@ h2 {
 .notice {
   background: #fff8e8;
   border-left: 4px solid #bd8728;
-  padding: 14px 18px;
-  border-radius: 4px;
-}
-
-button,
-input {
-  font: inherit;
+  padding: 15px 18px;
 }
 
 button {
@@ -745,33 +894,26 @@ button {
   border-radius: 7px;
   padding: 11px 16px;
   cursor: pointer;
+  font: inherit;
 }
 
 button:disabled {
   opacity: .6;
-  cursor: wait;
 }
 
 input {
   width: 100%;
-  max-width: 420px;
+  max-width: 440px;
   padding: 11px;
   border: 1px solid #b9c8d5;
   border-radius: 7px;
   box-sizing: border-box;
-  margin-top: 8px;
-}
-
-.actions {
-  display: flex;
-  gap: 10px;
-  flex-wrap: wrap;
-  margin: 16px 0;
+  font: inherit;
 }
 
 table {
-  border-collapse: collapse;
   width: 100%;
+  border-collapse: collapse;
   font-size: 14px;
 }
 
@@ -791,34 +933,41 @@ th {
   overflow-x: auto;
 }
 
-#error {
-  color: #a32626;
+.positive {
+  color: #11823b;
   font-weight: 600;
 }
 
-#status {
-  font-size: 14px;
-  margin: 16px 0;
+.negative {
+  color: #b52a2a;
+  font-weight: 600;
 }
 
-.small {
-  font-size: 13px;
+.muted {
   color: #66788a;
 }
 
-@media(max-width: 650px) {
+#error {
+  color: #b52a2a;
+  font-weight: 600;
+}
 
-  main {
-    padding: 16px;
-  }
+.actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 16px 0;
+}
 
-  header {
-    display: block;
-  }
-
+pre {
+  overflow-x: auto;
+  background: #f6f8fa;
+  padding: 15px;
+  border-radius: 8px;
 }
 
 </style>
+
 </head>
 
 <body>
@@ -829,7 +978,9 @@ th {
 
 <div>
 
-<h1>NOMAD Invest</h1>
+<h1>
+NOMAD Invest
+</h1>
 
 <div class="sub">
 PSX research and personal investment intelligence
@@ -845,17 +996,15 @@ Build ${VERSION}
 
 <p class="notice">
 
-PSX market data is now connected through the public
-psxdata-api service.
-
-Stock recommendations remain disabled until the
-analysis and prediction engines are validated.
+Market data is connected.
+Prediction and recommendation models are still disabled
+until we build and validate them.
 
 </p>
 
-<div id="status">
-Checking PSX connection...
-</div>
+<p id="status">
+Checking connection...
+</p>
 
 <p id="error"></p>
 
@@ -865,13 +1014,6 @@ Checking PSX connection...
 Explore PSX
 </h2>
 
-<p>
-
-Load the available PSX stock universe and search by
-company, symbol or sector.
-
-</p>
-
 <div class="actions">
 
 <button id="loadMarket">
@@ -880,21 +1022,15 @@ Load market data
 
 </div>
 
-<label>
-
-Search
-
 <input
   id="search"
   type="search"
-  placeholder="HBL, ENGRO, Cement..."
+  placeholder="Search company, symbol or sector"
 >
-
-</label>
 
 <p
   id="coverage"
-  class="small"
+  class="muted"
 ></p>
 
 <div
@@ -910,23 +1046,10 @@ Search
 Stock research
 </h2>
 
-<p>
-
-Enter a PSX symbol to retrieve the latest available
-quote and historical data.
-
-</p>
-
-<label>
-
-PSX symbol
-
 <input
   id="stockSymbol"
-  placeholder="Example: HBL"
+  placeholder="Enter PSX symbol e.g. HBL"
 >
-
-</label>
 
 <div class="actions">
 
@@ -948,13 +1071,6 @@ Fundamentals
 
 </section>
 
-<footer class="small">
-
-No broker connection. No bank connection.
-No automated trading.
-
-</footer>
-
 </main>
 
 <script>
@@ -965,7 +1081,6 @@ const $ =
 let marketRows = [];
 
 function escapeHtml(value) {
-
   return String(value).replace(
     /[&<>"']/g,
     character => ({
@@ -976,13 +1091,33 @@ function escapeHtml(value) {
       "'": '&#39;'
     }[character])
   );
-
 }
 
-async function api(action, params = {}) {
+function formatNumber(value) {
+  if (
+    value === null ||
+    value === undefined
+  ) {
+    return '-';
+  }
 
+  return Number(value)
+    .toLocaleString(
+      'en-PK',
+      {
+        maximumFractionDigits: 2
+      }
+    );
+}
+
+async function api(
+  action,
+  params = {}
+) {
   const url =
-    new URL(location.href);
+    new URL(
+      location.href
+    );
 
   url.searchParams.set(
     'action',
@@ -993,20 +1128,16 @@ async function api(action, params = {}) {
     const [key, value]
     of Object.entries(params)
   ) {
-
     if (
       value !== null &&
       value !== undefined &&
       value !== ''
     ) {
-
       url.searchParams.set(
         key,
         value
       );
-
     }
-
   }
 
   const response =
@@ -1016,27 +1147,16 @@ async function api(action, params = {}) {
     await response.json();
 
   if (!response.ok) {
-
     throw new Error(
       result.message ||
       'Request failed.'
     );
-
   }
 
   return result;
-
-}
-
-function showError(message = '') {
-
-  $('error').textContent =
-    message;
-
 }
 
 function renderStocks() {
-
   const query =
     $('search')
       .value
@@ -1058,112 +1178,120 @@ function renderStocks() {
     );
 
   if (!rows.length) {
-
     $('stocks').innerHTML =
       '<p>No matching stocks.</p>';
 
     return;
-
   }
 
   $('stocks').innerHTML =
-    \`
-    <table>
+    '<table>' +
 
-    <thead>
+    '<thead>' +
+    '<tr>' +
+    '<th>Symbol</th>' +
+    '<th>Company</th>' +
+    '<th>Sector</th>' +
+    '<th>Price</th>' +
+    '<th>Change</th>' +
+    '<th>Change %</th>' +
+    '<th>Volume</th>' +
+    '</tr>' +
+    '</thead>' +
 
-    <tr>
+    '<tbody>' +
 
-    <th>Symbol</th>
-    <th>Company</th>
-    <th>Sector</th>
-    <th>Price</th>
-    <th>Change %</th>
-    <th>Volume</th>
+    rows.map(stock => {
 
-    </tr>
+      const className =
+        stock.change > 0
+          ? 'positive'
+          : stock.change < 0
+            ? 'negative'
+            : '';
 
-    </thead>
+      return (
+        '<tr>' +
 
-    <tbody>
+        '<td>' +
+        escapeHtml(stock.symbol) +
+        '</td>' +
 
-    \${rows.map(stock => \`
+        '<td>' +
+        escapeHtml(stock.name) +
+        '</td>' +
 
-      <tr>
+        '<td>' +
+        escapeHtml(stock.sector) +
+        '</td>' +
 
-      <td>
-      \${escapeHtml(stock.symbol)}
-      </td>
+        '<td>' +
+        formatNumber(stock.price) +
+        '</td>' +
 
-      <td>
-      \${escapeHtml(stock.name)}
-      </td>
+        '<td class="' +
+        className +
+        '">' +
+        formatNumber(stock.change) +
+        '</td>' +
 
-      <td>
-      \${escapeHtml(stock.sector)}
-      </td>
+        '<td class="' +
+        className +
+        '">' +
+        (
+          stock.changePercent === null
+            ? '-'
+            : formatNumber(
+                stock.changePercent
+              ) + '%'
+        ) +
+        '</td>' +
 
-      <td>
-      \${stock.price ?? ''}
-      </td>
+        '<td>' +
+        formatNumber(stock.volume) +
+        '</td>' +
 
-      <td>
-      \${stock.changePercent ?? ''}
-      </td>
+        '</tr>'
+      );
 
-      <td>
-      \${stock.volume ?? ''}
-      </td>
+    }).join('') +
 
-      </tr>
+    '</tbody>' +
 
-    \`).join('')}
-
-    </tbody>
-
-    </table>
-    \`;
-
+    '</table>';
 }
 
 $('loadMarket').onclick =
   async () => {
 
-    showError();
+    $('error').textContent = '';
 
     $('loadMarket').disabled =
       true;
 
     try {
-
-      const market =
-        await api('market');
+      const result =
+        await api(
+          'market'
+        );
 
       marketRows =
-        market.stocks || [];
+        result.stocks || [];
 
       $('coverage').textContent =
-        market.sourceName +
-        ' | ' +
-        market.totalStocks +
+        result.totalStocks +
         ' usable stocks | Updated ' +
-        market.asOf;
+        result.asOf;
 
       renderStocks();
 
     } catch (error) {
-
-      showError(
-        error.message
-      );
-
+      $('error').textContent =
+        error.message;
     } finally {
-
       $('loadMarket').disabled =
         false;
-
     }
-
   };
 
 $('search').oninput =
@@ -1172,20 +1300,17 @@ $('search').oninput =
 $('loadQuote').onclick =
   async () => {
 
-    showError();
-
     try {
-
-      const symbol =
-        $('stockSymbol')
-          .value
-          .trim()
-          .toUpperCase();
-
       const result =
         await api(
           'quote',
-          { symbol }
+          {
+            symbol:
+              $('stockSymbol')
+                .value
+                .trim()
+                .toUpperCase()
+          }
         );
 
       $('research').textContent =
@@ -1196,32 +1321,25 @@ $('loadQuote').onclick =
         );
 
     } catch (error) {
-
-      showError(
-        error.message
-      );
-
+      $('error').textContent =
+        error.message;
     }
-
   };
 
 $('loadHistory').onclick =
   async () => {
 
-    showError();
-
     try {
-
-      const symbol =
-        $('stockSymbol')
-          .value
-          .trim()
-          .toUpperCase();
-
       const result =
         await api(
           'history',
-          { symbol }
+          {
+            symbol:
+              $('stockSymbol')
+                .value
+                .trim()
+                .toUpperCase()
+          }
         );
 
       $('research').textContent =
@@ -1232,32 +1350,25 @@ $('loadHistory').onclick =
         );
 
     } catch (error) {
-
-      showError(
-        error.message
-      );
-
+      $('error').textContent =
+        error.message;
     }
-
   };
 
 $('loadFundamentals').onclick =
   async () => {
 
-    showError();
-
     try {
-
-      const symbol =
-        $('stockSymbol')
-          .value
-          .trim()
-          .toUpperCase();
-
       const result =
         await api(
           'fundamentals',
-          { symbol }
+          {
+            symbol:
+              $('stockSymbol')
+                .value
+                .trim()
+                .toUpperCase()
+          }
         );
 
       $('research').textContent =
@@ -1268,47 +1379,37 @@ $('loadFundamentals').onclick =
         );
 
     } catch (error) {
-
-      showError(
-        error.message
-      );
-
+      $('error').textContent =
+        error.message;
     }
-
   };
 
 api('health')
-  .then(result => {
-
-    $('status').textContent =
-      'Market provider: ' +
-      result.marketDataProvider +
-      ' | Prediction engine: ' +
-      result.predictionEngine;
-
-  })
-  .catch(error => {
-
-    $('status').textContent =
-      error.message;
-
-  });
+  .then(
+    result => {
+      $('status').textContent =
+        'Market: connected | Company metadata: connected | Prediction engine: ' +
+        result.predictionEngine;
+    }
+  )
+  .catch(
+    error => {
+      $('status').textContent =
+        error.message;
+    }
+  );
 
 </script>
 
 </body>
+
 </html>`;
 }
-
-/* --------------------------------------------------
-   Exports
--------------------------------------------------- */
 
 module.exports =
   handler;
 
 if (require.main === module) {
-
   const port =
     Number(
       process.env.PORT || 3000
@@ -1320,12 +1421,9 @@ if (require.main === module) {
       port,
       '127.0.0.1',
       () => {
-
         console.log(
           `NOMAD Invest running at http://127.0.0.1:${port}`
         );
-
       }
     );
-
 }
