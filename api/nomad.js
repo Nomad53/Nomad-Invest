@@ -9,7 +9,25 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.7.0';
+const VERSION = '0.8.0';
+
+
+const SUPABASE_URL =
+  String(
+    process.env.SUPABASE_URL ||
+    ''
+  )
+    .trim()
+    .replace(
+      /\/+$/,
+      ''
+    );
+
+const SUPABASE_SECRET_KEY =
+  String(
+    process.env.SUPABASE_SECRET_KEY ||
+    ''
+  ).trim();
 
 const PSX_API_BASE =
   process.env.PSX_API_BASE ||
@@ -12081,6 +12099,897 @@ async function getTechnicalAnalysis(
   };
 }
 
+
+/* =========================================================
+   CONTINUOUS INTELLIGENCE MEMORY - BUILD 0.8.0
+========================================================= */
+
+function continuousMemoryConfigured() {
+  return Boolean(
+    SUPABASE_URL &&
+    SUPABASE_SECRET_KEY
+  );
+}
+
+async function supabaseRest(
+  resource,
+  options = {}
+) {
+  if (
+    !continuousMemoryConfigured()
+  ) {
+    bad(
+      'Supabase continuous-intelligence memory is not configured.',
+      503
+    );
+  }
+
+  const method =
+    String(
+      options.method ||
+      'GET'
+    ).toUpperCase();
+
+  const headers = {
+    apikey:
+      SUPABASE_SECRET_KEY,
+
+    Accept:
+      'application/json',
+
+    'User-Agent':
+      'NOMAD-Invest-Server/0.8.0'
+  };
+
+  if (
+    options.body !== undefined &&
+    options.body !== null
+  ) {
+    headers['Content-Type'] =
+      'application/json';
+  }
+
+  if (
+    options.prefer
+  ) {
+    headers.Prefer =
+      options.prefer;
+  }
+
+  const response =
+    await fetch(
+      `${SUPABASE_URL}/rest/v1/${resource}`,
+      {
+        method,
+        headers,
+        body:
+          options.body !== undefined &&
+          options.body !== null
+            ? JSON.stringify(
+                options.body
+              )
+            : undefined,
+        signal:
+          AbortSignal.timeout(
+            options.timeout ||
+            20000
+          )
+      }
+    );
+
+  const raw =
+    await response.text();
+
+  let payload = null;
+
+  if (raw) {
+    try {
+      payload = JSON.parse(raw);
+    } catch {
+      payload = raw;
+    }
+  }
+
+  if (!response.ok) {
+    const detail =
+      payload?.message ||
+      payload?.details ||
+      payload?.hint ||
+      (
+        typeof payload === 'string'
+          ? payload
+          : ''
+      );
+
+    bad(
+      'Supabase request failed with HTTP ' +
+      response.status +
+      (
+        detail
+          ? ': ' + String(detail)
+          : ''
+      ),
+      502
+    );
+  }
+
+  return payload;
+}
+
+async function readSecurityMemory(symbol) {
+  const rows =
+    await supabaseRest(
+      'security_state?symbol=eq.' +
+      encodeURIComponent(symbol) +
+      '&select=*'
+    );
+
+  return Array.isArray(rows) && rows.length
+    ? rows[0]
+    : null;
+}
+
+async function createIntelligenceRun(metadata = {}) {
+  const rows =
+    await supabaseRest(
+      'intelligence_runs?select=id,started_at',
+      {
+        method: 'POST',
+        prefer: 'return=representation',
+        body: {
+          run_type: 'manual',
+          status: 'running',
+          universe_version:
+            PSX_UNIVERSE_MASTER.masterVersion,
+          metadata
+        }
+      }
+    );
+
+  if (!Array.isArray(rows) || !rows[0]?.id) {
+    bad(
+      'Supabase did not return an intelligence-run ID.',
+      502
+    );
+  }
+
+  return rows[0];
+}
+
+async function finishIntelligenceRun(
+  runId,
+  update
+) {
+  if (!runId) {
+    return;
+  }
+
+  await supabaseRest(
+    'intelligence_runs?id=eq.' +
+    encodeURIComponent(runId),
+    {
+      method: 'PATCH',
+      prefer: 'return=minimal',
+      body: {
+        ...update,
+        completed_at:
+          new Date().toISOString()
+      }
+    }
+  );
+}
+
+function roundMemoryNumber(
+  value,
+  digits = 4
+) {
+  const number = safeNumber(value);
+
+  if (number === null) {
+    return null;
+  }
+
+  const factor = 10 ** digits;
+
+  return Math.round(number * factor) / factor;
+}
+
+function technicalPosition(
+  price,
+  movingAverage
+) {
+  const current = safeNumber(price);
+  const average = safeNumber(movingAverage);
+
+  if (current === null || average === null) {
+    return null;
+  }
+
+  if (Math.abs(current - average) < 0.000001) {
+    return 'AT';
+  }
+
+  return current > average
+    ? 'ABOVE'
+    : 'BELOW';
+}
+
+function buildMemoryState(
+  marketRow,
+  technical
+) {
+  const symbol =
+    normalizeSymbol(
+      marketRow?.symbol
+    );
+
+  const master =
+    getUniverseMasterEntry(
+      symbol
+    );
+
+  const technicalAvailable =
+    Boolean(
+      technical?.available
+    );
+
+  const price =
+    safeNumber(
+      marketRow?.price
+    ) ??
+    safeNumber(
+      technical?.price
+    );
+
+  const technicalState =
+    technicalAvailable
+      ? {
+          asOf:
+            technical.asOf || null,
+          trend:
+            technical.trend?.label || null,
+          rsi14:
+            roundMemoryNumber(
+              technical.momentum?.rsi14,
+              2
+            ),
+          rsiLabel:
+            technical.momentum?.rsiLabel || null,
+          macd:
+            roundMemoryNumber(
+              technical.momentum?.macd,
+              4
+            ),
+          macdSignal:
+            roundMemoryNumber(
+              technical.momentum?.macdSignal,
+              4
+            ),
+          momentum20Pct:
+            roundMemoryNumber(
+              technical.momentum?.momentum20Pct,
+              2
+            ),
+          annualizedVolatility20dPct:
+            roundMemoryNumber(
+              technical.risk?.annualizedVolatility20dPct,
+              2
+            ),
+          atrPct:
+            roundMemoryNumber(
+              technical.risk?.atrPct,
+              2
+            ),
+          volumeRatio20d:
+            roundMemoryNumber(
+              technical.volume?.ratio,
+              2
+            ),
+          sma20:
+            roundMemoryNumber(
+              technical.trend?.sma20,
+              2
+            ),
+          sma50:
+            roundMemoryNumber(
+              technical.trend?.sma50,
+              2
+            ),
+          sma200:
+            roundMemoryNumber(
+              technical.trend?.sma200,
+              2
+            ),
+          priceVsSma20:
+            technicalPosition(
+              price,
+              technical.trend?.sma20
+            ),
+          priceVsSma50:
+            technicalPosition(
+              price,
+              technical.trend?.sma50
+            ),
+          priceVsSma200:
+            technicalPosition(
+              price,
+              technical.trend?.sma200
+            ),
+          support20:
+            roundMemoryNumber(
+              technical.levels?.support20,
+              2
+            ),
+          resistance20:
+            roundMemoryNumber(
+              technical.levels?.resistance20,
+              2
+            ),
+          validSessions:
+            technical.dataQuality?.validSessions ?? null,
+          excludedAnomalies:
+            technical.dataQuality?.excludedAnomalies ?? null
+        }
+      : {
+          available: false
+        };
+
+  const marketState = {
+    asOf:
+      marketRow?.asOf || null,
+    price:
+      roundMemoryNumber(
+        price,
+        4
+      ),
+    peRatio:
+      roundMemoryNumber(
+        marketRow?.peRatio,
+        4
+      ),
+    dividendYield:
+      roundMemoryNumber(
+        marketRow?.dividendYield,
+        4
+      ),
+    averageVolume30d:
+      roundMemoryNumber(
+        marketRow?.averageVolume30d,
+        2
+      ),
+    change1yPct:
+      roundMemoryNumber(
+        marketRow?.change1yPct,
+        2
+      ),
+    statusCodes:
+      Array.isArray(
+        marketRow?.statusCodes
+      )
+        ? marketRow.statusCodes
+        : []
+  };
+
+  const currentView =
+    technicalAvailable
+      ? (
+          technical.trend?.label ||
+          'Technical state available'
+        )
+      : 'Technical state unavailable';
+
+  const currentViewReason =
+    technicalAvailable
+      ? (
+          'Price is ' +
+          String(
+            technicalState.priceVsSma50 ||
+            'not comparable with'
+          ) +
+          ' SMA50; RSI(14) is ' +
+          (
+            technicalState.rsi14 ??
+            'N/A'
+          ) +
+          '.'
+        )
+      : 'NOMAD saved the market state, but technical history was not available for this observation.';
+
+  const hashPayload = {
+    symbol,
+    marketState,
+    technicalState,
+    currentView
+  };
+
+  const stateHash =
+    crypto
+      .createHash('sha256')
+      .update(
+        JSON.stringify(hashPayload)
+      )
+      .digest('hex');
+
+  return {
+    symbol,
+    company_name:
+      master?.companyName ||
+      marketRow?.companyName ||
+      symbol,
+    sector:
+      master?.sector ||
+      marketRow?.sector ||
+      null,
+    universe_class:
+      master?.universeClass ||
+      marketRow?.universeClass ||
+      null,
+    eligibility:
+      master?.recommendationEligible === true
+        ? 'RECOMMENDATION_ELIGIBLE'
+        : 'NOT_RECOMMENDATION_ELIGIBLE',
+    market_price:
+      roundMemoryNumber(
+        price,
+        4
+      ),
+    market_change_pct: null,
+    volume: null,
+    volume_ratio_20d:
+      technicalAvailable
+        ? technicalState.volumeRatio20d
+        : null,
+    technical_score: null,
+    fundamental_score: null,
+    risk_score: null,
+    overall_score: null,
+    technical_state:
+      technicalState,
+    fundamental_state: {},
+    risk_state: {},
+    market_state:
+      marketState,
+    current_view:
+      currentView,
+    current_view_reason:
+      currentViewReason,
+    data_quality_score:
+      technicalAvailable
+        ? 100
+        : 60,
+    source_timestamp:
+      marketRow?.asOf ||
+      technical?.asOf ||
+      null,
+    state_hash:
+      stateHash,
+    evaluated_at:
+      new Date().toISOString()
+  };
+}
+
+function memoryChangeSignificance(
+  percentageChange
+) {
+  const absolute =
+    Math.abs(
+      safeNumber(
+        percentageChange
+      ) || 0
+    );
+
+  if (absolute >= 5) {
+    return 'high';
+  }
+
+  if (absolute >= 2) {
+    return 'medium';
+  }
+
+  return 'low';
+}
+
+function appendMemoryChange(
+  changes,
+  fieldName,
+  oldValue,
+  newValue,
+  options = {}
+) {
+  if (
+    oldValue === undefined ||
+    oldValue === null ||
+    newValue === undefined ||
+    newValue === null
+  ) {
+    return;
+  }
+
+  if (String(oldValue) === String(newValue)) {
+    return;
+  }
+
+  const oldNumber = safeNumber(oldValue);
+  const newNumber = safeNumber(newValue);
+
+  const absoluteChange =
+    oldNumber !== null &&
+    newNumber !== null
+      ? newNumber - oldNumber
+      : null;
+
+  const percentageChange =
+    oldNumber !== null &&
+    newNumber !== null &&
+    oldNumber !== 0
+      ? (
+          absoluteChange /
+          Math.abs(oldNumber)
+        ) * 100
+      : null;
+
+  changes.push({
+    change_category:
+      options.category || 'state',
+    field_name:
+      fieldName,
+    old_value: {
+      value: oldValue
+    },
+    new_value: {
+      value: newValue
+    },
+    absolute_change:
+      roundMemoryNumber(
+        absoluteChange,
+        6
+      ),
+    percentage_change:
+      roundMemoryNumber(
+        percentageChange,
+        4
+      ),
+    significance:
+      options.significance ||
+      memoryChangeSignificance(
+        percentageChange
+      ),
+    summary:
+      options.summary ||
+      (
+        fieldName +
+        ' changed from ' +
+        String(oldValue) +
+        ' to ' +
+        String(newValue) +
+        '.'
+      ),
+    evidence: {
+      source:
+        options.source ||
+        'NOMAD state comparison'
+    }
+  });
+}
+
+function detectMemoryChanges(
+  previous,
+  current
+) {
+  if (!previous) {
+    return [];
+  }
+
+  const changes = [];
+
+  appendMemoryChange(
+    changes,
+    'market_price',
+    previous.market_price,
+    current.market_price,
+    {
+      category: 'market',
+      source: 'psxdata-api'
+    }
+  );
+
+  const previousTechnical =
+    previous.technical_state || {};
+
+  const currentTechnical =
+    current.technical_state || {};
+
+  appendMemoryChange(
+    changes,
+    'technical_trend',
+    previousTechnical.trend,
+    currentTechnical.trend,
+    {
+      category: 'technical',
+      significance: 'medium',
+      summary:
+        'Technical trend changed from ' +
+        String(previousTechnical.trend) +
+        ' to ' +
+        String(currentTechnical.trend) +
+        '.'
+    }
+  );
+
+  appendMemoryChange(
+    changes,
+    'rsi14',
+    previousTechnical.rsi14,
+    currentTechnical.rsi14,
+    {
+      category: 'technical',
+      source: 'deterministic technical engine'
+    }
+  );
+
+  for (
+    const field of [
+      'priceVsSma20',
+      'priceVsSma50',
+      'priceVsSma200'
+    ]
+  ) {
+    appendMemoryChange(
+      changes,
+      field,
+      previousTechnical[field],
+      currentTechnical[field],
+      {
+        category: 'technical',
+        significance: 'medium',
+        summary:
+          field +
+          ' changed from ' +
+          String(previousTechnical[field]) +
+          ' to ' +
+          String(currentTechnical[field]) +
+          '.'
+      }
+    );
+  }
+
+  appendMemoryChange(
+    changes,
+    'volume_ratio_20d',
+    previousTechnical.volumeRatio20d,
+    currentTechnical.volumeRatio20d,
+    {
+      category: 'market',
+      source: 'deterministic technical engine'
+    }
+  );
+
+  return changes;
+}
+
+async function upsertSecurityMemory(
+  state,
+  runId
+) {
+  const rows =
+    await supabaseRest(
+      'security_state?on_conflict=symbol&select=*',
+      {
+        method: 'POST',
+        prefer:
+          'resolution=merge-duplicates,return=representation',
+        body: {
+          ...state,
+          last_run_id: runId
+        }
+      }
+    );
+
+  return Array.isArray(rows) && rows.length
+    ? rows[0]
+    : null;
+}
+
+async function saveStateChanges(
+  symbol,
+  runId,
+  changes
+) {
+  if (!Array.isArray(changes) || !changes.length) {
+    return [];
+  }
+
+  const rows =
+    changes.map(
+      change => ({
+        run_id: runId,
+        symbol,
+        ...change
+      })
+    );
+
+  const result =
+    await supabaseRest(
+      'state_changes?select=id,field_name,significance,summary,detected_at',
+      {
+        method: 'POST',
+        prefer: 'return=representation',
+        body: rows
+      }
+    );
+
+  return Array.isArray(result)
+    ? result
+    : [];
+}
+
+async function runContinuousMemoryTest(
+  stockSymbol
+) {
+  const symbol =
+    normalizeSymbol(
+      stockSymbol || 'HBL'
+    );
+
+  if (!symbol) {
+    bad('Enter a PSX symbol.');
+  }
+
+  const master =
+    getUniverseMasterEntry(symbol);
+
+  if (!master) {
+    bad(
+      'Symbol is not present in the canonical NOMAD universe.',
+      404
+    );
+  }
+
+  const run =
+    await createIntelligenceRun({
+      test: 'PERSISTENT_SECURITY_STATE',
+      symbol,
+      build: VERSION
+    });
+
+  try {
+    const previous =
+      await readSecurityMemory(symbol);
+
+    const [market, technical] =
+      await Promise.all([
+        loadPSXMarket(),
+        getTechnicalAnalysis(symbol).catch(
+          error => ({
+            available: false,
+            message:
+              error.message ||
+              'Technical analysis unavailable.'
+          })
+        )
+      ]);
+
+    const marketRow =
+      market.stocks.find(
+        row =>
+          normalizeSymbol(row.symbol) === symbol
+      );
+
+    if (!marketRow) {
+      bad(
+        'Current market row is unavailable for ' +
+        symbol +
+        '.',
+        502
+      );
+    }
+
+    const current =
+      buildMemoryState(
+        marketRow,
+        technical
+      );
+
+    const changes =
+      detectMemoryChanges(
+        previous,
+        current
+      );
+
+    const savedChanges =
+      await saveStateChanges(
+        symbol,
+        run.id,
+        changes
+      );
+
+    const savedState =
+      await upsertSecurityMemory(
+        current,
+        run.id
+      );
+
+    await finishIntelligenceRun(
+      run.id,
+      {
+        status: 'completed',
+        securities_processed: 1,
+        changes_detected: changes.length,
+        signals_generated: 0,
+        alerts_generated: 0,
+        predictions_generated: 0
+      }
+    );
+
+    return {
+      status: 'OK',
+      memoryConfigured: true,
+      symbol,
+      companyName:
+        master.companyName ||
+        marketRow.companyName ||
+        symbol,
+      universeClass:
+        master.universeClass || null,
+      runId:
+        run.id,
+      firstObservation:
+        !previous,
+      previousStateFound:
+        Boolean(previous),
+      previousEvaluatedAt:
+        previous?.evaluated_at || null,
+      previousStateHash:
+        previous?.state_hash || null,
+      currentEvaluatedAt:
+        savedState?.evaluated_at ||
+        current.evaluated_at,
+      currentStateHash:
+        savedState?.state_hash ||
+        current.state_hash,
+      sameStateHash:
+        Boolean(
+          previous?.state_hash &&
+          previous.state_hash === current.state_hash
+        ),
+      changesDetected:
+        changes.length,
+      changes:
+        savedChanges,
+      current: {
+        price:
+          current.market_price,
+        view:
+          current.current_view,
+        viewReason:
+          current.current_view_reason,
+        technical:
+          current.technical_state,
+        market:
+          current.market_state
+      },
+      proof:
+        previous
+          ? 'NOMAD read the previously stored state before saving the new observation.'
+          : 'This was the first stored observation for this symbol. Run the same test again to prove retrieval of the previous state.'
+    };
+  } catch (error) {
+    await finishIntelligenceRun(
+      run.id,
+      {
+        status: 'failed',
+        error_message:
+          String(
+            error.message ||
+            'Memory test failed.'
+          ).slice(0, 1000)
+      }
+    ).catch(() => {});
+
+    throw error;
+  }
+}
+
 /* =========================================================
    AUTH
 ========================================================= */
@@ -12293,6 +13202,14 @@ async function handler(
           technicalEngine:
             'IMPLEMENTED_DETERMINISTIC',
 
+          continuousIntelligenceMemory:
+            continuousMemoryConfigured()
+              ? 'CONFIGURED'
+              : 'NOT_CONFIGURED',
+
+          supabaseConfigured:
+            continuousMemoryConfigured(),
+
           pyPSXConfigured:
             Boolean(
               PYPSX_API_KEY_ID &&
@@ -12311,6 +13228,23 @@ async function handler(
           tradeExecution:
             false
         }
+      );
+    }
+
+    if (
+      request.method ===
+        'GET' &&
+      action ===
+        'intelligence-memory-test'
+    ) {
+      return sendJSON(
+        response,
+        await runContinuousMemoryTest(
+          url.searchParams.get(
+            'symbol'
+          ) ||
+          'HBL'
+        )
       );
     }
 
@@ -13487,7 +14421,7 @@ Build ${VERSION}
 Market, company metadata, fundamentals, symbol normalization,
 canonical universe identity, metadata, fundamentals and deterministic technical analysis are connected.
 
-Predictions and investment recommendations remain disabled
+Persistent intelligence memory is now connected. Predictions and investment recommendations remain disabled
 until their models are built and validated.
 
 </p>
@@ -13713,6 +14647,54 @@ NOMAD now uses a frozen, versioned security master for identity and recommendati
 
 <div class="infoBox">
 <strong>Universe lock:</strong> Core equities may proceed to future scoring and allocation. GEM and alternative securities require separate frameworks. Review-required symbols remain searchable for research but cannot enter recommendations. Universe changes will be handled later through a controlled master refresh/diff, not during normal app use.
+</div>
+
+</section>
+
+<section class="card" id="continuousMemorySection">
+
+<h2>Continuous Intelligence Memory</h2>
+
+<p class="muted">
+Build 0.8.0 connects NOMAD to persistent server-side memory. This test reads a stock's previously stored state, recalculates its current market and technical state, records any changes, and then saves the new state for the next run.
+</p>
+
+<div class="grid3">
+
+<div>
+<label for="memoryTestSymbol">Test symbol</label>
+<input
+  id="memoryTestSymbol"
+  type="text"
+  value="HBL"
+  placeholder="Example: HBL"
+>
+</div>
+
+<div style="align-self:end">
+<button id="runMemoryTest">
+Test persistent memory
+</button>
+</div>
+
+<div>
+<div class="metricLabel">Database status</div>
+<div
+  id="memoryDatabaseStatus"
+  class="metricValue"
+>
+Checking...
+</div>
+</div>
+
+</div>
+
+<div
+  id="memoryTestResult"
+  class="infoBox"
+  style="margin-top:16px"
+>
+Run the test once to create the first observation. Run it again later to prove NOMAD can retrieve the previous state before saving the new one.
 </div>
 
 </section>
@@ -21443,6 +22425,135 @@ $('stockSymbol')
     };
 
 /* =========================================================
+   CONTINUOUS INTELLIGENCE MEMORY
+========================================================= */
+
+function renderMemoryTestResult(
+  result
+) {
+  const previousLine =
+    result.previousStateFound
+      ? (
+          '<strong>Previous state found:</strong> Yes' +
+          (
+            result.previousEvaluatedAt
+              ? ' | Saved ' +
+                escapeHtml(
+                  result.previousEvaluatedAt
+                )
+              : ''
+          )
+        )
+      : '<strong>Previous state found:</strong> No - first observation';
+
+  const changeLine =
+    '<strong>Changes detected:</strong> ' +
+    escapeHtml(
+      String(
+        result.changesDetected ?? 0
+      )
+    );
+
+  const stateLine =
+    '<strong>Current state:</strong> ' +
+    escapeHtml(
+      result.current?.view || 'N/A'
+    ) +
+    ' | Price PKR ' +
+    escapeHtml(
+      result.current?.price === null ||
+      result.current?.price === undefined
+        ? 'N/A'
+        : String(result.current.price)
+    );
+
+  const changeRows =
+    Array.isArray(result.changes) &&
+    result.changes.length
+      ? (
+          '<div style="margin-top:10px"><strong>Recorded changes</strong><ul>' +
+          result.changes
+            .map(
+              item =>
+                '<li>' +
+                escapeHtml(
+                  item.summary ||
+                  item.field_name ||
+                  'State change'
+                ) +
+                ' <span class="muted">(' +
+                escapeHtml(
+                  item.significance || 'low'
+                ) +
+                ')</span></li>'
+            )
+            .join('') +
+          '</ul></div>'
+        )
+      : '';
+
+  $('memoryTestResult')
+    .innerHTML =
+      '<strong>' +
+      escapeHtml(result.symbol || '') +
+      ' - ' +
+      escapeHtml(result.companyName || '') +
+      '</strong><br>' +
+      previousLine +
+      '<br>' +
+      changeLine +
+      '<br>' +
+      stateLine +
+      '<br><span class="muted">' +
+      escapeHtml(result.proof || '') +
+      '</span>' +
+      changeRows;
+}
+
+$('runMemoryTest')
+  .onclick =
+    async () => {
+      const button =
+        $('runMemoryTest');
+
+      const symbol =
+        String(
+          $('memoryTestSymbol').value ||
+          'HBL'
+        )
+          .trim()
+          .toUpperCase();
+
+      button.disabled = true;
+      button.textContent =
+        'Testing memory...';
+
+      $('memoryTestResult')
+        .textContent =
+          'Reading previous state, calculating current state and saving the observation...';
+
+      try {
+        const result =
+          await api(
+            'intelligence-memory-test',
+            { symbol }
+          );
+
+        renderMemoryTestResult(result);
+      } catch (error) {
+        $('memoryTestResult')
+          .innerHTML =
+            '<span class="negative">' +
+            escapeHtml(error.message) +
+            '</span>';
+      } finally {
+        button.disabled = false;
+        button.textContent =
+          'Test persistent memory';
+      }
+    };
+
+/* =========================================================
    HEALTH
 ========================================================= */
 
@@ -21466,8 +22577,20 @@ api(
           ) +
           ' | Fundamentals: connected' +
           ' | Technical engine: deterministic' +
+          ' | Persistent memory: ' +
+          (
+            result.supabaseConfigured
+              ? 'connected'
+              : 'not configured'
+          ) +
           ' | Prediction engine: ' +
           result.predictionEngine;
+
+      $('memoryDatabaseStatus')
+        .textContent =
+          result.supabaseConfigured
+            ? 'Connected'
+            : 'Not configured';
     }
   )
   .catch(
