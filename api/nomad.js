@@ -3,7 +3,7 @@
 const http = require('node:http');
 const crypto = require('node:crypto');
 
-const VERSION = '0.6.0';
+const VERSION = '0.6.1';
 
 const PSX_API_BASE =
   process.env.PSX_API_BASE ||
@@ -19,6 +19,9 @@ const PSX_DPS_BASE =
 
 const PSX_ELIGIBLE_SCRIPS_URL =
   `${PSX_DPS_BASE}/eligible-scrips`;
+
+const PSX_ALLSHR_URL =
+  `${PSX_DPS_BASE}/indices/ALLSHR`;
 
 const PYPSX_API_KEY_ID =
   process.env.PYPSX_API_KEY_ID ||
@@ -38,7 +41,12 @@ function getPyPSXBase() {
     : 'https://paper-api.pypsx.com';
 }
 
+/* =========================================================
+   CACHE
+========================================================= */
+
 let marketCache = null;
+let rawScreenerCache = null;
 let sectorCache = null;
 let companyCache = null;
 
@@ -46,7 +54,7 @@ const companyPageCache =
   new Map();
 
 /* =========================================================
-   HELPERS
+   CORE HELPERS
 ========================================================= */
 
 function bad(
@@ -107,6 +115,75 @@ function normalizeSymbol(value) {
   )
     .trim()
     .toUpperCase();
+}
+
+function normalizeRawMarketSymbol(
+  value
+) {
+  return String(
+    value || ''
+  )
+    .trim()
+    .toUpperCase()
+    .replace(
+      /\s+/g,
+      ' '
+    );
+}
+
+function primaryMarketToken(
+  value
+) {
+  return normalizeRawMarketSymbol(
+    value
+  )
+    .split(/\s+/)
+    .filter(Boolean)[0] ||
+    '';
+}
+
+function isSecurityStatusToken(
+  value
+) {
+  const token =
+    normalizeSymbol(
+      value
+    );
+
+  /*
+    PSX may append temporary two-letter X-statuses
+    such as XD or XB to the trading symbol.
+
+    IMPORTANT:
+    We never remove these just because they match this
+    pattern. Removal only happens if the proposed base
+    symbol is independently validated as a canonical
+    PSX symbol.
+  */
+
+  return /^X[A-Z]$/
+    .test(
+      token
+    );
+}
+
+function uniqueStrings(
+  values
+) {
+  return [
+    ...new Set(
+      values
+        .map(
+          value =>
+            String(
+              value || ''
+            )
+              .trim()
+              .toUpperCase()
+        )
+        .filter(Boolean)
+    )
+  ];
 }
 
 function normalizeTimestamp(
@@ -484,6 +561,10 @@ function dateKeyFromDate(
     );
 }
 
+/* =========================================================
+   HTML TABLE PARSING
+========================================================= */
+
 function parseHTMLTables(html) {
   const tables = [];
 
@@ -754,6 +835,10 @@ function normalizeRatioTable(
   );
 }
 
+/* =========================================================
+   ANNOUNCEMENTS
+========================================================= */
+
 function inferAnnouncementType(
   title
 ) {
@@ -932,6 +1017,1326 @@ function normalizeAnnouncementRows(
   );
 }
 
+/* =========================================================
+   HTTP
+========================================================= */
+
+async function fetchJSON(
+  url,
+  timeout = 20000,
+  headers = {}
+) {
+  const response =
+    await fetch(
+      url,
+      {
+        headers: {
+          Accept:
+            'application/json',
+
+          ...headers
+        },
+
+        signal:
+          AbortSignal.timeout(
+            timeout
+          )
+      }
+    );
+
+  if (
+    !response.ok
+  ) {
+    let message =
+      `Data service returned HTTP ${response.status}.`;
+
+    try {
+      const body =
+        await response.json();
+
+      if (
+        body?.error
+          ?.message
+      ) {
+        message =
+          body
+            .error
+            .message;
+      }
+
+      if (
+        body?.detail
+      ) {
+        message =
+          String(
+            body.detail
+          );
+      }
+    } catch {}
+
+    bad(
+      message,
+      response.status
+    );
+  }
+
+  return response.json();
+}
+
+async function fetchText(
+  url,
+  timeout = 20000,
+  headers = {}
+) {
+  const response =
+    await fetch(
+      url,
+      {
+        headers: {
+          Accept:
+            'text/html,application/xhtml+xml',
+
+          'User-Agent':
+            'Mozilla/5.0 NOMAD-Invest/0.6.1',
+
+          ...headers
+        },
+
+        signal:
+          AbortSignal.timeout(
+            timeout
+          )
+      }
+    );
+
+  if (
+    !response.ok
+  ) {
+    bad(
+      `Data service returned HTTP ${response.status}.`,
+      response.status
+    );
+  }
+
+  return response.text();
+}
+
+/* =========================================================
+   SYMBOL IDENTITY / NORMALIZATION
+========================================================= */
+
+function isOfficialCanonicalEntry(
+  metadata
+) {
+  return Boolean(
+    metadata &&
+    metadata.isCanonical ===
+      true
+  );
+}
+
+function resolveSymbolIdentity(
+  rawValue,
+  companyMap
+) {
+  const rawSymbol =
+    normalizeRawMarketSymbol(
+      rawValue
+    );
+
+  if (!rawSymbol) {
+    return {
+      rawSymbol: '',
+      tradingSymbol: '',
+      canonicalSymbol: '',
+      statusCodes: [],
+      normalized: false,
+      reason:
+        'empty'
+    };
+  }
+
+  const tokens =
+    rawSymbol
+      .split(/\s+/)
+      .filter(Boolean);
+
+  const primary =
+    tokens[0];
+
+  const standaloneStatuses =
+    tokens
+      .slice(1)
+      .filter(
+        isSecurityStatusToken
+      );
+
+  const exactMetadata =
+    companyMap?.get(
+      primary
+    );
+
+  /*
+    If the exact symbol is confirmed by an official
+    canonical source, it wins immediately.
+
+    This protects legitimate symbols that happen to end
+    with letters resembling status markers.
+  */
+
+  if (
+    isOfficialCanonicalEntry(
+      exactMetadata
+    )
+  ) {
+    return {
+      rawSymbol,
+
+      tradingSymbol:
+        primary,
+
+      canonicalSymbol:
+        primary,
+
+      statusCodes:
+        uniqueStrings(
+          standaloneStatuses
+        ),
+
+      normalized:
+        standaloneStatuses.length >
+        0,
+
+      reason:
+        standaloneStatuses.length
+          ? 'standalone-status'
+          : 'official-exact'
+    };
+  }
+
+  /*
+    Try to peel validated X-statuses from the END only.
+
+    Examples:
+      LUCKXD     -> LUCK + XD
+      BPLXD XB   -> BPL + XD + XB
+
+    A suffix is accepted only when the proposed base
+    exists as an officially confirmed canonical symbol.
+  */
+
+  let candidate =
+    primary;
+
+  const suffixStatuses =
+    [];
+
+  while (
+    candidate.length >
+    2
+  ) {
+    const suffix =
+      candidate.slice(
+        -2
+      );
+
+    if (
+      !isSecurityStatusToken(
+        suffix
+      )
+    ) {
+      break;
+    }
+
+    const proposedBase =
+      candidate.slice(
+        0,
+        -2
+      );
+
+    if (!proposedBase) {
+      break;
+    }
+
+    suffixStatuses.unshift(
+      suffix
+    );
+
+    const baseMetadata =
+      companyMap?.get(
+        proposedBase
+      );
+
+    if (
+      isOfficialCanonicalEntry(
+        baseMetadata
+      )
+    ) {
+      return {
+        rawSymbol,
+
+        tradingSymbol:
+          primary,
+
+        canonicalSymbol:
+          proposedBase,
+
+        statusCodes:
+          uniqueStrings([
+            ...suffixStatuses,
+            ...standaloneStatuses
+          ]),
+
+        normalized:
+          true,
+
+        reason:
+          'validated-status-suffix'
+      };
+    }
+
+    candidate =
+      proposedBase;
+  }
+
+  /*
+    If the exact ticker exists from a fallback provider
+    but no canonical base could be independently verified,
+    leave it untouched.
+  */
+
+  if (
+    exactMetadata
+  ) {
+    return {
+      rawSymbol,
+
+      tradingSymbol:
+        primary,
+
+      canonicalSymbol:
+        primary,
+
+      statusCodes:
+        uniqueStrings(
+          standaloneStatuses
+        ),
+
+      normalized:
+        standaloneStatuses.length >
+        0,
+
+      reason:
+        'fallback-exact'
+    };
+  }
+
+  return {
+    rawSymbol,
+
+    tradingSymbol:
+      primary,
+
+    canonicalSymbol:
+      primary,
+
+    statusCodes:
+      uniqueStrings(
+        standaloneStatuses
+      ),
+
+    normalized:
+      standaloneStatuses.length >
+      0,
+
+    reason:
+      'unresolved'
+  };
+}
+
+/* =========================================================
+   RAW SCREENER
+========================================================= */
+
+async function loadRawScreener() {
+  if (
+    rawScreenerCache &&
+    Date.now() -
+      rawScreenerCache.fetchedAt <
+      60000
+  ) {
+    return rawScreenerCache.data;
+  }
+
+  const result =
+    await fetchJSON(
+      `${PSX_API_BASE}/screener`
+    );
+
+  if (
+    !result ||
+    !Array.isArray(
+      result.data
+    )
+  ) {
+    bad(
+      'PSX screener returned an unexpected format.',
+      502
+    );
+  }
+
+  const data = {
+    rows:
+      result.data,
+
+    timestamp:
+      normalizeTimestamp(
+        result?.meta?.timestamp
+      )
+  };
+
+  rawScreenerCache = {
+    fetchedAt:
+      Date.now(),
+
+    data
+  };
+
+  return data;
+}
+
+/* =========================================================
+   COMPANY METADATA
+========================================================= */
+
+function mergeCompanyMetadata(
+  map,
+  symbol,
+  update
+) {
+  const key =
+    normalizeSymbol(
+      symbol
+    );
+
+  if (!key) {
+    return;
+  }
+
+  const current =
+    map.get(key) ||
+    {};
+
+  const currentName =
+    String(
+      current.name ||
+      ''
+    ).trim();
+
+  const incomingName =
+    String(
+      update.name ||
+      ''
+    ).trim();
+
+  const currentSector =
+    String(
+      current.sector ||
+      ''
+    ).trim();
+
+  const incomingSector =
+    String(
+      update.sector ||
+      ''
+    ).trim();
+
+  map.set(
+    key,
+    {
+      name:
+        currentName &&
+        currentName !==
+          key
+          ? currentName
+          : (
+              incomingName ||
+              currentName ||
+              key
+            ),
+
+      sector:
+        currentSector ||
+        incomingSector ||
+        '',
+
+      source:
+        current.source ||
+        update.source ||
+        '',
+
+      isCanonical:
+        Boolean(
+          current.isCanonical ||
+          update.isCanonical
+        )
+    }
+  );
+}
+
+async function loadOfficialSymbolsMap() {
+  const map =
+    new Map();
+
+  try {
+    const response =
+      await fetchJSON(
+        `${PSX_DPS_BASE}/symbols`,
+        30000,
+        {
+          'User-Agent':
+            'Mozilla/5.0 NOMAD-Invest/0.6.1',
+
+          Referer:
+            `${PSX_DPS_BASE}/`,
+
+          'X-Requested-With':
+            'XMLHttpRequest'
+        }
+      );
+
+    const rows =
+      Array.isArray(
+        response
+      )
+        ? response
+        : Array.isArray(
+            response?.data
+          )
+          ? response.data
+          : [];
+
+    for (
+      const row
+      of rows
+    ) {
+      const symbol =
+        normalizeSymbol(
+          row?.symbol ||
+          row?.SYMBOL ||
+          row?.ticker ||
+          row?.code
+        );
+
+      const name =
+        String(
+          row?.name ||
+          row?.companyName ||
+          row?.company_name ||
+          ''
+        ).trim();
+
+      const sector =
+        String(
+          row?.sectorName ||
+          row?.sector_name ||
+          row?.sector ||
+          ''
+        ).trim();
+
+      if (!symbol) {
+        continue;
+      }
+
+      mergeCompanyMetadata(
+        map,
+        symbol,
+        {
+          name:
+            name ||
+            symbol,
+
+          sector,
+
+          source:
+            'PSX symbols',
+
+          isCanonical:
+            true
+        }
+      );
+    }
+  } catch {}
+
+  return map;
+}
+
+async function enrichFromEligibleScrips(
+  map
+) {
+  try {
+    const html =
+      await fetchText(
+        PSX_ELIGIBLE_SCRIPS_URL,
+        30000
+      );
+
+    const tables =
+      parseHTMLTables(
+        html
+      );
+
+    for (
+      const table
+      of tables
+    ) {
+      for (
+        const row
+        of table.rows
+      ) {
+        if (
+          row.cells.length <
+          2
+        ) {
+          continue;
+        }
+
+        const symbol =
+          normalizeSymbol(
+            row.cells[0]
+          );
+
+        const name =
+          String(
+            row.cells[1] ||
+            ''
+          ).trim();
+
+        if (
+          !symbol ||
+          !name ||
+          symbol ===
+            'SYMBOL' ||
+          name.toUpperCase() ===
+            'NAME'
+        ) {
+          continue;
+        }
+
+        if (
+          !/^[A-Z0-9.-]{1,30}$/
+            .test(
+              symbol
+            )
+        ) {
+          continue;
+        }
+
+        mergeCompanyMetadata(
+          map,
+          symbol,
+          {
+            name,
+
+            source:
+              'PSX eligible scrips',
+
+            isCanonical:
+              true
+          }
+        );
+      }
+    }
+  } catch {}
+}
+
+async function enrichFromAllShareIndex(
+  map
+) {
+  /*
+    ALLSHR is useful because it provides a much broader
+    official symbol -> company-name mapping than the
+    earlier eligible-scrip source alone.
+
+    Some rows can themselves include temporary X-statuses.
+    We first preserve them as raw metadata. Canonicalization
+    is performed later against confirmed base symbols.
+  */
+
+  try {
+    const html =
+      await fetchText(
+        PSX_ALLSHR_URL,
+        30000
+      );
+
+    const tables =
+      parseHTMLTables(
+        html
+      );
+
+    for (
+      const table
+      of tables
+    ) {
+      for (
+        const row
+        of table.rows
+      ) {
+        if (
+          row.cells.length <
+          2
+        ) {
+          continue;
+        }
+
+        const rawSymbol =
+          normalizeRawMarketSymbol(
+            row.cells[0]
+          );
+
+        const name =
+          String(
+            row.cells[1] ||
+            ''
+          ).trim();
+
+        if (
+          !rawSymbol ||
+          !name ||
+          rawSymbol ===
+            'SYMBOL'
+        ) {
+          continue;
+        }
+
+        const primary =
+          primaryMarketToken(
+            rawSymbol
+          );
+
+        if (
+          !primary
+        ) {
+          continue;
+        }
+
+        /*
+          Do not declare these index-row tickers canonical
+          by themselves because they may include XD/XB.
+        */
+
+        mergeCompanyMetadata(
+          map,
+          primary,
+          {
+            name,
+
+            source:
+              'PSX ALLSHR',
+
+            isCanonical:
+              false
+          }
+        );
+      }
+    }
+  } catch {}
+}
+
+async function enrichFromPyPSX(
+  map
+) {
+  try {
+    const response =
+      await fetchJSON(
+        `${getPyPSXBase()}/symbols`,
+        20000,
+        pyPSXHeaders()
+      );
+
+    const rows =
+      Array.isArray(
+        response
+      )
+        ? response
+        : Array.isArray(
+            response?.data
+          )
+          ? response.data
+          : Array.isArray(
+              response?.symbols
+            )
+            ? response.symbols
+            : [];
+
+    for (
+      const row
+      of rows
+    ) {
+      if (
+        !row ||
+        typeof row ===
+          'string'
+      ) {
+        continue;
+      }
+
+      const symbol =
+        normalizeSymbol(
+          row.symbol ||
+          row.ticker ||
+          row.code
+        );
+
+      const name =
+        String(
+          row.name ||
+          row.company_name ||
+          row.companyName ||
+          ''
+        ).trim();
+
+      const sector =
+        String(
+          row.sector ||
+          ''
+        ).trim();
+
+      if (
+        !symbol
+      ) {
+        continue;
+      }
+
+      mergeCompanyMetadata(
+        map,
+        symbol,
+        {
+          name:
+            name ||
+            symbol,
+
+          sector,
+
+          source:
+            'pyPSX symbols',
+
+          isCanonical:
+            false
+        }
+      );
+    }
+  } catch {}
+}
+
+async function enrichFromFallbackMetadata(
+  map
+) {
+  try {
+    const response =
+      await fetchJSON(
+        `${PSX_META_BASE}/symbols?limit=5000`,
+        30000
+      );
+
+    const rows =
+      Array.isArray(
+        response
+      )
+        ? response
+        : Array.isArray(
+            response?.data
+          )
+          ? response.data
+          : [];
+
+    for (
+      const row
+      of rows
+    ) {
+      const symbol =
+        normalizeSymbol(
+          row.symbol
+        );
+
+      if (!symbol) {
+        continue;
+      }
+
+      mergeCompanyMetadata(
+        map,
+        symbol,
+        {
+          name:
+            String(
+              row.name ||
+              symbol
+            ).trim(),
+
+          sector:
+            String(
+              row.sector ||
+              ''
+            ).trim(),
+
+          source:
+            'psx-rest-api',
+
+          isCanonical:
+            false
+        }
+      );
+    }
+  } catch {}
+}
+
+function reconcileStatusMetadata(
+  map
+) {
+  /*
+    Second pass:
+
+    A current-market/status symbol may have a better
+    company name from ALLSHR or another source.
+
+    Example:
+      map may contain LUCK (canonical)
+      and LUCKXD (non-canonical with full name).
+
+    Transfer useful metadata to the canonical entry
+    without converting the status symbol into a canonical
+    company identity.
+  */
+
+  const entries =
+    [...map.entries()];
+
+  for (
+    const [
+      rawSymbol,
+      rawMetadata
+    ]
+    of entries
+  ) {
+    if (
+      rawMetadata?.isCanonical
+    ) {
+      continue;
+    }
+
+    const identity =
+      resolveSymbolIdentity(
+        rawSymbol,
+        map
+      );
+
+    if (
+      !identity.normalized ||
+      identity.canonicalSymbol ===
+        rawSymbol
+    ) {
+      continue;
+    }
+
+    const canonical =
+      map.get(
+        identity.canonicalSymbol
+      );
+
+    if (
+      !canonical
+    ) {
+      continue;
+    }
+
+    mergeCompanyMetadata(
+      map,
+      identity.canonicalSymbol,
+      {
+        name:
+          rawMetadata.name,
+
+        sector:
+          rawMetadata.sector,
+
+        source:
+          canonical.source ||
+          rawMetadata.source,
+
+        isCanonical:
+          true
+      }
+    );
+  }
+}
+
+async function loadCompanyMap() {
+  if (
+    companyCache &&
+    Date.now() -
+      companyCache.fetchedAt <
+      6 *
+      60 *
+      60 *
+      1000
+  ) {
+    return companyCache.data;
+  }
+
+  const map =
+    await loadOfficialSymbolsMap();
+
+  await enrichFromEligibleScrips(
+    map
+  );
+
+  await enrichFromAllShareIndex(
+    map
+  );
+
+  await enrichFromPyPSX(
+    map
+  );
+
+  await enrichFromFallbackMetadata(
+    map
+  );
+
+  reconcileStatusMetadata(
+    map
+  );
+
+  companyCache = {
+    fetchedAt:
+      Date.now(),
+
+    data:
+      map
+  };
+
+  return map;
+}
+
+/* =========================================================
+   SECTOR MAP
+========================================================= */
+
+async function loadSectorMap() {
+  if (
+    sectorCache &&
+    Date.now() -
+      sectorCache.fetchedAt <
+      3600000
+  ) {
+    return sectorCache.data;
+  }
+
+  const companyMap =
+    await loadCompanyMap();
+
+  const map =
+    new Map();
+
+  for (
+    const [
+      symbol,
+      metadata
+    ]
+    of companyMap.entries()
+  ) {
+    if (
+      metadata?.sector
+    ) {
+      const identity =
+        resolveSymbolIdentity(
+          symbol,
+          companyMap
+        );
+
+      map.set(
+        identity.canonicalSymbol,
+        metadata.sector
+      );
+    }
+  }
+
+  try {
+    const response =
+      await fetchJSON(
+        `${PSX_API_BASE}/sectors`
+      );
+
+    if (
+      Array.isArray(
+        response.data
+      )
+    ) {
+      for (
+        const sectorRow
+        of response.data
+      ) {
+        const sectorName =
+          String(
+            sectorRow.sector ||
+            sectorRow.name ||
+            sectorRow.sector_name ||
+            sectorRow.sectorName ||
+            ''
+          ).trim();
+
+        if (
+          !sectorName
+        ) {
+          continue;
+        }
+
+        try {
+          const stocksResponse =
+            await fetchJSON(
+              `${PSX_API_BASE}/sectors/${encodeURIComponent(
+                sectorName
+              )}/stocks`
+            );
+
+          if (
+            !Array.isArray(
+              stocksResponse.data
+            )
+          ) {
+            continue;
+          }
+
+          for (
+            const item
+            of stocksResponse.data
+          ) {
+            const rawSymbol =
+              typeof item ===
+                'string'
+                ? item
+                : (
+                    item.symbol ||
+                    item.SYMBOL ||
+                    item.ticker
+                  );
+
+            const identity =
+              resolveSymbolIdentity(
+                rawSymbol,
+                companyMap
+              );
+
+            if (
+              identity.canonicalSymbol &&
+              !map.has(
+                identity.canonicalSymbol
+              )
+            ) {
+              map.set(
+                identity.canonicalSymbol,
+                sectorName
+              );
+            }
+          }
+        } catch {}
+      }
+    }
+  } catch {}
+
+  sectorCache = {
+    fetchedAt:
+      Date.now(),
+
+    data:
+      map
+  };
+
+  return map;
+}
+
+/* =========================================================
+   SYMBOL CONTEXT
+========================================================= */
+
+function rowIdentityScore(
+  row,
+  identity
+) {
+  let score = 0;
+
+  const price =
+    safeNumber(
+      row?.price
+    );
+
+  if (
+    price !== null &&
+    price > 0
+  ) {
+    score += 100;
+  }
+
+  if (
+    identity.statusCodes
+      .length
+  ) {
+    score += 20;
+  }
+
+  if (
+    row?.listed_in
+  ) {
+    score += 5;
+  }
+
+  const volume =
+    safeNumber(
+      row?.volume_avg_30d
+    );
+
+  if (
+    volume !== null &&
+    volume > 0
+  ) {
+    score += 2;
+  }
+
+  return score;
+}
+
+async function resolveSymbolContext(
+  inputSymbol
+) {
+  const companyMap =
+    await loadCompanyMap();
+
+  const inputIdentity =
+    resolveSymbolIdentity(
+      inputSymbol,
+      companyMap
+    );
+
+  const canonicalSymbol =
+    inputIdentity
+      .canonicalSymbol;
+
+  if (
+    !canonicalSymbol
+  ) {
+    bad(
+      'Enter a PSX symbol.'
+    );
+  }
+
+  let currentIdentity =
+    inputIdentity;
+
+  try {
+    const screener =
+      await loadRawScreener();
+
+    let best = null;
+
+    for (
+      const row
+      of screener.rows
+    ) {
+      const identity =
+        resolveSymbolIdentity(
+          row.symbol,
+          companyMap
+        );
+
+      if (
+        identity.canonicalSymbol !==
+        canonicalSymbol
+      ) {
+        continue;
+      }
+
+      const score =
+        rowIdentityScore(
+          row,
+          identity
+        );
+
+      if (
+        !best ||
+        score >
+          best.score
+      ) {
+        best = {
+          identity,
+          score,
+          row
+        };
+      }
+    }
+
+    if (best) {
+      currentIdentity =
+        best.identity;
+    }
+  } catch {}
+
+  const metadata =
+    companyMap.get(
+      canonicalSymbol
+    ) ||
+    companyMap.get(
+      currentIdentity
+        .tradingSymbol
+    ) ||
+    null;
+
+  return {
+    inputSymbol:
+      normalizeRawMarketSymbol(
+        inputSymbol
+      ),
+
+    canonicalSymbol,
+
+    tradingSymbol:
+      currentIdentity
+        .tradingSymbol ||
+      canonicalSymbol,
+
+    rawMarketSymbol:
+      currentIdentity
+        .rawSymbol ||
+      canonicalSymbol,
+
+    statusCodes:
+      uniqueStrings([
+        ...inputIdentity
+          .statusCodes,
+
+        ...currentIdentity
+          .statusCodes
+      ]),
+
+    normalized:
+      inputIdentity.normalized ||
+      currentIdentity.normalized,
+
+    companyName:
+      metadata?.name ||
+      canonicalSymbol,
+
+    sector:
+      metadata?.sector ||
+      '',
+
+    metadata
+  };
+}
+
+/* =========================================================
+   PSX COMPANY PAGE
+========================================================= */
+
 function parseOfficialQuoteStats(
   lines
 ) {
@@ -1085,6 +2490,8 @@ function parsePSXCompanyPage(
   let sectorName =
     null;
 
+  const pageStatusCodes = [];
+
   if (
     companyName
   ) {
@@ -1110,7 +2517,7 @@ function parsePSXCompanyPage(
         index <
           Math.min(
             lines.length,
-            companyLineIndex + 9
+            companyLineIndex + 12
           );
 
         index++
@@ -1118,32 +2525,66 @@ function parsePSXCompanyPage(
         const candidate =
           String(
             lines[index] || ''
-          ).trim();
+          )
+            .trim()
+            .toUpperCase();
+
+        if (!candidate) {
+          continue;
+        }
 
         if (
-          candidate &&
-          candidate !==
-            symbol &&
-          candidate.length <=
-            120 &&
+          isSecurityStatusToken(
+            candidate
+          )
+        ) {
+          pageStatusCodes.push(
+            candidate
+          );
+
+          continue;
+        }
+
+        if (
           candidate ===
-            candidate.toUpperCase() &&
-          !/^(QUOTE|PROFILE|EQUITY|ANNOUNCEMENTS|FINANCIALS|RATIOS|PAYOUTS|REPORTS|REG|DFC|CSF|ODL)$/i
-            .test(
-              candidate
-            ) &&
-          !/^RS\.?/i
-            .test(
-              candidate
-            ) &&
-          !/^PKR\b/i
-            .test(
-              candidate
-            ) &&
-          !/^\d/
+            normalizeSymbol(
+              symbol
+            )
+        ) {
+          continue;
+        }
+
+        if (
+          /^(QUOTE|PROFILE|EQUITY|ANNOUNCEMENTS|FINANCIALS|RATIOS|PAYOUTS|REPORTS|REG|DFC|CSF|ODL)$/i
             .test(
               candidate
             )
+        ) {
+          continue;
+        }
+
+        if (
+          /^RS\.?/i
+            .test(
+              candidate
+            ) ||
+          /^PKR\b/i
+            .test(
+              candidate
+            ) ||
+          /^\d/
+            .test(
+              candidate
+            )
+        ) {
+          continue;
+        }
+
+        if (
+          candidate.length <=
+          120 &&
+          candidate ===
+            candidate.toUpperCase()
         ) {
           sectorName =
             candidate;
@@ -1281,6 +2722,11 @@ function parsePSXCompanyPage(
 
     sectorName,
 
+    statusCodes:
+      uniqueStrings(
+        pageStatusCodes
+      ),
+
     sourceUrl:
       `${PSX_DPS_BASE}/company/${encodeURIComponent(
         symbol
@@ -1326,176 +2772,6 @@ function parsePSXCompanyPage(
         30
       )
   };
-}
-
-function rangeStartDate(
-  range
-) {
-  const now =
-    new Date();
-
-  const date =
-    new Date(
-      Date.UTC(
-        now.getUTCFullYear(),
-        now.getUTCMonth(),
-        now.getUTCDate()
-      )
-    );
-
-  switch (
-    String(
-      range || ''
-    ).toUpperCase()
-  ) {
-    case '1M':
-      date.setUTCMonth(
-        date.getUTCMonth() -
-          1
-      );
-      break;
-
-    case '6M':
-      date.setUTCMonth(
-        date.getUTCMonth() -
-          6
-      );
-      break;
-
-    case '1Y':
-      date.setUTCFullYear(
-        date.getUTCFullYear() -
-          1
-      );
-      break;
-
-    case '2Y':
-      date.setUTCFullYear(
-        date.getUTCFullYear() -
-          2
-      );
-      break;
-
-    case 'ALL':
-      return null;
-
-    default:
-      date.setUTCFullYear(
-        date.getUTCFullYear() -
-          1
-      );
-  }
-
-  return date
-    .toISOString()
-    .slice(
-      0,
-      10
-    );
-}
-
-/* =========================================================
-   HTTP
-========================================================= */
-
-async function fetchJSON(
-  url,
-  timeout = 20000,
-  headers = {}
-) {
-  const response =
-    await fetch(
-      url,
-      {
-        headers: {
-          Accept:
-            'application/json',
-
-          ...headers
-        },
-
-        signal:
-          AbortSignal.timeout(
-            timeout
-          )
-      }
-    );
-
-  if (
-    !response.ok
-  ) {
-    let message =
-      `Data service returned HTTP ${response.status}.`;
-
-    try {
-      const body =
-        await response.json();
-
-      if (
-        body?.error
-          ?.message
-      ) {
-        message =
-          body
-            .error
-            .message;
-      }
-
-      if (
-        body?.detail
-      ) {
-        message =
-          String(
-            body.detail
-          );
-      }
-    } catch {}
-
-    bad(
-      message,
-      response.status
-    );
-  }
-
-  return response.json();
-}
-
-async function fetchText(
-  url,
-  timeout = 20000,
-  headers = {}
-) {
-  const response =
-    await fetch(
-      url,
-      {
-        headers: {
-          Accept:
-            'text/html,application/xhtml+xml',
-
-          'User-Agent':
-            'Mozilla/5.0 NOMAD-Invest/0.6.0',
-
-          ...headers
-        },
-
-        signal:
-          AbortSignal.timeout(
-            timeout
-          )
-      }
-    );
-
-  if (
-    !response.ok
-  ) {
-    bad(
-      `Data service returned HTTP ${response.status}.`,
-      response.status
-    );
-  }
-
-  return response.text();
 }
 
 async function getPSXCompanySnapshot(
@@ -1851,35 +3127,17 @@ async function getPyPSXMarketStatus() {
   }
 }
 
-async function getPyPSXIntraday(
-  stockSymbol
+async function fetchPyPSXIntradaySymbol(
+  symbol
 ) {
-  const symbol =
-    normalizeSymbol(
-      stockSymbol
+  const raw =
+    await fetchJSON(
+      `${getPyPSXBase()}/intraday/${encodeURIComponent(
+        symbol
+      )}`,
+      20000,
+      pyPSXHeaders()
     );
-
-  if (!symbol) {
-    bad(
-      'Enter a PSX symbol.'
-    );
-  }
-
-  const [
-    raw,
-    marketStatus
-  ] =
-    await Promise.all([
-      fetchJSON(
-        `${getPyPSXBase()}/intraday/${encodeURIComponent(
-          symbol
-        )}`,
-        20000,
-        pyPSXHeaders()
-      ),
-
-      getPyPSXMarketStatus()
-    ]);
 
   const rows =
     extractPyPSXRows(
@@ -1909,11 +3167,80 @@ async function getPyPSXIntraday(
           )
       );
 
+  return rows;
+}
+
+async function getPyPSXIntraday(
+  symbolCandidates,
+  canonicalSymbol = null
+) {
+  const candidates =
+    uniqueStrings(
+      Array.isArray(
+        symbolCandidates
+      )
+        ? symbolCandidates
+        : [
+            symbolCandidates
+          ]
+    );
+
+  if (
+    !candidates.length
+  ) {
+    bad(
+      'Enter a PSX symbol.'
+    );
+  }
+
+  const marketStatusPromise =
+    getPyPSXMarketStatus();
+
+  let rows = [];
+  let providerSymbol = null;
+  let lastError = null;
+
+  for (
+    const candidate
+    of candidates
+  ) {
+    try {
+      const candidateRows =
+        await fetchPyPSXIntradaySymbol(
+          candidate
+        );
+
+      if (
+        candidateRows.length
+      ) {
+        rows =
+          candidateRows;
+
+        providerSymbol =
+          candidate;
+
+        break;
+      }
+    } catch (error) {
+      lastError =
+        error;
+    }
+  }
+
+  const marketStatus =
+    await marketStatusPromise;
+
   if (
     !rows.length
   ) {
+    if (
+      lastError
+    ) {
+      throw lastError;
+    }
+
     bad(
-      `pyPSX returned no intraday price data for ${symbol}.`,
+      `pyPSX returned no intraday price data for ${canonicalSymbol || candidates[0]}.`,
       502
     );
   }
@@ -2066,7 +3393,11 @@ async function getPyPSXIntraday(
       );
 
   return {
-    symbol,
+    symbol:
+      canonicalSymbol ||
+      providerSymbol,
+
+    providerSymbol,
 
     provider:
       'pyPSX',
@@ -2139,508 +3470,20 @@ async function getPyPSXIntraday(
   };
 }
 
-/* =========================================================
-   COMPANY / SECTOR METADATA
-========================================================= */
-
-async function loadOfficialSymbolsMap() {
-  const map =
-    new Map();
-
-  try {
-    const response =
-      await fetchJSON(
-        `${PSX_DPS_BASE}/symbols`,
-        30000,
-        {
-          'User-Agent':
-            'Mozilla/5.0 NOMAD-Invest/0.6.0',
-
-          Referer:
-            `${PSX_DPS_BASE}/`,
-
-          'X-Requested-With':
-            'XMLHttpRequest'
-        }
-      );
-
-    const rows =
-      Array.isArray(
-        response
-      )
-        ? response
-        : Array.isArray(
-            response?.data
-          )
-          ? response.data
-          : [];
-
-    for (
-      const row
-      of rows
-    ) {
-      const symbol =
-        normalizeSymbol(
-          row?.symbol ||
-          row?.SYMBOL ||
-          row?.ticker ||
-          row?.code
-        );
-
-      const name =
-        String(
-          row?.name ||
-          row?.companyName ||
-          row?.company_name ||
-          ''
-        ).trim();
-
-      const sector =
-        String(
-          row?.sectorName ||
-          row?.sector_name ||
-          row?.sector ||
-          ''
-        ).trim();
-
-      if (!symbol) {
-        continue;
-      }
-
-      map.set(
-        symbol,
-        {
-          name:
-            name ||
-            symbol,
-
-          sector,
-
-          source:
-            'PSX symbols'
-        }
-      );
-    }
-  } catch {}
-
-  return map;
-}
-
-async function loadCompanyMap() {
-  if (
-    companyCache &&
-    Date.now() -
-      companyCache.fetchedAt <
-      6 *
-      60 *
-      60 *
-      1000
-  ) {
-    return companyCache.data;
-  }
-
-  const map =
-    await loadOfficialSymbolsMap();
-
-  try {
-    const html =
-      await fetchText(
-        PSX_ELIGIBLE_SCRIPS_URL,
-        30000
-      );
-
-    const rowRegex =
-      /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
-
-    let rowMatch;
-
-    while (
-      (
-        rowMatch =
-          rowRegex.exec(
-            html
-          )
-      ) !== null
-    ) {
-      const cells = [];
-
-      const cellRegex =
-        /<td[^>]*>([\s\S]*?)<\/td>/gi;
-
-      let cellMatch;
-
-      while (
-        (
-          cellMatch =
-            cellRegex.exec(
-              rowMatch[1]
-            )
-        ) !== null
-      ) {
-        cells.push(
-          cleanHtmlCell(
-            cellMatch[1]
-          )
-        );
-      }
-
-      if (
-        cells.length < 2
-      ) {
-        continue;
-      }
-
-      const symbol =
-        normalizeSymbol(
-          cells[0]
-        );
-
-      const name =
-        String(
-          cells[1] ||
-          ''
-        ).trim();
-
-      if (
-        !symbol ||
-        !name ||
-        symbol ===
-          'SYMBOL' ||
-        name.toLowerCase() ===
-          'name'
-      ) {
-        continue;
-      }
-
-      if (
-        /^[A-Z0-9.-]{1,20}$/
-          .test(
-            symbol
-          )
-      ) {
-        const existing =
-          map.get(
-            symbol
-          );
-
-        map.set(
-          symbol,
-          {
-            name:
-              existing?.name &&
-              existing.name !==
-                symbol
-                ? existing.name
-                : name,
-
-            sector:
-              existing?.sector ||
-              '',
-
-            source:
-              existing?.source ||
-              'PSX eligible scrips'
-          }
-        );
-      }
-    }
-  } catch {}
-
-  try {
-    const response =
-      await fetchJSON(
-        `${getPyPSXBase()}/symbols`,
-        20000,
-        pyPSXHeaders()
-      );
-
-    const rows =
-      Array.isArray(
-        response
-      )
-        ? response
-        : Array.isArray(
-            response?.data
-          )
-          ? response.data
-          : Array.isArray(
-              response?.symbols
-            )
-            ? response.symbols
-            : [];
-
-    for (
-      const row
-      of rows
-    ) {
-      if (
-        !row ||
-        typeof row ===
-          'string'
-      ) {
-        continue;
-      }
-
-      const symbol =
-        normalizeSymbol(
-          row.symbol ||
-          row.ticker ||
-          row.code
-        );
-
-      const name =
-        String(
-          row.name ||
-          row.company_name ||
-          row.companyName ||
-          ''
-        ).trim();
-
-      if (
-        !symbol ||
-        !name
-      ) {
-        continue;
-      }
-
-      const existing =
-        map.get(
-          symbol
-        );
-
-      map.set(
-        symbol,
-        {
-          name:
-            existing?.name &&
-            existing.name !==
-              symbol
-              ? existing.name
-              : name,
-
-          sector:
-            existing?.sector ||
-            String(
-              row.sector ||
-              ''
-            ).trim(),
-
-          source:
-            existing?.source ||
-            'pyPSX symbols'
-        }
-      );
-    }
-  } catch {}
-
-  try {
-    const response =
-      await fetchJSON(
-        `${PSX_META_BASE}/symbols?limit=5000`,
-        30000
-      );
-
-    const rows =
-      Array.isArray(
-        response
-      )
-        ? response
-        : Array.isArray(
-            response?.data
-          )
-          ? response.data
-          : [];
-
-    for (
-      const row
-      of rows
-    ) {
-      const symbol =
-        normalizeSymbol(
-          row.symbol
-        );
-
-      if (!symbol) {
-        continue;
-      }
-
-      const existing =
-        map.get(
-          symbol
-        );
-
-      const fallbackName =
-        String(
-          row.name ||
-          symbol
-        ).trim();
-
-      const fallbackSector =
-        String(
-          row.sector ||
-          ''
-        ).trim();
-
-      map.set(
-        symbol,
-        {
-          name:
-            existing?.name &&
-            existing.name !==
-              symbol
-              ? existing.name
-              : fallbackName,
-
-          sector:
-            existing?.sector ||
-            fallbackSector,
-
-          source:
-            existing?.source ||
-            'psx-rest-api'
-        }
-      );
-    }
-  } catch {}
-
-  companyCache = {
-    fetchedAt:
-      Date.now(),
-
-    data:
-      map
-  };
-
-  return map;
-}
-
-async function loadSectorMap() {
-  if (
-    sectorCache &&
-    Date.now() -
-      sectorCache.fetchedAt <
-      3600000
-  ) {
-    return sectorCache.data;
-  }
-
-  const map =
-    new Map();
-
-  try {
-    const companyMap =
-      await loadCompanyMap();
-
-    for (
-      const [
-        symbol,
-        metadata
-      ]
-      of companyMap.entries()
-    ) {
-      if (
-        metadata?.sector
-      ) {
-        map.set(
-          symbol,
-          metadata.sector
-        );
-      }
-    }
-  } catch {}
-
-  try {
-    const response =
-      await fetchJSON(
-        `${PSX_API_BASE}/sectors`
-      );
-
-    if (
-      Array.isArray(
-        response.data
-      )
-    ) {
-      for (
-        const sectorRow
-        of response.data
-      ) {
-        const sectorName =
-          String(
-            sectorRow.sector ||
-            sectorRow.name ||
-            sectorRow.sector_name ||
-            sectorRow.sectorName ||
-            ''
-          ).trim();
-
-        if (
-          !sectorName
-        ) {
-          continue;
-        }
-
-        try {
-          const stocksResponse =
-            await fetchJSON(
-              `${PSX_API_BASE}/sectors/${encodeURIComponent(
-                sectorName
-              )}/stocks`
-            );
-
-          if (
-            !Array.isArray(
-              stocksResponse.data
-            )
-          ) {
-            continue;
-          }
-
-          for (
-            const item
-            of stocksResponse.data
-          ) {
-            const symbol =
-              typeof item ===
-                'string'
-                ? normalizeSymbol(
-                    item
-                  )
-                : normalizeSymbol(
-                    item.symbol ||
-                    item.SYMBOL ||
-                    item.ticker
-                  );
-
-            if (
-              symbol &&
-              !map.has(
-                symbol
-              )
-            ) {
-              map.set(
-                symbol,
-                sectorName
-              );
-            }
-          }
-        } catch {}
-      }
-    }
-  } catch {}
-
-  sectorCache = {
-    fetchedAt:
-      Date.now(),
-
-    data:
-      map
-  };
-
-  return map;
+async function getLiveForContext(
+  context
+) {
+  return getPyPSXIntraday(
+    [
+      context.tradingSymbol,
+      context.canonicalSymbol
+    ],
+    context.canonicalSymbol
+  );
 }
 
 /* =========================================================
-   MARKET
+   SCREENER NORMALIZATION
 ========================================================= */
 
 function normalizeScreenerRow(
@@ -2649,10 +3492,14 @@ function normalizeScreenerRow(
   companyMap,
   timestamp
 ) {
-  const symbol =
-    normalizeSymbol(
-      row.symbol
+  const identity =
+    resolveSymbolIdentity(
+      row.symbol,
+      companyMap
     );
+
+  const symbol =
+    identity.canonicalSymbol;
 
   if (!symbol) {
     return null;
@@ -2673,6 +3520,9 @@ function normalizeScreenerRow(
   const company =
     companyMap.get(
       symbol
+    ) ||
+    companyMap.get(
+      identity.tradingSymbol
     );
 
   const pe =
@@ -2683,9 +3533,27 @@ function normalizeScreenerRow(
   return {
     symbol,
 
-    companyName:
-      company?.name ||
+    canonicalSymbol:
       symbol,
+
+    tradingSymbol:
+      identity.tradingSymbol,
+
+    rawSymbol:
+      identity.rawSymbol,
+
+    statusCodes:
+      identity.statusCodes,
+
+    normalizedSymbol:
+      identity.normalized,
+
+    companyName:
+      company?.name &&
+      company.name !==
+        identity.tradingSymbol
+        ? company.name
+        : symbol,
 
     sector:
       company?.sector ||
@@ -2750,6 +3618,80 @@ function normalizeScreenerRow(
   };
 }
 
+function chooseBetterMarketRow(
+  a,
+  b
+) {
+  if (!a) {
+    return b;
+  }
+
+  if (!b) {
+    return a;
+  }
+
+  let scoreA = 0;
+  let scoreB = 0;
+
+  if (
+    a.price !== null &&
+    a.price > 0
+  ) {
+    scoreA += 100;
+  }
+
+  if (
+    b.price !== null &&
+    b.price > 0
+  ) {
+    scoreB += 100;
+  }
+
+  if (
+    a.statusCodes?.length
+  ) {
+    scoreA += 20;
+  }
+
+  if (
+    b.statusCodes?.length
+  ) {
+    scoreB += 20;
+  }
+
+  if (
+    a.listedIn
+  ) {
+    scoreA += 5;
+  }
+
+  if (
+    b.listedIn
+  ) {
+    scoreB += 5;
+  }
+
+  if (
+    (
+      a.averageVolume30d ||
+      0
+    ) >
+    (
+      b.averageVolume30d ||
+      0
+    )
+  ) {
+    scoreA += 1;
+  } else {
+    scoreB += 1;
+  }
+
+  return scoreB >
+    scoreA
+      ? b
+      : a;
+}
+
 async function loadPSXMarket() {
   if (
     marketCache &&
@@ -2766,44 +3708,56 @@ async function loadPSXMarket() {
     companyMap
   ] =
     await Promise.all([
-      fetchJSON(
-        `${PSX_API_BASE}/screener`
-      ),
-
+      loadRawScreener(),
       loadSectorMap(),
-
       loadCompanyMap()
     ]);
 
-  if (
-    !screener ||
-    !Array.isArray(
-      screener.data
-    )
-  ) {
-    bad(
-      'PSX screener returned an unexpected format.',
-      502
-    );
-  }
-
-  const timestamp =
-    normalizeTimestamp(
-      screener?.meta?.timestamp
-    );
-
-  const stocks =
-    screener.data
+  const normalizedRows =
+    screener.rows
       .map(
         row =>
           normalizeScreenerRow(
             row,
             sectorMap,
             companyMap,
-            timestamp
+            screener.timestamp
           )
       )
       .filter(Boolean);
+
+  const canonicalRows =
+    new Map();
+
+  for (
+    const row
+    of normalizedRows
+  ) {
+    const previous =
+      canonicalRows.get(
+        row.canonicalSymbol
+      );
+
+    canonicalRows.set(
+      row.canonicalSymbol,
+      chooseBetterMarketRow(
+        previous,
+        row
+      )
+    );
+  }
+
+  const stocks =
+    [...canonicalRows.values()]
+      .sort(
+        (
+          a,
+          b
+        ) =>
+          a.symbol.localeCompare(
+            b.symbol
+          )
+      );
 
   if (
     !stocks.length
@@ -2819,7 +3773,9 @@ async function loadPSXMarket() {
       stock =>
         stock.companyName &&
         stock.companyName !==
-          stock.symbol
+          stock.symbol &&
+        stock.companyName !==
+          stock.tradingSymbol
     ).length;
 
   const sectorsMatched =
@@ -2830,6 +3786,12 @@ async function loadPSXMarket() {
           'Unknown'
     ).length;
 
+  const normalizedStatusRows =
+    stocks.filter(
+      stock =>
+        stock.normalizedSymbol
+    ).length;
+
   const result = {
     sourceName:
       'psxdata-api',
@@ -2838,8 +3800,13 @@ async function loadPSXMarket() {
 
     sectorsMatched,
 
+    normalizedStatusRows,
+
+    rawRows:
+      normalizedRows.length,
+
     asOf:
-      timestamp,
+      screener.timestamp,
 
     totalStocks:
       stocks.length,
@@ -2856,6 +3823,62 @@ async function loadPSXMarket() {
   };
 
   return result;
+}
+
+/* =========================================================
+   QUOTE FALLBACK
+========================================================= */
+
+async function fetchQuoteForSymbols(
+  symbols
+) {
+  const candidates =
+    uniqueStrings(
+      symbols
+    );
+
+  let lastError =
+    null;
+
+  for (
+    const symbol
+    of candidates
+  ) {
+    try {
+      const result =
+        await fetchJSON(
+          `${PSX_API_BASE}/stocks/${encodeURIComponent(
+            symbol
+          )}/quote`
+        );
+
+      if (
+        result &&
+        result.data
+      ) {
+        return {
+          ...result,
+
+          providerSymbol:
+            symbol
+        };
+      }
+    } catch (error) {
+      lastError =
+        error;
+    }
+  }
+
+  if (
+    lastError
+  ) {
+    throw lastError;
+  }
+
+  bad(
+    'Quote unavailable.',
+    502
+  );
 }
 
 /* =========================================================
@@ -2966,6 +3989,104 @@ function normalizeHistoricalRows(
   };
 }
 
+function rangeStartDate(
+  range
+) {
+  const now =
+    new Date();
+
+  const date =
+    new Date(
+      Date.UTC(
+        now.getUTCFullYear(),
+        now.getUTCMonth(),
+        now.getUTCDate()
+      )
+    );
+
+  switch (
+    String(
+      range || ''
+    ).toUpperCase()
+  ) {
+    case '1M':
+      date.setUTCMonth(
+        date.getUTCMonth() -
+          1
+      );
+      break;
+
+    case '6M':
+      date.setUTCMonth(
+        date.getUTCMonth() -
+          6
+      );
+      break;
+
+    case '1Y':
+      date.setUTCFullYear(
+        date.getUTCFullYear() -
+          1
+      );
+      break;
+
+    case '2Y':
+      date.setUTCFullYear(
+        date.getUTCFullYear() -
+          2
+      );
+      break;
+
+    case 'ALL':
+      return null;
+
+    default:
+      date.setUTCFullYear(
+        date.getUTCFullYear() -
+          1
+      );
+  }
+
+  return date
+    .toISOString()
+    .slice(
+      0,
+      10
+    );
+}
+
+async function fetchCanonicalHistory(
+  canonicalSymbol,
+  start,
+  end
+) {
+  const params =
+    new URLSearchParams();
+
+  if (start) {
+    params.set(
+      'start',
+      start
+    );
+  }
+
+  if (end) {
+    params.set(
+      'end',
+      end
+    );
+  }
+
+  const query =
+    params.toString();
+
+  return fetchJSON(
+    `${PSX_API_BASE}/stocks/${encodeURIComponent(
+      canonicalSymbol
+    )}/historical${query ? '?' + query : ''}`
+  );
+}
+
 /* =========================================================
    QUOTE / OVERVIEW
 ========================================================= */
@@ -2973,16 +4094,13 @@ function normalizeHistoricalRows(
 async function getQuote(
   stockSymbol
 ) {
-  const symbol =
-    normalizeSymbol(
+  const context =
+    await resolveSymbolContext(
       stockSymbol
     );
 
-  if (!symbol) {
-    bad(
-      'Enter a PSX symbol.'
-    );
-  }
+  const symbol =
+    context.canonicalSymbol;
 
   const now =
     new Date();
@@ -3010,44 +4128,31 @@ async function getQuote(
         10
       );
 
-  const historyURL =
-    `${PSX_API_BASE}/stocks/${encodeURIComponent(
-      symbol
-    )}/historical` +
-    `?start=${encodeURIComponent(
-      historyStartDate
-    )}` +
-    `&end=${encodeURIComponent(
-      historyEndDate
-    )}`;
-
   const [
     result,
-    companyMap,
     sectorMap,
     liveResult,
     historyResult,
     companySnapshot
   ] =
     await Promise.all([
-      fetchJSON(
-        `${PSX_API_BASE}/stocks/${encodeURIComponent(
-          symbol
-        )}/quote`
-      ),
-
-      loadCompanyMap(),
+      fetchQuoteForSymbols([
+        context.tradingSymbol,
+        symbol
+      ]),
 
       loadSectorMap(),
 
-      getPyPSXIntraday(
-        symbol
+      getLiveForContext(
+        context
       ).catch(
         () => null
       ),
 
-      fetchJSON(
-        historyURL
+      fetchCanonicalHistory(
+        symbol,
+        historyStartDate,
+        historyEndDate
       ).catch(
         () => null
       ),
@@ -3058,11 +4163,6 @@ async function getQuote(
         () => null
       )
     ]);
-
-  const company =
-    companyMap.get(
-      symbol
-    );
 
   const data =
     result.data ||
@@ -3391,12 +4491,12 @@ async function getQuote(
 
   const resolvedName =
     companySnapshot?.companyName ||
-    company?.name ||
+    context.companyName ||
     symbol;
 
   const resolvedSector =
     companySnapshot?.sectorName ||
-    company?.sector ||
+    context.sector ||
     sectorMap.get(
       symbol
     ) ||
@@ -3449,12 +4549,37 @@ async function getQuote(
       officialQuote.peRatio
     );
 
+  const combinedStatuses =
+    uniqueStrings([
+      ...context.statusCodes,
+      ...(
+        companySnapshot
+          ?.statusCodes ||
+        []
+      )
+    ]);
+
   return {
     symbol,
 
-    company: {
-      ...(company || {}),
+    identity: {
+      canonicalSymbol:
+        symbol,
 
+      tradingSymbol:
+        context.tradingSymbol,
+
+      rawMarketSymbol:
+        context.rawMarketSymbol,
+
+      statusCodes:
+        combinedStatuses,
+
+      normalized:
+        context.normalized
+    },
+
+    company: {
       name:
         resolvedName,
 
@@ -3468,6 +4593,10 @@ async function getQuote(
       result.meta ||
       null,
 
+    quoteProviderSymbol:
+      result.providerSymbol ||
+      null,
+
     live:
       liveResult,
 
@@ -3479,6 +4608,9 @@ async function getQuote(
 
             quote:
               companySnapshot.quote,
+
+            statusCodes:
+              companySnapshot.statusCodes,
 
             sourceUrl:
               companySnapshot.sourceUrl,
@@ -3598,10 +4730,13 @@ async function getHistory(
   stockSymbol,
   range = '1Y'
 ) {
-  const symbol =
-    normalizeSymbol(
+  const context =
+    await resolveSymbolContext(
       stockSymbol
     );
+
+  const symbol =
+    context.canonicalSymbol;
 
   const normalizedRange =
     [
@@ -3620,15 +4755,6 @@ async function getHistory(
         ).toUpperCase()
       : '1Y';
 
-  if (!symbol) {
-    bad(
-      'Enter a PSX symbol.'
-    );
-  }
-
-  const params =
-    new URLSearchParams();
-
   const start =
     rangeStartDate(
       normalizedRange
@@ -3642,33 +4768,25 @@ async function getHistory(
         10
       );
 
-  if (start) {
-    params.set(
-      'start',
-      start
-    );
-  }
-
-  params.set(
-    'end',
-    end
-  );
-
   const [
     result,
-    companyMap,
-    sectorMap
+    sectorMap,
+    snapshot
   ] =
     await Promise.all([
-      fetchJSON(
-        `${PSX_API_BASE}/stocks/${encodeURIComponent(
-          symbol
-        )}/historical?${params.toString()}`
+      fetchCanonicalHistory(
+        symbol,
+        start,
+        end
       ),
 
-      loadCompanyMap(),
+      loadSectorMap(),
 
-      loadSectorMap()
+      getPSXCompanySnapshot(
+        symbol
+      ).catch(
+        () => null
+      )
     ]);
 
   const normalized =
@@ -3790,27 +4908,46 @@ async function getHistory(
     };
   }
 
-  const company =
-    companyMap.get(
-      symbol
-    );
-
   return {
     symbol,
 
-    company:
-      company
-        ? {
-            ...company,
+    identity: {
+      canonicalSymbol:
+        symbol,
 
-            sector:
-              company.sector ||
-              sectorMap.get(
-                symbol
-              ) ||
-              ''
-          }
-        : null,
+      tradingSymbol:
+        context.tradingSymbol,
+
+      rawMarketSymbol:
+        context.rawMarketSymbol,
+
+      statusCodes:
+        uniqueStrings([
+          ...context.statusCodes,
+          ...(
+            snapshot?.statusCodes ||
+            []
+          )
+        ]),
+
+      normalized:
+        context.normalized
+    },
+
+    company: {
+      name:
+        snapshot?.companyName ||
+        context.companyName ||
+        symbol,
+
+      sector:
+        snapshot?.sectorName ||
+        context.sector ||
+        sectorMap.get(
+          symbol
+        ) ||
+        ''
+    },
 
     range:
       normalizedRange,
@@ -3835,26 +4972,20 @@ async function getHistory(
 async function getFundamentals(
   stockSymbol
 ) {
-  const symbol =
-    normalizeSymbol(
+  const context =
+    await resolveSymbolContext(
       stockSymbol
     );
 
-  if (!symbol) {
-    bad(
-      'Enter a PSX symbol.'
-    );
-  }
+  const symbol =
+    context.canonicalSymbol;
 
   const [
-    companyMap,
     sectorMap,
     snapshot,
     quote
   ] =
     await Promise.all([
-      loadCompanyMap(),
-
       loadSectorMap(),
 
       getPSXCompanySnapshot(
@@ -3863,19 +4994,13 @@ async function getFundamentals(
         () => null
       ),
 
-      fetchJSON(
-        `${PSX_API_BASE}/stocks/${encodeURIComponent(
-          symbol
-        )}/quote`
-      ).catch(
+      fetchQuoteForSymbols([
+        context.tradingSymbol,
+        symbol
+      ]).catch(
         () => null
       )
     ]);
-
-  const company =
-    companyMap.get(
-      symbol
-    );
 
   const quoteData =
     quote?.data ||
@@ -3901,17 +5026,38 @@ async function getFundamentals(
   return {
     symbol,
 
-    company: {
-      ...(company || {}),
+    identity: {
+      canonicalSymbol:
+        symbol,
 
+      tradingSymbol:
+        context.tradingSymbol,
+
+      rawMarketSymbol:
+        context.rawMarketSymbol,
+
+      statusCodes:
+        uniqueStrings([
+          ...context.statusCodes,
+          ...(
+            snapshot?.statusCodes ||
+            []
+          )
+        ]),
+
+      normalized:
+        context.normalized
+    },
+
+    company: {
       name:
         snapshot?.companyName ||
-        company?.name ||
+        context.companyName ||
         symbol,
 
       sector:
         snapshot?.sectorName ||
-        company?.sector ||
+        context.sector ||
         sectorMap.get(
           symbol
         ) ||
@@ -4002,25 +5148,19 @@ async function getFundamentals(
 async function getEvents(
   stockSymbol
 ) {
-  const symbol =
-    normalizeSymbol(
+  const context =
+    await resolveSymbolContext(
       stockSymbol
     );
 
-  if (!symbol) {
-    bad(
-      'Enter a PSX symbol.'
-    );
-  }
+  const symbol =
+    context.canonicalSymbol;
 
   const [
-    companyMap,
     sectorMap,
     snapshot
   ] =
     await Promise.all([
-      loadCompanyMap(),
-
       loadSectorMap(),
 
       getPSXCompanySnapshot(
@@ -4030,25 +5170,41 @@ async function getEvents(
       )
     ]);
 
-  const company =
-    companyMap.get(
-      symbol
-    );
-
   return {
     symbol,
 
-    company: {
-      ...(company || {}),
+    identity: {
+      canonicalSymbol:
+        symbol,
 
+      tradingSymbol:
+        context.tradingSymbol,
+
+      rawMarketSymbol:
+        context.rawMarketSymbol,
+
+      statusCodes:
+        uniqueStrings([
+          ...context.statusCodes,
+          ...(
+            snapshot?.statusCodes ||
+            []
+          )
+        ]),
+
+      normalized:
+        context.normalized
+    },
+
+    company: {
       name:
         snapshot?.companyName ||
-        company?.name ||
+        context.companyName ||
         symbol,
 
       sector:
         snapshot?.sectorName ||
-        company?.sector ||
+        context.sector ||
         sectorMap.get(
           symbol
         ) ||
@@ -4076,7 +5232,7 @@ async function getEvents(
 }
 
 /* =========================================================
-   TECHNICAL ANALYSIS
+   TECHNICAL ANALYSIS HELPERS
 ========================================================= */
 
 function mean(values) {
@@ -4759,19 +5915,20 @@ function getVolumeLabel(
   return 'Normal participation';
 }
 
+/* =========================================================
+   TECHNICAL ANALYSIS
+========================================================= */
+
 async function getTechnicalAnalysis(
   stockSymbol
 ) {
-  const symbol =
-    normalizeSymbol(
+  const context =
+    await resolveSymbolContext(
       stockSymbol
     );
 
-  if (!symbol) {
-    bad(
-      'Enter a PSX symbol.'
-    );
-  }
+  const symbol =
+    context.canonicalSymbol;
 
   const now =
     new Date();
@@ -4802,19 +5959,23 @@ async function getTechnicalAnalysis(
 
   const [
     historyResult,
-    companyMap,
-    sectorMap
+    sectorMap,
+    snapshot
   ] =
     await Promise.all([
-      fetchJSON(
-        `${PSX_API_BASE}/stocks/${encodeURIComponent(
-          symbol
-        )}/historical?start=${start}&end=${end}`
+      fetchCanonicalHistory(
+        symbol,
+        start,
+        end
       ),
 
-      loadCompanyMap(),
+      loadSectorMap(),
 
-      loadSectorMap()
+      getPSXCompanySnapshot(
+        symbol
+      ).catch(
+        () => null
+      )
     ]);
 
   const normalized =
@@ -4826,24 +5987,64 @@ async function getTechnicalAnalysis(
   const rows =
     normalized.cleaned;
 
+  const identity = {
+    canonicalSymbol:
+      symbol,
+
+    tradingSymbol:
+      context.tradingSymbol,
+
+    rawMarketSymbol:
+      context.rawMarketSymbol,
+
+    statusCodes:
+      uniqueStrings([
+        ...context.statusCodes,
+        ...(
+          snapshot?.statusCodes ||
+          []
+        )
+      ]),
+
+    normalized:
+      context.normalized
+  };
+
+  const company = {
+    name:
+      snapshot?.companyName ||
+      context.companyName ||
+      symbol,
+
+    sector:
+      snapshot?.sectorName ||
+      context.sector ||
+      sectorMap.get(
+        symbol
+      ) ||
+      ''
+  };
+
   if (
     rows.length < 30
   ) {
     return {
       symbol,
 
-      company:
-        companyMap.get(
-          symbol
-        ) || null,
+      identity,
+
+      company,
 
       available:
         false,
 
       reason:
-        'At least 30 valid trading sessions are required for technical analysis.',
+        `At least 30 valid trading sessions are required for technical analysis. Canonical history lookup used ${symbol}.`,
 
       dataQuality: {
+        canonicalSymbol:
+          symbol,
+
         validSessions:
           rows.length,
 
@@ -5223,27 +6424,12 @@ async function getTechnicalAnalysis(
       }
     );
 
-  const company =
-    companyMap.get(
-      symbol
-    );
-
   return {
     symbol,
 
-    company:
-      company
-        ? {
-            ...company,
+    identity,
 
-            sector:
-              company.sector ||
-              sectorMap.get(
-                symbol
-              ) ||
-              ''
-          }
-        : null,
+    company,
 
     available:
       true,
@@ -5335,6 +6521,12 @@ async function getTechnicalAnalysis(
     },
 
     dataQuality: {
+      canonicalSymbol:
+        symbol,
+
+      tradingSymbol:
+        context.tradingSymbol,
+
       validSessions:
         rows.length,
 
@@ -5449,7 +6641,7 @@ function authorize(
 }
 
 /* =========================================================
-   RESPONSE / HANDLER
+   RESPONSE
 ========================================================= */
 
 function sendJSON(
@@ -5471,6 +6663,10 @@ function sendJSON(
     )
   );
 }
+
+/* =========================================================
+   HANDLER
+========================================================= */
 
 async function handler(
   request,
@@ -5545,7 +6741,10 @@ async function handler(
             'psxdata-api',
 
           companyMetadata:
-            'PSX official metadata + fallbacks',
+            'PSX canonical metadata + ALLSHR + fallbacks',
+
+          symbolNormalization:
+            'VALIDATED_CANONICAL_STATUS_SEPARATION',
 
           fundamentalsProvider:
             'PSX Data Portal company page',
@@ -5578,23 +6777,64 @@ async function handler(
       request.method ===
         'GET' &&
       action ===
-        'live-price'
+        'resolve-symbol'
     ) {
-      const result =
-        await getPyPSXIntraday(
+      return sendJSON(
+        response,
+        await resolveSymbolContext(
           url.searchParams.get(
             'symbol'
           )
+        )
+      );
+    }
+
+    if (
+      request.method ===
+        'GET' &&
+      action ===
+        'live-price'
+    ) {
+      const context =
+        await resolveSymbolContext(
+          url.searchParams.get(
+            'symbol'
+          )
+        );
+
+      const result =
+        await getLiveForContext(
+          context
         );
 
       return sendJSON(
         response,
         {
           symbol:
-            result.symbol,
+            context.canonicalSymbol,
+
+          identity: {
+            canonicalSymbol:
+              context.canonicalSymbol,
+
+            tradingSymbol:
+              context.tradingSymbol,
+
+            rawMarketSymbol:
+              context.rawMarketSymbol,
+
+            statusCodes:
+              context.statusCodes,
+
+            normalized:
+              context.normalized
+          },
 
           provider:
             result.provider,
+
+          providerSymbol:
+            result.providerSymbol,
 
           sourceType:
             result.sourceType,
@@ -5632,13 +6872,43 @@ async function handler(
       action ===
         'live-chart'
     ) {
-      return sendJSON(
-        response,
-        await getPyPSXIntraday(
+      const context =
+        await resolveSymbolContext(
           url.searchParams.get(
             'symbol'
           )
-        )
+        );
+
+      const result =
+        await getLiveForContext(
+          context
+        );
+
+      return sendJSON(
+        response,
+        {
+          ...result,
+
+          symbol:
+            context.canonicalSymbol,
+
+          identity: {
+            canonicalSymbol:
+              context.canonicalSymbol,
+
+            tradingSymbol:
+              context.tradingSymbol,
+
+            rawMarketSymbol:
+              context.rawMarketSymbol,
+
+            statusCodes:
+              context.statusCodes,
+
+            normalized:
+              context.normalized
+          }
+        }
       );
     }
 
@@ -5762,7 +7032,7 @@ async function handler(
 }
 
 /* =========================================================
-   PAGE
+   WEB PAGE
 ========================================================= */
 
 function page() {
@@ -5906,6 +7176,14 @@ tbody tr:hover {
   white-space: nowrap;
 }
 
+.symbolSub {
+  display: block;
+  margin-top: 3px;
+  font-size: 11px;
+  color: #718394;
+  font-weight: 400;
+}
+
 .company {
   min-width: 230px;
 }
@@ -5965,6 +7243,25 @@ tbody tr:hover {
 
 .companyHeader span {
   color: #66788a;
+}
+
+.identityLine {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+  margin-top: 3px;
+}
+
+.statusPill {
+  display: inline-block;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: #fff0d6;
+  color: #865b12;
+  font-size: 11px;
+  font-weight: 700;
+  border: 1px solid #f0d39e;
 }
 
 .summaryGrid {
@@ -6333,6 +7630,21 @@ tbody tr:hover {
   font-size: 13px;
 }
 
+.learnBox {
+  margin-top: 14px;
+  padding: 14px 16px;
+  border-radius: 9px;
+  background: #f5f8fb;
+  border: 1px solid #dce6ed;
+  color: #42596c;
+  line-height: 1.55;
+  font-size: 13px;
+}
+
+.learnBox strong {
+  color: #18384e;
+}
+
 .sourceNote {
   font-size: 12px;
   color: #66788a;
@@ -6502,8 +7814,8 @@ Build ${VERSION}
 
 <p class="notice">
 
-Market, company metadata, fundamentals and deterministic
-technical analysis are connected.
+Market, company metadata, fundamentals, symbol normalization
+and deterministic technical analysis are connected.
 
 Predictions and investment recommendations remain disabled
 until their models are built and validated.
@@ -7279,6 +8591,178 @@ function metricCard(
   );
 }
 
+function statusPills(
+  codes
+) {
+  const list =
+    Array.isArray(
+      codes
+    )
+      ? codes
+      : [];
+
+  return list
+    .map(
+      code =>
+        '<span class="statusPill">' +
+        escapeHtml(
+          code
+        ) +
+        '</span>'
+    )
+    .join('');
+}
+
+function identityNote(
+  identity
+) {
+  if (
+    !identity ||
+    !identity.normalized
+  ) {
+    return '';
+  }
+
+  const canonical =
+    identity.canonicalSymbol ||
+    '';
+
+  const trading =
+    identity.tradingSymbol ||
+    '';
+
+  if (
+    !canonical ||
+    !trading ||
+    canonical ===
+      trading
+  ) {
+    return '';
+  }
+
+  return (
+    '<div class="sourceNote">' +
+    'Canonical company symbol: ' +
+    '<strong>' +
+    escapeHtml(
+      canonical
+    ) +
+    '</strong>' +
+    ' &bull; Current market symbol: ' +
+    '<strong>' +
+    escapeHtml(
+      trading
+    ) +
+    '</strong>' +
+    '</div>'
+  );
+}
+
+/* =========================================================
+   COMPANY HEADER
+========================================================= */
+
+function showSelectedCompany(
+  symbol
+) {
+  const stock =
+    marketRows.find(
+      row =>
+        row.symbol ===
+          symbol ||
+        row.tradingSymbol ===
+          symbol ||
+        row.rawSymbol ===
+          symbol
+    );
+
+  if (!stock) {
+    $('selectedCompany')
+      .innerHTML =
+        '<strong>' +
+        escapeHtml(
+          symbol
+        ) +
+        '</strong>';
+
+    return;
+  }
+
+  $('selectedCompany')
+    .innerHTML =
+      '<strong>' +
+      escapeHtml(
+        stock.companyName
+      ) +
+      '</strong>' +
+
+      '<div class="identityLine">' +
+
+      '<span>' +
+      escapeHtml(
+        stock.symbol
+      ) +
+      ' &bull; ' +
+      escapeHtml(
+        stock.sector
+      ) +
+      '</span>' +
+
+      statusPills(
+        stock.statusCodes
+      ) +
+
+      '</div>';
+}
+
+function updateSelectedCompany(
+  result
+) {
+  if (
+    !result?.company?.name
+  ) {
+    return;
+  }
+
+  const identity =
+    result.identity ||
+    {};
+
+  $('selectedCompany')
+    .innerHTML =
+      '<strong>' +
+      escapeHtml(
+        result.company.name
+      ) +
+      '</strong>' +
+
+      '<div class="identityLine">' +
+
+      '<span>' +
+      escapeHtml(
+        result.symbol
+      ) +
+
+      (
+        result.company.sector
+          ? (
+              ' &bull; ' +
+              escapeHtml(
+                result.company.sector
+              )
+            )
+          : ''
+      ) +
+
+      '</span>' +
+
+      statusPills(
+        identity.statusCodes
+      ) +
+
+      '</div>';
+}
+
 /* =========================================================
    OVERVIEW
 ========================================================= */
@@ -7472,6 +8956,10 @@ function renderDecisionOverview(
       : '';
 
   let html =
+    identityNote(
+      result.identity
+    ) +
+
     '<div class="decisionHeader">' +
 
     '<div>' +
@@ -7690,6 +9178,10 @@ function renderDecisionOverview(
       html;
 }
 
+/* =========================================================
+   MORE
+========================================================= */
+
 function renderMoreData(
   result
 ) {
@@ -7813,6 +9305,10 @@ function renderMoreData(
   }
 
   let html =
+    identityNote(
+      result.identity
+    ) +
+
     '<div class="decisionSectionTitle">' +
     'Advanced market data' +
     '</div>';
@@ -7841,13 +9337,42 @@ function renderMoreData(
     escapeHtml(
       JSON.stringify(
         {
+          canonicalSymbol:
+            result.identity
+              ?.canonicalSymbol ||
+            result.symbol,
+
+          marketSymbol:
+            result.identity
+              ?.tradingSymbol ||
+            result.symbol,
+
+          rawMarketSymbol:
+            result.identity
+              ?.rawMarketSymbol ||
+            null,
+
+          statusCodes:
+            result.identity
+              ?.statusCodes ||
+            [],
+
           quoteProvider:
             'psxdata-api',
+
+          quoteProviderSymbol:
+            result.quoteProviderSymbol ||
+            null,
 
           intradayProvider:
             result.live
               ? 'pyPSX'
               : null,
+
+          intradayProviderSymbol:
+            result.live
+              ?.providerSymbol ||
+            null,
 
           companyProvider:
             result.official
@@ -7880,17 +9405,6 @@ function renderMoreData(
               ?.sourceUrl ||
             null
         },
-        null,
-        2
-      )
-    ) +
-    '</pre>' +
-
-    '<pre>' +
-    escapeHtml(
-      JSON.stringify(
-        result.data ||
-        {},
         null,
         2
       )
@@ -8036,7 +9550,7 @@ async function refreshLiveOverview(
       if (
         lastQuoteResult &&
         lastQuoteResult.symbol ===
-          symbol
+          result.symbol
       ) {
         lastQuoteResult.live =
           result;
@@ -8259,8 +9773,6 @@ function buildIntradayLineChart(
   const right = 20;
   const top = 20;
   const priceHeight = 265;
-  const volumeTop = 310;
-  const volumeHeight = 58;
 
   const usableWidth =
     width -
@@ -8852,6 +10364,41 @@ function renderLiveChart(
     result
   );
 
+  updateSelectedCompany(
+    {
+      symbol:
+        result.symbol,
+
+      identity:
+        result.identity,
+
+      company:
+        (
+          marketRows.find(
+            row =>
+              row.symbol ===
+              result.symbol
+          )
+            ? {
+                name:
+                  marketRows.find(
+                    row =>
+                      row.symbol ===
+                      result.symbol
+                  ).companyName,
+
+                sector:
+                  marketRows.find(
+                    row =>
+                      row.symbol ===
+                      result.symbol
+                  ).sector
+              }
+            : null
+        )
+    }
+  );
+
   const stateNote =
     result.feedState ===
       'LIVE'
@@ -8873,6 +10420,10 @@ function renderLiveChart(
 
   $('research')
     .innerHTML =
+      identityNote(
+        result.identity
+      ) +
+
       '<div class="liveChartHeader">' +
 
       '<div>' +
@@ -8896,6 +10447,18 @@ function renderLiveChart(
         ''
       ) +
       ' &bull; pyPSX' +
+
+      (
+        result.providerSymbol
+          ? (
+              ' &bull; feed symbol ' +
+              escapeHtml(
+                result.providerSymbol
+              )
+            )
+          : ''
+      ) +
+
       '</div>' +
 
       '</div>' +
@@ -9048,85 +10611,8 @@ async function startLiveChart(
 }
 
 /* =========================================================
-   COMPANY / MARKET TABLE
+   MARKET TABLE
 ========================================================= */
-
-function showSelectedCompany(
-  symbol
-) {
-  const stock =
-    marketRows.find(
-      row =>
-        row.symbol ===
-        symbol
-    );
-
-  if (!stock) {
-    $('selectedCompany')
-      .innerHTML =
-        '<strong>' +
-        escapeHtml(
-          symbol
-        ) +
-        '</strong>';
-
-    return;
-  }
-
-  $('selectedCompany')
-    .innerHTML =
-      '<strong>' +
-      escapeHtml(
-        stock.companyName
-      ) +
-      '</strong>' +
-
-      '<span>' +
-      escapeHtml(
-        stock.symbol
-      ) +
-      ' &bull; ' +
-      escapeHtml(
-        stock.sector
-      ) +
-      '</span>';
-}
-
-function updateSelectedCompany(
-  result
-) {
-  if (
-    !result?.company?.name
-  ) {
-    return;
-  }
-
-  $('selectedCompany')
-    .innerHTML =
-      '<strong>' +
-      escapeHtml(
-        result.company.name
-      ) +
-      '</strong>' +
-
-      '<span>' +
-      escapeHtml(
-        result.symbol
-      ) +
-
-      (
-        result.company.sector
-          ? (
-              ' &bull; ' +
-              escapeHtml(
-                result.company.sector
-              )
-            )
-          : ''
-      ) +
-
-      '</span>';
-}
 
 function getFilteredRows() {
   const query =
@@ -9144,6 +10630,15 @@ function getFilteredRows() {
       stock =>
         (
           stock.symbol +
+          ' ' +
+          stock.tradingSymbol +
+          ' ' +
+          stock.rawSymbol +
+          ' ' +
+          (
+            stock.statusCodes ||
+            []
+          ).join(' ') +
           ' ' +
           stock.companyName +
           ' ' +
@@ -9345,6 +10840,10 @@ function renderStocks() {
       .innerHTML =
         '<p>No matching stocks.</p>';
 
+    $('pageInfo')
+      .textContent =
+        '';
+
     return;
   }
 
@@ -9372,77 +10871,112 @@ function renderStocks() {
       '<tbody>' +
 
       pageRows.map(
-        stock =>
-          '<tr data-symbol="' +
-          escapeHtml(
-            stock.symbol
-          ) +
-          '">' +
+        stock => {
+          const differentMarketSymbol =
+            stock.tradingSymbol &&
+            stock.tradingSymbol !==
+              stock.symbol;
 
-          '<td class="symbol">' +
-          escapeHtml(
-            stock.symbol
-          ) +
-          '</td>' +
+          return (
+            '<tr data-symbol="' +
+            escapeHtml(
+              stock.symbol
+            ) +
+            '">' +
 
-          '<td class="company">' +
-          escapeHtml(
-            stock.companyName
-          ) +
-          '</td>' +
+            '<td class="symbol">' +
 
-          '<td>' +
-          escapeHtml(
-            stock.sector
-          ) +
-          '</td>' +
+            escapeHtml(
+              stock.symbol
+            ) +
 
-          '<td>' +
-          formatNumber(
-            stock.price
-          ) +
-          '</td>' +
+            (
+              stock.statusCodes
+                ?.length
+                ? (
+                    ' ' +
+                    statusPills(
+                      stock.statusCodes
+                    )
+                  )
+                : ''
+            ) +
 
-          '<td>' +
-          (
-            stock.peRatio ===
-              null
-              ? 'N/A'
-              : formatNumber(
-                  stock.peRatio
-                )
-          ) +
-          '</td>' +
+            (
+              differentMarketSymbol
+                ? (
+                    '<span class="symbolSub">' +
+                    'Market: ' +
+                    escapeHtml(
+                      stock.tradingSymbol
+                    ) +
+                    '</span>'
+                  )
+                : ''
+            ) +
 
-          '<td>' +
-          (
-            stock.dividendYield ===
-              null
-              ? 'N/A'
-              : formatPercent(
-                  stock.dividendYield
-                )
-          ) +
-          '</td>' +
+            '</td>' +
 
-          '<td>' +
-          formatNumber(
-            stock.averageVolume30d,
-            0
-          ) +
-          '</td>' +
+            '<td class="company">' +
+            escapeHtml(
+              stock.companyName
+            ) +
+            '</td>' +
 
-          '<td class="' +
-          percentClass(
-            stock.change1yPct
-          ) +
-          '">' +
-          formatPercent(
-            stock.change1yPct
-          ) +
-          '</td>' +
+            '<td>' +
+            escapeHtml(
+              stock.sector
+            ) +
+            '</td>' +
 
-          '</tr>'
+            '<td>' +
+            formatNumber(
+              stock.price
+            ) +
+            '</td>' +
+
+            '<td>' +
+            (
+              stock.peRatio ===
+                null
+                ? 'N/A'
+                : formatNumber(
+                    stock.peRatio
+                  )
+            ) +
+            '</td>' +
+
+            '<td>' +
+            (
+              stock.dividendYield ===
+                null
+                ? 'N/A'
+                : formatPercent(
+                    stock.dividendYield
+                  )
+            ) +
+            '</td>' +
+
+            '<td>' +
+            formatNumber(
+              stock.averageVolume30d,
+              0
+            ) +
+            '</td>' +
+
+            '<td class="' +
+            percentClass(
+              stock.change1yPct
+            ) +
+            '">' +
+            formatPercent(
+              stock.change1yPct
+            ) +
+            '</td>' +
+
+            '</tr>'
+          );
+        }
       )
         .join('') +
 
@@ -9554,7 +11088,7 @@ function populateSectors() {
 }
 
 /* =========================================================
-   HISTORY UI
+   HISTORY CHART
 ========================================================= */
 
 function buildPriceChart(
@@ -9602,12 +11136,23 @@ function buildPriceChart(
       ...closes
     );
 
+  if (
+    min === max
+  ) {
+    min *= .995;
+    max *= 1.005;
+  }
+
   const margin =
-    (
-      max -
-      min
-    ) *
-    .08;
+    Math.max(
+      (
+        max -
+        min
+      ) *
+      .08,
+      max *
+      .001
+    );
 
   min -= margin;
   max += margin;
@@ -9714,7 +11259,7 @@ function historyRangeToggle(
     '</div>' +
 
     '<div class="muted">' +
-    'Choose a period to recalculate performance.' +
+    'Choose a period to recalculate performance and chart statistics.' +
     '</div>' +
 
     '</div>' +
@@ -9790,12 +11335,20 @@ function renderHistory(
   ) {
     $('research')
       .innerHTML =
+        identityNote(
+          result.identity
+        ) +
+
         historyRangeToggle(
           result.range
         ) +
 
         '<div class="emptyState">' +
-        'No valid historical price data was available.' +
+        'No valid historical price data was available for the canonical ticker ' +
+        escapeHtml(
+          result.symbol
+        ) +
+        '.' +
         '</div>';
 
     bindHistoryRangeButtons(
@@ -9807,6 +11360,10 @@ function renderHistory(
 
   $('research')
     .innerHTML =
+      identityNote(
+        result.identity
+      ) +
+
       historyRangeToggle(
         result.range
       ) +
@@ -9877,14 +11434,19 @@ function renderHistory(
           ? (
               '<div class="warningBox">' +
               summary.excludedAnomalies +
-              ' suspicious historical rows were excluded.' +
+              ' suspicious historical rows were excluded from this chart.' +
               '</div>'
             )
           : ''
       ) +
 
       '<div class="sourceNote">' +
-      'Historical daily data: psxdata-api. Live/session price is shown separately.' +
+      'Historical data uses canonical ticker ' +
+      '<strong>' +
+      escapeHtml(
+        result.symbol
+      ) +
+      '</strong>. Live/session prices are handled separately.' +
       '</div>';
 
   bindHistoryRangeButtons(
@@ -9921,6 +11483,10 @@ async function loadHistoryView(
     selectedHistoryRange =
       result.range;
 
+    $('stockSymbol')
+      .value =
+        result.symbol;
+
     renderHistory(
       result
     );
@@ -9932,7 +11498,7 @@ async function loadHistoryView(
 }
 
 /* =========================================================
-   TECHNICAL UI
+   TECHNICAL CHART
 ========================================================= */
 
 function buildTechnicalChart(
@@ -10160,6 +11726,135 @@ function buildTechnicalChart(
   );
 }
 
+function buildSMALearningText(
+  result
+) {
+  const price =
+    finiteNumber(
+      result.price
+    );
+
+  const sma20 =
+    finiteNumber(
+      result.trend?.sma20
+    );
+
+  const sma50 =
+    finiteNumber(
+      result.trend?.sma50
+    );
+
+  const sma200 =
+    finiteNumber(
+      result.trend?.sma200
+    );
+
+  const available = [
+    {
+      label:
+        '20-day',
+      value:
+        sma20
+    },
+    {
+      label:
+        '50-day',
+      value:
+        sma50
+    },
+    {
+      label:
+        '200-day',
+      value:
+        sma200
+    }
+  ]
+    .filter(
+      item =>
+        item.value !==
+        null
+    );
+
+  let interpretation =
+    '';
+
+  if (
+    price !== null &&
+    available.length
+  ) {
+    const above =
+      available.filter(
+        item =>
+          price >
+          item.value
+      );
+
+    const below =
+      available.filter(
+        item =>
+          price <
+          item.value
+      );
+
+    if (
+      above.length ===
+      available.length
+    ) {
+      interpretation =
+        ' The current price is above all available moving averages, which indicates stronger trend structure across those time horizons.';
+    } else if (
+      below.length ===
+      available.length
+    ) {
+      interpretation =
+        ' The current price is below all available moving averages, which indicates weaker trend structure across those time horizons.';
+    } else {
+      interpretation =
+        ' The price is above some moving averages and below others, so the short-, medium- and longer-term trend signals are mixed.';
+    }
+  }
+
+  return (
+    '<div class="learnBox">' +
+
+    '<strong>How to read SMA 20 / 50 / 200</strong><br>' +
+
+    'SMA means Simple Moving Average. SMA 20 is the average closing price over the last 20 trading sessions, SMA 50 covers 50 sessions, and SMA 200 covers roughly 200 sessions. ' +
+
+    'Price above a moving average generally indicates stronger trend structure for that time horizon; price below it suggests weakness.' +
+
+    interpretation +
+
+    '<br><br>' +
+
+    '<strong>Important:</strong> moving averages describe price trend. They are not, by themselves, a Buy or Sell instruction.' +
+
+    '</div>'
+  );
+}
+
+function buildIndicatorLearningText() {
+  return (
+    '<div class="learnBox">' +
+
+    '<strong>Quick guide to the indicators above</strong><br>' +
+
+    '<strong>RSI (14):</strong> measures recent momentum on a 0-100 scale. Readings above 70 are commonly treated as an overbought zone and below 30 as an oversold zone.<br>' +
+
+    '<strong>MACD:</strong> compares faster and slower exponential moving averages to show changes in momentum.<br>' +
+
+    '<strong>ATR (14):</strong> measures the typical trading range, so a larger ATR generally means larger price swings.<br>' +
+
+    '<strong>20D volatility:</strong> estimates how variable recent daily returns have been, annualized for easier comparison.<br>' +
+
+    '<strong>Volume vs 20D:</strong> compares the latest session volume with its recent average. High volume can give more weight to a price move.<br>' +
+
+    '<strong>Support / resistance:</strong> NOMAD currently uses recent 20-session lows and highs as simple reference levels. These are descriptive levels, not guaranteed floors or ceilings.' +
+
+    '</div>'
+  );
+}
+
 function renderTechnical(
   result
 ) {
@@ -10172,6 +11867,10 @@ function renderTechnical(
   ) {
     $('research')
       .innerHTML =
+        identityNote(
+          result.identity
+        ) +
+
         '<div class="emptyState">' +
         escapeHtml(
           result.reason ||
@@ -10203,6 +11902,10 @@ function renderTechnical(
     {};
 
   let html =
+    identityNote(
+      result.identity
+    ) +
+
     '<div class="decisionSectionTitle">' +
     'Technical posture' +
     '</div>' +
@@ -10215,7 +11918,7 @@ function renderTechnical(
     '</div>' +
 
     '<div class="sourceNote">' +
-    'Based on daily historical price and volume through ' +
+    'Based on canonical daily historical price and volume through ' +
     escapeHtml(
       result.asOf ||
       ''
@@ -10302,6 +12005,9 @@ function renderTechnical(
     ) +
 
     '</div>';
+
+  html +=
+    buildIndicatorLearningText();
 
   html +=
     '<div class="decisionSection">' +
@@ -10428,6 +12134,11 @@ function renderTechnical(
     );
 
   html +=
+    buildSMALearningText(
+      result
+    );
+
+  html +=
     '<div class="infoBox">' +
     escapeHtml(
       result.disclaimer
@@ -10445,6 +12156,9 @@ function renderTechnical(
     escapeHtml(
       JSON.stringify(
         {
+          identity:
+            result.identity,
+
           trend:
             result.trend,
 
@@ -10477,7 +12191,7 @@ function renderTechnical(
 }
 
 /* =========================================================
-   FUNDAMENTALS UI
+   FUNDAMENTALS
 ========================================================= */
 
 function financialMetricRow(
@@ -10655,6 +12369,10 @@ function renderFundamentals(
   ) {
     $('research')
       .innerHTML =
+        identityNote(
+          result.identity
+        ) +
+
         '<div class="emptyState">' +
         'Structured fundamentals are unavailable from the connected PSX source. NOMAD will not invent missing values.' +
         '</div>';
@@ -10704,6 +12422,10 @@ function renderFundamentals(
     );
 
   let html =
+    identityNote(
+      result.identity
+    ) +
+
     '<div class="decisionSectionTitle">' +
     'Fundamental snapshot' +
     '</div>' +
@@ -10850,7 +12572,11 @@ function renderFundamentals(
     escapeHtml(
       result.source
     ) +
-    '. Summary PKR figures are converted from source values reported in thousands where applicable.' +
+    '. Company data uses canonical ticker ' +
+    escapeHtml(
+      result.symbol
+    ) +
+    '.' +
     '</div>';
 
   $('research')
@@ -10859,7 +12585,7 @@ function renderFundamentals(
 }
 
 /* =========================================================
-   EVENTS UI
+   EVENTS
 ========================================================= */
 
 function isKeyEvent(
@@ -10956,7 +12682,17 @@ function renderEvents(
           isKeyEvent
         );
 
+  const modeDescription =
+    eventMode ===
+      'key'
+      ? 'Showing events most likely to matter to an investment decision.'
+      : 'Showing all available company announcements.';
+
   let html =
+    identityNote(
+      result.identity
+    ) +
+
     '<div class="liveChartHeader">' +
 
     '<div>' +
@@ -10966,10 +12702,9 @@ function renderEvents(
     '</div>' +
 
     '<div class="muted">' +
-    eventMode ===
-      'key'
-      ? 'Showing events most likely to matter to an investment decision.'
-      : 'Showing all available company announcements.' +
+    escapeHtml(
+      modeDescription
+    ) +
     '</div>' +
 
     '</div>' +
@@ -11071,6 +12806,10 @@ function renderEvents(
     escapeHtml(
       result.source
     ) +
+    ' &bull; Canonical ticker: ' +
+    escapeHtml(
+      result.symbol
+    ) +
     '</div>';
 
   $('research')
@@ -11081,7 +12820,7 @@ function renderEvents(
 }
 
 /* =========================================================
-   BUTTONS
+   MARKET BUTTON
 ========================================================= */
 
 $('loadMarket')
@@ -11112,7 +12851,7 @@ $('loadMarket')
         $('coverage')
           .textContent =
             result.totalStocks +
-            ' usable stocks | Company names matched ' +
+            ' canonical stocks | Company names matched ' +
             result.companyNamesMatched +
             '/' +
             result.totalStocks +
@@ -11120,6 +12859,8 @@ $('loadMarket')
             result.sectorsMatched +
             '/' +
             result.totalStocks +
+            ' | Status symbols normalized ' +
+            result.normalizedStatusRows +
             ' | Updated ' +
             result.asOf;
 
@@ -11136,6 +12877,10 @@ $('loadMarket')
             false;
       }
     };
+
+/* =========================================================
+   FILTER EVENTS
+========================================================= */
 
 $('search')
   .oninput =
@@ -11196,6 +12941,10 @@ $('nextPage')
       }
     };
 
+/* =========================================================
+   OVERVIEW BUTTON
+========================================================= */
+
 $('loadQuote')
   .onclick =
     async () => {
@@ -11203,14 +12952,14 @@ $('loadQuote')
         .textContent =
           '';
 
-      const symbol =
+      const inputSymbol =
         $('stockSymbol')
           .value
           .trim()
           .toUpperCase();
 
       if (
-        !symbol
+        !inputSymbol
       ) {
         $('error')
           .textContent =
@@ -11220,7 +12969,7 @@ $('loadQuote')
       }
 
       showSelectedCompany(
-        symbol
+        inputSymbol
       );
 
       $('research')
@@ -11234,9 +12983,14 @@ $('loadQuote')
           await api(
             'quote',
             {
-              symbol
+              symbol:
+                inputSymbol
             }
           );
+
+        $('stockSymbol')
+          .value =
+            result.symbol;
 
         updateSelectedCompany(
           result
@@ -11250,7 +13004,7 @@ $('loadQuote')
         );
 
         startLiveOverview(
-          symbol,
+          result.symbol,
           result.live ||
           null
         );
@@ -11260,6 +13014,10 @@ $('loadQuote')
             error.message;
       }
     };
+
+/* =========================================================
+   LIVE CHART BUTTON
+========================================================= */
 
 $('loadLiveChart')
   .onclick =
@@ -11289,6 +13047,10 @@ $('loadLiveChart')
       );
     };
 
+/* =========================================================
+   HISTORY BUTTON
+========================================================= */
+
 $('loadHistory')
   .onclick =
     () => {
@@ -11317,6 +13079,10 @@ $('loadHistory')
         selectedHistoryRange
       );
     };
+
+/* =========================================================
+   TECHNICAL BUTTON
+========================================================= */
 
 $('loadTechnical')
   .onclick =
@@ -11362,6 +13128,10 @@ $('loadTechnical')
             }
           );
 
+        $('stockSymbol')
+          .value =
+            result.symbol;
+
         renderTechnical(
           result
         );
@@ -11371,6 +13141,10 @@ $('loadTechnical')
             error.message;
       }
     };
+
+/* =========================================================
+   FUNDAMENTALS BUTTON
+========================================================= */
 
 $('loadFundamentals')
   .onclick =
@@ -11416,6 +13190,10 @@ $('loadFundamentals')
             }
           );
 
+        $('stockSymbol')
+          .value =
+            result.symbol;
+
         renderFundamentals(
           result
         );
@@ -11425,6 +13203,10 @@ $('loadFundamentals')
             error.message;
       }
     };
+
+/* =========================================================
+   EVENTS BUTTON
+========================================================= */
 
 $('loadEvents')
   .onclick =
@@ -11473,6 +13255,10 @@ $('loadEvents')
             }
           );
 
+        $('stockSymbol')
+          .value =
+            result.symbol;
+
         renderEvents(
           result
         );
@@ -11482,6 +13268,10 @@ $('loadEvents')
             error.message;
       }
     };
+
+/* =========================================================
+   MORE BUTTON
+========================================================= */
 
 $('loadMore')
   .onclick =
@@ -11515,8 +13305,14 @@ $('loadMore')
       try {
         let result =
           lastQuoteResult &&
-          lastQuoteResult.symbol ===
-            symbol
+          (
+            lastQuoteResult.symbol ===
+              symbol ||
+            lastQuoteResult
+              .identity
+              ?.tradingSymbol ===
+              symbol
+          )
             ? lastQuoteResult
             : null;
 
@@ -11535,6 +13331,10 @@ $('loadMore')
             result;
         }
 
+        $('stockSymbol')
+          .value =
+            result.symbol;
+
         updateSelectedCompany(
           result
         );
@@ -11548,6 +13348,10 @@ $('loadMore')
             error.message;
       }
     };
+
+/* =========================================================
+   SYMBOL INPUT
+========================================================= */
 
 $('stockSymbol')
   .oninput =
@@ -11581,6 +13385,7 @@ api(
         .textContent =
           'Market: connected | ' +
           'Company metadata: connected | ' +
+          'Symbol normalization: validated canonical mapping | ' +
           'pyPSX: ' +
           (
             result.pyPSXConfigured
@@ -11608,6 +13413,10 @@ api(
 </html>`;
 }
 
+/* =========================================================
+   EXPORT / LOCAL SERVER
+========================================================= */
+
 module.exports =
   handler;
 
@@ -11630,7 +13439,7 @@ if (
       '127.0.0.1',
       () => {
         console.log(
-          `NOMAD Invest running at http://127.0.0.1:${port}`
+          \`NOMAD Invest running at http://127.0.0.1:\${port}\`
         );
       }
     );
