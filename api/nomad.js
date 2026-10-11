@@ -3,7 +3,7 @@
 const http = require('node:http');
 const crypto = require('node:crypto');
 
-const VERSION = '0.5.0';
+const VERSION = '0.6.0';
 
 const PSX_API_BASE =
   process.env.PSX_API_BASE ||
@@ -41,15 +41,24 @@ function getPyPSXBase() {
 let marketCache = null;
 let sectorCache = null;
 let companyCache = null;
-const companyPageCache = new Map();
 
-/* --------------------------------------------------
+const companyPageCache =
+  new Map();
+
+/* =========================================================
    HELPERS
--------------------------------------------------- */
+========================================================= */
 
-function bad(message, status = 400) {
-  const error = new Error(message);
-  error.status = status;
+function bad(
+  message,
+  status = 400
+) {
+  const error =
+    new Error(message);
+
+  error.status =
+    status;
+
   throw error;
 }
 
@@ -62,50 +71,75 @@ function safeNumber(value) {
     return null;
   }
 
-  const normalized = String(value)
-    .replace(/,/g, '')
-    .replace(/%/g, '')
-    .replace(/^\((.*)\)$/, '-$1')
-    .trim();
+  const normalized =
+    String(value)
+      .replace(/,/g, '')
+      .replace(/%/g, '')
+      .replace(
+        /^\((.*)\)$/,
+        '-$1'
+      )
+      .trim();
 
   if (
     !normalized ||
     normalized === '-' ||
-    /^n\/?a$/i.test(normalized)
+    /^n\/?a$/i.test(
+      normalized
+    )
   ) {
     return null;
   }
 
-  const parsed = Number(normalized);
+  const parsed =
+    Number(normalized);
 
-  return Number.isFinite(parsed)
+  return Number.isFinite(
+    parsed
+  )
     ? parsed
     : null;
 }
 
 function normalizeSymbol(value) {
-  return String(value || '')
+  return String(
+    value || ''
+  )
     .trim()
     .toUpperCase();
 }
 
-function normalizeTimestamp(value) {
-  const parsed = Date.parse(value);
+function normalizeTimestamp(
+  value
+) {
+  const parsed =
+    Date.parse(value);
 
-  return Number.isFinite(parsed)
-    ? new Date(parsed).toISOString()
-    : new Date().toISOString();
+  return Number.isFinite(
+    parsed
+  )
+    ? new Date(
+        parsed
+      ).toISOString()
+    : new Date()
+        .toISOString();
 }
 
 function absoluteURL(value) {
-  const raw = String(value || '').trim();
+  const raw =
+    String(
+      value || ''
+    ).trim();
 
   if (!raw) {
     return null;
   }
 
   try {
-    return new URL(raw, PSX_DPS_BASE).toString();
+    return new URL(
+      raw,
+      PSX_DPS_BASE
+    ).toString();
   } catch {
     return null;
   }
@@ -113,29 +147,68 @@ function absoluteURL(value) {
 
 function escapeRegExp(value) {
   return String(value)
-    .replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    .replace(
+      /[.*+?^${}()|[\]\\]/g,
+      '\\$&'
+    );
 }
 
 function decodeHtml(value) {
-  return String(value || '')
-    .replace(/&nbsp;/gi, ' ')
-    .replace(/&amp;/gi, '&')
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;/gi, "'")
-    .replace(/&apos;/gi, "'")
-    .replace(/&lt;/gi, '<')
-    .replace(/&gt;/gi, '>')
-    .replace(/&#(\d+);/g, (_, code) =>
-      String.fromCharCode(Number(code))
+  return String(
+    value || ''
+  )
+    .replace(
+      /&nbsp;/gi,
+      ' '
     )
-    .replace(/&#x([0-9a-f]+);/gi, (_, code) =>
-      String.fromCharCode(parseInt(code, 16))
+    .replace(
+      /&amp;/gi,
+      '&'
+    )
+    .replace(
+      /&quot;/gi,
+      '"'
+    )
+    .replace(
+      /&#39;/gi,
+      "'"
+    )
+    .replace(
+      /&apos;/gi,
+      "'"
+    )
+    .replace(
+      /&lt;/gi,
+      '<'
+    )
+    .replace(
+      /&gt;/gi,
+      '>'
+    )
+    .replace(
+      /&#(\d+);/g,
+      (_, code) =>
+        String.fromCharCode(
+          Number(code)
+        )
+    )
+    .replace(
+      /&#x([0-9a-f]+);/gi,
+      (_, code) =>
+        String.fromCharCode(
+          parseInt(
+            code,
+            16
+          )
+        )
     );
 }
 
 function cleanHtmlCell(value) {
   return decodeHtml(
-    String(value || '')
+    String(
+      value || ''
+    )
       .replace(
         /<script[\s\S]*?<\/script>/gi,
         ''
@@ -149,13 +222,18 @@ function cleanHtmlCell(value) {
         ' '
       )
   )
-    .replace(/\s+/g, ' ')
+    .replace(
+      /\s+/g,
+      ' '
+    )
     .trim();
 }
 
 function htmlToLines(html) {
   return decodeHtml(
-    String(html || '')
+    String(
+      html || ''
+    )
       .replace(
         /<script[\s\S]*?<\/script>/gi,
         ''
@@ -178,10 +256,14 @@ function htmlToLines(html) {
       )
   )
     .split(/\r?\n/)
-    .map(value =>
-      value
-        .replace(/\s+/g, ' ')
-        .trim()
+    .map(
+      value =>
+        value
+          .replace(
+            /\s+/g,
+            ' '
+          )
+          .trim()
     )
     .filter(Boolean);
 }
@@ -192,8 +274,9 @@ function findLineValue(
   occurrence = 0
 ) {
   const target =
-    String(label || '')
-      .toLowerCase();
+    String(
+      label || ''
+    ).toLowerCase();
 
   let seen = 0;
 
@@ -205,17 +288,19 @@ function findLineValue(
     const line =
       String(
         lines[index] || ''
-      )
-        .toLowerCase();
+      ).toLowerCase();
 
     if (
-      !line.includes(target)
+      !line.includes(
+        target
+      )
     ) {
       continue;
     }
 
     if (
-      seen < occurrence
+      seen <
+      occurrence
     ) {
       seen += 1;
       continue;
@@ -225,7 +310,9 @@ function findLineValue(
       lines[index]
         .replace(
           new RegExp(
-            escapeRegExp(label),
+            escapeRegExp(
+              label
+            ),
             'i'
           ),
           ''
@@ -241,19 +328,19 @@ function findLineValue(
     }
 
     for (
-      let candidateIndex =
+      let next =
         index + 1;
 
-      candidateIndex <
+      next <
         Math.min(
           lines.length,
-          index + 5
+          index + 6
         );
 
-      candidateIndex += 1
+      next += 1
     ) {
       const candidate =
-        lines[candidateIndex];
+        lines[next];
 
       if (candidate) {
         return candidate;
@@ -287,23 +374,114 @@ function findNumericAfterLabel(
       );
 
   return match
-    ? safeNumber(match[0])
+    ? safeNumber(
+        match[0]
+      )
     : null;
+}
+
+function findExactNumericAfterLabel(
+  lines,
+  label
+) {
+  const target =
+    String(label)
+      .trim()
+      .toUpperCase();
+
+  for (
+    let index = 0;
+    index < lines.length;
+    index++
+  ) {
+    const current =
+      String(
+        lines[index] || ''
+      )
+        .trim()
+        .toUpperCase();
+
+    if (
+      current !== target
+    ) {
+      continue;
+    }
+
+    for (
+      let next =
+        index + 1;
+
+      next <
+        Math.min(
+          lines.length,
+          index + 5
+        );
+
+      next++
+    ) {
+      const match =
+        String(
+          lines[next] || ''
+        )
+          .match(
+            /\(?-?[\d,.]+(?:\.\d+)?\)?/
+          );
+
+      if (match) {
+        const number =
+          safeNumber(
+            match[0]
+          );
+
+        if (
+          number !== null
+        ) {
+          return number;
+        }
+      }
+    }
+  }
+
+  return null;
 }
 
 function dateLike(value) {
   return (
     /^(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},\s+\d{4}/i
       .test(
-        String(value || '')
-          .trim()
+        String(
+          value || ''
+        ).trim()
       ) ||
     /^\d{4}-\d{2}-\d{2}$/
       .test(
-        String(value || '')
-          .trim()
+        String(
+          value || ''
+        ).trim()
       )
   );
+}
+
+function dateKeyFromDate(
+  value
+) {
+  const time =
+    Date.parse(value);
+
+  if (
+    !Number.isFinite(
+      time
+    )
+  ) {
+    return '';
+  }
+
+  return new Date(time)
+    .toISOString()
+    .slice(
+      0,
+      10
+    );
 }
 
 function parseHTMLTables(html) {
@@ -318,7 +496,9 @@ function parseHTMLTables(html) {
     (
       tableMatch =
         tableRegex.exec(
-          String(html || '')
+          String(
+            html || ''
+          )
         )
     ) !== null
   ) {
@@ -365,7 +545,9 @@ function parseHTMLTables(html) {
         );
       }
 
-      if (cells.length) {
+      if (
+        cells.length
+      ) {
         const anchorMatch =
           rowHtml.match(
             /<a\b[^>]*href=["']([^"']+)["'][^>]*>/i
@@ -384,9 +566,12 @@ function parseHTMLTables(html) {
       }
     }
 
-    if (rows.length) {
+    if (
+      rows.length
+    ) {
       tables.push({
         rows,
+
         start:
           tableMatch.index
       });
@@ -408,7 +593,9 @@ function classifyCompanyTable(
   table
 ) {
   const matrix =
-    tableToMatrix(table);
+    tableToMatrix(
+      table
+    );
 
   const flattened =
     matrix
@@ -425,13 +612,16 @@ function classifyCompanyTable(
     )
   ) {
     const header =
-      matrix[0] || [];
+      matrix[0] ||
+      [];
 
     const headerText =
       header.join(' ');
 
-    return /^.*\bq[1-4]\b/i
-      .test(headerText)
+    return /\bq[1-4]\b/i
+      .test(
+        headerText
+      )
         ? 'financial-quarterly'
         : 'financial-annual';
   }
@@ -463,13 +653,12 @@ function classifyCompanyTable(
   }
 
   const dateRows =
-    table.rows
-      .filter(
-        row =>
-          dateLike(
-            row.cells[0]
-          )
-      );
+    table.rows.filter(
+      row =>
+        dateLike(
+          row.cells[0]
+        )
+    );
 
   if (
     dateRows.length >= 1
@@ -488,7 +677,9 @@ function normalizeFinancialTable(
       table
     );
 
-  if (!matrix.length) {
+  if (
+    !matrix.length
+  ) {
     return null;
   }
 
@@ -500,7 +691,9 @@ function normalizeFinancialTable(
       .slice(1)
       .filter(Boolean);
 
-  if (!periods.length) {
+  if (
+    !periods.length
+  ) {
     return null;
   }
 
@@ -567,27 +760,26 @@ function inferAnnouncementType(
   const text =
     String(
       title || ''
-    )
-      .toLowerCase();
+    ).toLowerCase();
 
   if (
     text.includes(
-      'board meeting'
+      'dividend'
     ) ||
     text.includes(
-      'annual general meeting'
+      'bonus'
     ) ||
     text.includes(
-      'extraordinary general meeting'
+      'right issue'
     ) ||
     text.includes(
-      'eogm'
+      'book closure'
     ) ||
     text.includes(
-      'agm'
+      'payout'
     )
   ) {
-    return 'Meeting';
+    return 'Payout';
   }
 
   if (
@@ -596,6 +788,9 @@ function inferAnnouncementType(
     ) ||
     text.includes(
       'quarterly'
+    ) ||
+    text.includes(
+      'half yearly'
     ) ||
     text.includes(
       'half year'
@@ -615,19 +810,22 @@ function inferAnnouncementType(
 
   if (
     text.includes(
-      'dividend'
+      'board meeting'
     ) ||
     text.includes(
-      'bonus'
+      'annual general meeting'
     ) ||
     text.includes(
-      'right issue'
+      'extraordinary general meeting'
     ) ||
     text.includes(
-      'book closure'
+      'eogm'
+    ) ||
+    text.includes(
+      'agm'
     )
   ) {
-    return 'Payout';
+    return 'Meeting';
   }
 
   return 'Corporate';
@@ -716,23 +914,144 @@ function normalizeAnnouncementRows(
   const seen =
     new Set();
 
-  return announcements
-    .filter(
-      item => {
-        const key =
-          `${item.date}|${item.title}`;
+  return announcements.filter(
+    item => {
+      const key =
+        `${item.date}|${item.title}`;
 
-        if (
-          seen.has(key)
-        ) {
-          return false;
-        }
-
-        seen.add(key);
-
-        return true;
+      if (
+        seen.has(key)
+      ) {
+        return false;
       }
+
+      seen.add(key);
+
+      return true;
+    }
+  );
+}
+
+function parseOfficialQuoteStats(
+  lines
+) {
+  const priceLine =
+    lines.find(
+      line =>
+        /^Rs\.\s*[\d,.]+/i
+          .test(
+            String(line)
+          )
     );
+
+  const priceMatch =
+    priceLine
+      ? priceLine.match(
+          /Rs\.\s*([\d,.]+)/i
+        )
+      : null;
+
+  const asOfLine =
+    lines.find(
+      line =>
+        /\bAs of\b/i
+          .test(
+            String(line)
+          )
+    );
+
+  let asOf =
+    null;
+
+  let asOfDateKey =
+    '';
+
+  if (
+    asOfLine
+  ) {
+    const cleaned =
+      String(asOfLine)
+        .replace(
+          /^.*?\bAs of\b\s*/i,
+          ''
+        )
+        .replace(
+          /^\^\s*/,
+          ''
+        )
+        .trim();
+
+    const parsed =
+      Date.parse(
+        cleaned
+      );
+
+    if (
+      Number.isFinite(
+        parsed
+      )
+    ) {
+      asOf =
+        new Date(
+          parsed
+        )
+          .toISOString();
+
+      asOfDateKey =
+        dateKeyFromDate(
+          asOf
+        );
+    }
+  }
+
+  return {
+    price:
+      priceMatch
+        ? safeNumber(
+            priceMatch[1]
+          )
+        : null,
+
+    open:
+      findExactNumericAfterLabel(
+        lines,
+        'OPEN'
+      ),
+
+    high:
+      findExactNumericAfterLabel(
+        lines,
+        'HIGH'
+      ),
+
+    low:
+      findExactNumericAfterLabel(
+        lines,
+        'LOW'
+      ),
+
+    volume:
+      findExactNumericAfterLabel(
+        lines,
+        'VOLUME'
+      ),
+
+    ldcp:
+      findExactNumericAfterLabel(
+        lines,
+        'LDCP'
+      ),
+
+    peRatio:
+      findNumericAfterLabel(
+        lines,
+        'P/E RATIO'
+      ),
+
+    asOf,
+
+    asOfDateKey
+  };
 }
 
 function parsePSXCompanyPage(
@@ -740,7 +1059,9 @@ function parsePSXCompanyPage(
   symbol
 ) {
   const lines =
-    htmlToLines(html);
+    htmlToLines(
+      html
+    );
 
   const tables =
     parseHTMLTables(
@@ -764,7 +1085,9 @@ function parsePSXCompanyPage(
   let sectorName =
     null;
 
-  if (companyName) {
+  if (
+    companyName
+  ) {
     const companyLineIndex =
       lines.findIndex(
         line =>
@@ -782,17 +1105,15 @@ function parsePSXCompanyPage(
     ) {
       for (
         let index =
-          companyLineIndex +
-          1;
+          companyLineIndex + 1;
 
         index <
           Math.min(
             lines.length,
-            companyLineIndex +
-              8
+            companyLineIndex + 9
           );
 
-        index += 1
+        index++
       ) {
         const candidate =
           String(
@@ -806,8 +1127,7 @@ function parsePSXCompanyPage(
           candidate.length <=
             120 &&
           candidate ===
-            candidate
-              .toUpperCase() &&
+            candidate.toUpperCase() &&
           !/^(QUOTE|PROFILE|EQUITY|ANNOUNCEMENTS|FINANCIALS|RATIOS|PAYOUTS|REPORTS|REG|DFC|CSF|ODL)$/i
             .test(
               candidate
@@ -925,12 +1245,10 @@ function parsePSXCompanyPage(
   if (
     freeFloatShares !==
       null &&
-    freeFloatShares <=
-      100 &&
+    freeFloatShares <= 100 &&
     freeFloatPercent !==
       null &&
-    freeFloatPercent >
-      100
+    freeFloatPercent > 100
   ) {
     const swap =
       freeFloatShares;
@@ -947,8 +1265,7 @@ function parsePSXCompanyPage(
       null &&
     freeFloatShares !==
       null &&
-    freeFloatShares <=
-      100
+    freeFloatShares <= 100
   ) {
     freeFloatPercent =
       freeFloatShares;
@@ -959,7 +1276,9 @@ function parsePSXCompanyPage(
 
   return {
     symbol,
+
     companyName,
+
     sectorName,
 
     sourceUrl:
@@ -970,6 +1289,11 @@ function parsePSXCompanyPage(
     fetchedAt:
       new Date()
         .toISOString(),
+
+    quote:
+      parseOfficialQuoteStats(
+        lines
+      ),
 
     equity: {
       marketCapThousands,
@@ -982,12 +1306,16 @@ function parsePSXCompanyPage(
           : null,
 
       shares,
+
       freeFloatShares,
+
       freeFloatPercent
     },
 
     annual,
+
     quarterly,
+
     ratios,
 
     announcements:
@@ -995,7 +1323,7 @@ function parsePSXCompanyPage(
         tables
       ).slice(
         0,
-        25
+        30
       )
   };
 }
@@ -1066,9 +1394,9 @@ function rangeStartDate(
     );
 }
 
-/* --------------------------------------------------
+/* =========================================================
    HTTP
--------------------------------------------------- */
+========================================================= */
 
 async function fetchJSON(
   url,
@@ -1087,28 +1415,29 @@ async function fetchJSON(
         },
 
         signal:
-          AbortSignal
-            .timeout(
-              timeout
-            )
+          AbortSignal.timeout(
+            timeout
+          )
       }
     );
 
-  if (!response.ok) {
+  if (
+    !response.ok
+  ) {
     let message =
       `Data service returned HTTP ${response.status}.`;
 
     try {
       const body =
-        await response
-          .json();
+        await response.json();
 
       if (
         body?.error
           ?.message
       ) {
         message =
-          body.error
+          body
+            .error
             .message;
       }
 
@@ -1128,8 +1457,7 @@ async function fetchJSON(
     );
   }
 
-  return response
-    .json();
+  return response.json();
 }
 
 async function fetchText(
@@ -1146,28 +1474,28 @@ async function fetchText(
             'text/html,application/xhtml+xml',
 
           'User-Agent':
-            'Mozilla/5.0 NOMAD-Invest/0.5.0',
+            'Mozilla/5.0 NOMAD-Invest/0.6.0',
 
           ...headers
         },
 
         signal:
-          AbortSignal
-            .timeout(
-              timeout
-            )
+          AbortSignal.timeout(
+            timeout
+          )
       }
     );
 
-  if (!response.ok) {
+  if (
+    !response.ok
+  ) {
     bad(
       `Data service returned HTTP ${response.status}.`,
       response.status
     );
   }
 
-  return response
-    .text();
+  return response.text();
 }
 
 async function getPSXCompanySnapshot(
@@ -1185,10 +1513,9 @@ async function getPSXCompanySnapshot(
   }
 
   const cached =
-    companyPageCache
-      .get(
-        symbol
-      );
+    companyPageCache.get(
+      symbol
+    );
 
   if (
     cached &&
@@ -1219,23 +1546,22 @@ async function getPSXCompanySnapshot(
       symbol
     );
 
-  companyPageCache
-    .set(
-      symbol,
-      {
-        fetchedAt:
-          Date.now(),
+  companyPageCache.set(
+    symbol,
+    {
+      fetchedAt:
+        Date.now(),
 
-        data
-      }
-    );
+      data
+    }
+  );
 
   return data;
 }
 
-/* --------------------------------------------------
-   PYPSX MARKET DATA
--------------------------------------------------- */
+/* =========================================================
+   PYPSX
+========================================================= */
 
 function pyPSXHeaders() {
   if (
@@ -1399,8 +1725,7 @@ function pyPSXTimeValue(
     return value >
       100000000000
         ? value
-        : value *
-          1000;
+        : value * 1000;
   }
 
   const parsed =
@@ -1408,12 +1733,11 @@ function pyPSXTimeValue(
       value
     );
 
-  return Number
-    .isFinite(
-      parsed
-    )
-      ? parsed
-      : 0;
+  return Number.isFinite(
+    parsed
+  )
+    ? parsed
+    : 0;
 }
 
 function karachiDateKey(
@@ -1429,23 +1753,22 @@ function karachiDateKey(
   }
 
   const parts =
-    new Intl
-      .DateTimeFormat(
-        'en-US',
-        {
-          timeZone:
-            'Asia/Karachi',
+    new Intl.DateTimeFormat(
+      'en-US',
+      {
+        timeZone:
+          'Asia/Karachi',
 
-          year:
-            'numeric',
+        year:
+          'numeric',
 
-          month:
-            '2-digit',
+        month:
+          '2-digit',
 
-          day:
-            '2-digit'
-        }
-      )
+        day:
+          '2-digit'
+      }
+    )
       .formatToParts(
         new Date(
           timestamp
@@ -1458,7 +1781,8 @@ function karachiDateKey(
         part =>
           part.type ===
           type
-      )?.value || '';
+      )?.value ||
+      '';
 
   return (
     get('year') +
@@ -1494,11 +1818,9 @@ async function getPyPSXMarketStatus() {
 
       statusText:
         String(
-          result
-            ?.status_text ||
+          result?.status_text ||
           (
-            result
-              ?.is_open ===
+            result?.is_open ===
             true
               ? 'Market Open'
               : 'Market Closed'
@@ -1506,8 +1828,7 @@ async function getPyPSXMarketStatus() {
         ),
 
       holidayName:
-        result
-          ?.holiday_name ||
+        result?.holiday_name ||
         null
     };
   } catch {
@@ -1569,8 +1890,7 @@ async function getPyPSXIntraday(
       )
       .filter(
         row =>
-          row.close !==
-            null &&
+          row.close !== null &&
           row.close > 0 &&
           pyPSXTimeValue(
             row.timestamp
@@ -1589,7 +1909,9 @@ async function getPyPSXIntraday(
           )
       );
 
-  if (!rows.length) {
+  if (
+    !rows.length
+  ) {
     bad(
       `pyPSX returned no intraday price data for ${symbol}.`,
       502
@@ -1598,8 +1920,7 @@ async function getPyPSXIntraday(
 
   const latest =
     rows[
-      rows.length -
-      1
+      rows.length - 1
     ];
 
   const latestSessionKey =
@@ -1642,8 +1963,7 @@ async function getPyPSXIntraday(
   if (
     marketStatus.known &&
     marketStatus.isOpen &&
-    ageSeconds <=
-      180
+    ageSeconds <= 180
   ) {
     feedState =
       'LIVE';
@@ -1700,7 +2020,8 @@ async function getPyPSXIntraday(
               pyPSXTimeValue(
                 row.timestamp
               )
-            ).toISOString(),
+            )
+              .toISOString(),
 
           open,
 
@@ -1754,7 +2075,9 @@ async function getPyPSXIntraday(
       '1-minute intraday candles',
 
     marketStatus,
+
     feedState,
+
     feedLabel,
 
     price:
@@ -1763,7 +2086,8 @@ async function getPyPSXIntraday(
     timestamp:
       new Date(
         latestTimestamp
-      ).toISOString(),
+      )
+        .toISOString(),
 
     ageSeconds,
 
@@ -1781,26 +2105,22 @@ async function getPyPSXIntraday(
         null,
 
       high:
-        normalizedSessionRows
-          .length
+        normalizedSessionRows.length
           ? Math.max(
-              ...normalizedSessionRows
-                .map(
-                  row =>
-                    row.high
-                )
+              ...normalizedSessionRows.map(
+                row =>
+                  row.high
+              )
             )
           : null,
 
       low:
-        normalizedSessionRows
-          .length
+        normalizedSessionRows.length
           ? Math.min(
-              ...normalizedSessionRows
-                .map(
-                  row =>
-                    row.low
-                )
+              ...normalizedSessionRows.map(
+                row =>
+                  row.low
+              )
             )
           : null,
 
@@ -1811,8 +2131,7 @@ async function getPyPSXIntraday(
         totalVolume,
 
       candles:
-        normalizedSessionRows
-          .length
+        normalizedSessionRows.length
     },
 
     data:
@@ -1820,9 +2139,9 @@ async function getPyPSXIntraday(
   };
 }
 
-/* --------------------------------------------------
+/* =========================================================
    COMPANY / SECTOR METADATA
--------------------------------------------------- */
+========================================================= */
 
 async function loadOfficialSymbolsMap() {
   const map =
@@ -1835,7 +2154,7 @@ async function loadOfficialSymbolsMap() {
         30000,
         {
           'User-Agent':
-            'Mozilla/5.0 NOMAD-Invest/0.5.0',
+            'Mozilla/5.0 NOMAD-Invest/0.6.0',
 
           Referer:
             `${PSX_DPS_BASE}/`,
@@ -1966,8 +2285,7 @@ async function loadCompanyMap() {
       }
 
       if (
-        cells.length <
-        2
+        cells.length < 2
       ) {
         continue;
       }
@@ -1988,8 +2306,7 @@ async function loadCompanyMap() {
         !name ||
         symbol ===
           'SYMBOL' ||
-        name
-          .toLowerCase() ===
+        name.toLowerCase() ===
           'name'
       ) {
         continue;
@@ -2017,13 +2334,11 @@ async function loadCompanyMap() {
                 : name,
 
             sector:
-              existing
-                ?.sector ||
+              existing?.sector ||
               '',
 
             source:
-              existing
-                ?.source ||
+              existing?.source ||
               'PSX eligible scrips'
           }
         );
@@ -2104,16 +2419,14 @@ async function loadCompanyMap() {
               : name,
 
           sector:
-            existing
-              ?.sector ||
+            existing?.sector ||
             String(
               row.sector ||
               ''
             ).trim(),
 
           source:
-            existing
-              ?.source ||
+            existing?.source ||
             'pyPSX symbols'
         }
       );
@@ -2179,13 +2492,11 @@ async function loadCompanyMap() {
               : fallbackName,
 
           sector:
-            existing
-              ?.sector ||
+            existing?.sector ||
             fallbackSector,
 
           source:
-            existing
-              ?.source ||
+            existing?.source ||
             'psx-rest-api'
         }
       );
@@ -2262,7 +2573,9 @@ async function loadSectorMap() {
             ''
           ).trim();
 
-        if (!sectorName) {
+        if (
+          !sectorName
+        ) {
           continue;
         }
 
@@ -2326,9 +2639,9 @@ async function loadSectorMap() {
   return map;
 }
 
-/* --------------------------------------------------
-   SCREENER / MARKET
--------------------------------------------------- */
+/* =========================================================
+   MARKET
+========================================================= */
 
 function normalizeScreenerRow(
   row,
@@ -2362,6 +2675,11 @@ function normalizeScreenerRow(
       symbol
     );
 
+  const pe =
+    safeNumber(
+      row.pe_ratio
+    );
+
   return {
     symbol,
 
@@ -2390,14 +2708,22 @@ function normalizeScreenerRow(
     price,
 
     peRatio:
-      safeNumber(
-        row.pe_ratio
-      ),
+      pe !== null &&
+      pe > 0
+        ? pe
+        : null,
 
     dividendYield:
-      safeNumber(
-        row.dividend_yield
-      ),
+      row.dividend_yield ===
+        null ||
+      row.dividend_yield ===
+        undefined ||
+      row.dividend_yield ===
+        ''
+        ? null
+        : safeNumber(
+            row.dividend_yield
+          ),
 
     marketCap:
       safeNumber(
@@ -2463,9 +2789,7 @@ async function loadPSXMarket() {
 
   const timestamp =
     normalizeTimestamp(
-      screener
-        ?.meta
-        ?.timestamp
+      screener?.meta?.timestamp
     );
 
   const stocks =
@@ -2479,11 +2803,11 @@ async function loadPSXMarket() {
             timestamp
           )
       )
-      .filter(
-        Boolean
-      );
+      .filter(Boolean);
 
-  if (!stocks.length) {
+  if (
+    !stocks.length
+  ) {
     bad(
       'No usable PSX market records were returned.',
       502
@@ -2534,9 +2858,117 @@ async function loadPSXMarket() {
   return result;
 }
 
-/* --------------------------------------------------
-   STOCK QUOTE / DECISION OVERVIEW
--------------------------------------------------- */
+/* =========================================================
+   HISTORICAL NORMALIZATION
+========================================================= */
+
+function normalizeHistoricalRows(
+  rawRows
+) {
+  const cleaned = [];
+  const anomalies = [];
+
+  for (
+    const row
+    of (
+      Array.isArray(
+        rawRows
+      )
+        ? rawRows
+        : []
+    )
+  ) {
+    const date =
+      String(
+        row.date ||
+        ''
+      );
+
+    const open =
+      safeNumber(
+        row.open
+      );
+
+    const high =
+      safeNumber(
+        row.high
+      );
+
+    const low =
+      safeNumber(
+        row.low
+      );
+
+    const close =
+      safeNumber(
+        row.close
+      );
+
+    const volume =
+      safeNumber(
+        row.volume
+      );
+
+    const suspicious =
+      row.is_anomaly ===
+        true ||
+      !date ||
+      close === null ||
+      close <= 0 ||
+      open === null ||
+      high === null ||
+      low === null ||
+      open <= 0 ||
+      high <= 0 ||
+      low <= 0;
+
+    const normalized = {
+      date,
+      open,
+      high,
+      low,
+      close,
+
+      volume:
+        volume ||
+        0,
+
+      isAnomaly:
+        suspicious
+    };
+
+    if (
+      suspicious
+    ) {
+      anomalies.push(
+        normalized
+      );
+    } else {
+      cleaned.push(
+        normalized
+      );
+    }
+  }
+
+  cleaned.sort(
+    (
+      a,
+      b
+    ) =>
+      a.date.localeCompare(
+        b.date
+      )
+  );
+
+  return {
+    cleaned,
+    anomalies
+  };
+}
+
+/* =========================================================
+   QUOTE / OVERVIEW
+========================================================= */
 
 async function getQuote(
   stockSymbol
@@ -2558,7 +2990,7 @@ async function getQuote(
   const historyStartDate =
     new Date(
       now.getTime() -
-      370 *
+      380 *
       24 *
       60 *
       60 *
@@ -2636,6 +3068,56 @@ async function getQuote(
     result.data ||
     {};
 
+  const officialQuote =
+    companySnapshot?.quote ||
+    {};
+
+  const historical =
+    normalizeHistoricalRows(
+      historyResult?.data ||
+      []
+    ).cleaned;
+
+  const liveSessionDate =
+    liveResult?.sessionDate ||
+    '';
+
+  const officialSessionDate =
+    officialQuote?.asOfDateKey ||
+    '';
+
+  const officialMatchesSession =
+    Boolean(
+      officialSessionDate &&
+      (
+        !liveSessionDate ||
+        officialSessionDate ===
+          liveSessionDate
+      )
+    );
+
+  const marketClosed =
+    Boolean(
+      liveResult?.marketStatus?.known &&
+      !liveResult.marketStatus.isOpen
+    );
+
+  const useOfficialSession =
+    Boolean(
+      marketClosed &&
+      officialMatchesSession &&
+      (
+        officialQuote.open !==
+          null ||
+        officialQuote.high !==
+          null ||
+        officialQuote.low !==
+          null ||
+        officialQuote.volume !==
+          null
+      )
+    );
+
   const quotePrice =
     safeNumber(
       data.price
@@ -2645,16 +3127,51 @@ async function getQuote(
     safeNumber(
       liveResult?.price
     ) ??
+    safeNumber(
+      officialQuote?.price
+    ) ??
     quotePrice;
 
-  let dayChangePct =
-    safeNumber(
-      data.change_pct
-    );
+  let historicalPreviousClose =
+    null;
+
+  const targetSessionDate =
+    liveSessionDate ||
+    officialSessionDate;
+
+  if (
+    targetSessionDate
+  ) {
+    const previousRows =
+      historical.filter(
+        row =>
+          row.date <
+          targetSessionDate
+      );
+
+    if (
+      previousRows.length
+    ) {
+      historicalPreviousClose =
+        previousRows[
+          previousRows.length -
+          1
+        ].close;
+    }
+  }
 
   let previousClose =
     safeNumber(
+      officialQuote.ldcp
+    ) ??
+    safeNumber(
       data.ldcp
+    ) ??
+    historicalPreviousClose;
+
+  const sourceChangePct =
+    safeNumber(
+      data.change_pct
     );
 
   if (
@@ -2662,12 +3179,12 @@ async function getQuote(
       null &&
     quotePrice !==
       null &&
-    dayChangePct !==
+    sourceChangePct !==
       null
   ) {
     const denominator =
       1 +
-      dayChangePct /
+      sourceChangePct /
       100;
 
     if (
@@ -2686,114 +3203,108 @@ async function getQuote(
   }
 
   let dayChange =
-    safeNumber(
-      data.change
-    );
+    null;
+
+  let dayChangePct =
+    null;
 
   if (
-    dayChange ===
-      null &&
     currentPrice !==
-      null &&
-    previousClose !==
-      null
-  ) {
-    dayChange =
-      currentPrice -
-      previousClose;
-  }
-
-  if (
-    dayChangePct ===
-      null &&
-    dayChange !==
       null &&
     previousClose !==
       null &&
     previousClose !==
       0
   ) {
+    dayChange =
+      currentPrice -
+      previousClose;
+
     dayChangePct =
       (
         dayChange /
         previousClose
       ) *
       100;
+  } else {
+    dayChange =
+      safeNumber(
+        data.change
+      );
+
+    dayChangePct =
+      sourceChangePct;
   }
 
-  const historicalRows =
-    Array.isArray(
-      historyResult?.data
-    )
-      ? historyResult.data
-          .map(
-            row => ({
-              date:
-                String(
-                  row.date ||
-                  ''
-                ),
+  const session =
+    useOfficialSession
+      ? {
+          open:
+            officialQuote.open ??
+            liveResult?.session?.open ??
+            null,
 
-              close:
-                safeNumber(
-                  row.close
-                ),
+          high:
+            officialQuote.high ??
+            liveResult?.session?.high ??
+            null,
 
-              high:
-                safeNumber(
-                  row.high
-                ),
+          low:
+            officialQuote.low ??
+            liveResult?.session?.low ??
+            null,
 
-              low:
-                safeNumber(
-                  row.low
-                ),
+          close:
+            currentPrice,
 
-              isAnomaly:
-                row.is_anomaly ===
-                true
-            })
-          )
-          .filter(
-            row =>
-              row.date &&
-              !row.isAnomaly &&
-              row.close !==
-                null &&
-              row.close > 0 &&
-              row.high !==
-                null &&
-              row.high > 0 &&
-              row.low !==
-                null &&
-              row.low > 0
-          )
-          .sort(
-            (
-              a,
-              b
-            ) =>
-              a.date
-                .localeCompare(
-                  b.date
-                )
-          )
-      : [];
+          volume:
+            officialQuote.volume ??
+            liveResult?.session?.volume ??
+            null,
+
+          candles:
+            liveResult?.session?.candles ??
+            null
+        }
+      : (
+          liveResult?.session ||
+          {
+            open:
+              officialQuote.open ??
+              null,
+
+            high:
+              officialQuote.high ??
+              null,
+
+            low:
+              officialQuote.low ??
+              null,
+
+            close:
+              currentPrice,
+
+            volume:
+              officialQuote.volume ??
+              null,
+
+            candles:
+              null
+          }
+        );
 
   const ytdStartKey =
     `${now.getUTCFullYear()}-01-01`;
 
   const ytdRows =
-    historicalRows
-      .filter(
-        row =>
-          row.date >=
-          ytdStartKey
-      );
+    historical.filter(
+      row =>
+        row.date >=
+        ytdStartKey
+    );
 
   const ytdStartClose =
-    ytdRows[0]
-      ?.close ??
+    ytdRows[0]?.close ??
     null;
 
   const ytdChangePct =
@@ -2829,32 +3340,29 @@ async function getQuote(
       );
 
   const range52Rows =
-    historicalRows
-      .filter(
-        row =>
-          row.date >=
-          range52StartKey
-      );
+    historical.filter(
+      row =>
+        row.date >=
+        range52StartKey
+    );
 
   const range52High =
     range52Rows.length
       ? Math.max(
-          ...range52Rows
-            .map(
-              row =>
-                row.high
-            )
+          ...range52Rows.map(
+            row =>
+              row.high
+          )
         )
       : null;
 
   const range52Low =
     range52Rows.length
       ? Math.min(
-          ...range52Rows
-            .map(
-              row =>
-                row.low
-            )
+          ...range52Rows.map(
+            row =>
+              row.low
+          )
         )
       : null;
 
@@ -2865,9 +3373,7 @@ async function getQuote(
 
   const sessionVolume =
     safeNumber(
-      liveResult
-        ?.session
-        ?.volume
+      session?.volume
     );
 
   const volumeVsAveragePct =
@@ -2875,8 +3381,7 @@ async function getQuote(
       null &&
     averageVolume30d !==
       null &&
-    averageVolume30d >
-      0
+    averageVolume30d > 0
       ? (
           sessionVolume /
           averageVolume30d
@@ -2885,19 +3390,64 @@ async function getQuote(
       : null;
 
   const resolvedName =
-    companySnapshot
-      ?.companyName ||
+    companySnapshot?.companyName ||
     company?.name ||
     symbol;
 
   const resolvedSector =
-    companySnapshot
-      ?.sectorName ||
+    companySnapshot?.sectorName ||
     company?.sector ||
     sectorMap.get(
       symbol
     ) ||
     '';
+
+  const officialMarketCap =
+    companySnapshot
+      ?.equity
+      ?.marketCapPkr ??
+    safeNumber(
+      data.market_cap
+    );
+
+  const shares =
+    companySnapshot
+      ?.equity
+      ?.shares ??
+    null;
+
+  const estimatedMarketCap =
+    officialMarketCap ===
+      null &&
+    currentPrice !==
+      null &&
+    shares !==
+      null &&
+    shares > 0
+      ? currentPrice *
+        shares
+      : null;
+
+  const marketCapPkr =
+    officialMarketCap ??
+    estimatedMarketCap;
+
+  const marketCapSource =
+    officialMarketCap !==
+      null
+      ? 'official'
+      : estimatedMarketCap !==
+        null
+        ? 'estimated'
+        : null;
+
+  const peRaw =
+    safeNumber(
+      data.pe_ratio
+    ) ??
+    safeNumber(
+      officialQuote.peRatio
+    );
 
   return {
     symbol,
@@ -2925,16 +3475,16 @@ async function getQuote(
       companySnapshot
         ? {
             equity:
-              companySnapshot
-                .equity,
+              companySnapshot.equity,
+
+            quote:
+              companySnapshot.quote,
 
             sourceUrl:
-              companySnapshot
-                .sourceUrl,
+              companySnapshot.sourceUrl,
 
             fetchedAt:
-              companySnapshot
-                .fetchedAt
+              companySnapshot.fetchedAt
           }
         : null,
 
@@ -2948,32 +3498,33 @@ async function getQuote(
 
       dayChangePct,
 
-      session:
-        liveResult
-          ?.session ||
-        null,
+      session,
+
+      sessionSource:
+        useOfficialSession
+          ? 'PSX Data Portal'
+          : liveResult
+            ? 'pyPSX'
+            : companySnapshot
+              ? 'PSX Data Portal'
+              : null,
 
       marketStatus:
-        liveResult
-          ?.marketStatus ||
+        liveResult?.marketStatus ||
         null,
 
       feedState:
-        liveResult
-          ?.feedState ||
+        liveResult?.feedState ||
         null,
 
       feedLabel:
-        liveResult
-          ?.feedLabel ||
+        liveResult?.feedLabel ||
         null,
 
       priceTimestamp:
-        liveResult
-          ?.timestamp ||
-        result
-          ?.meta
-          ?.timestamp ||
+        liveResult?.timestamp ||
+        officialQuote?.asOf ||
+        result?.meta?.timestamp ||
         null,
 
       ytdChangePct,
@@ -2992,19 +3543,11 @@ async function getQuote(
       },
 
       peRatio:
-        (() => {
-          const pe =
-            safeNumber(
-              data.pe_ratio
-            );
-
-          return (
-            pe !== null &&
-            pe > 0
-          )
-            ? pe
-            : null;
-        })(),
+        peRaw !==
+          null &&
+        peRaw > 0
+          ? peRaw
+          : null,
 
       dividendYield:
         data.dividend_yield ===
@@ -3024,19 +3567,11 @@ async function getQuote(
 
       volumeVsAveragePct,
 
-      marketCapPkr:
-        companySnapshot
-          ?.equity
-          ?.marketCapPkr ??
-        safeNumber(
-          data.market_cap
-        ),
+      marketCapPkr,
 
-      shares:
-        companySnapshot
-          ?.equity
-          ?.shares ??
-        null,
+      marketCapSource,
+
+      shares,
 
       freeFloatShares:
         companySnapshot
@@ -3055,9 +3590,9 @@ async function getQuote(
   };
 }
 
-/* --------------------------------------------------
+/* =========================================================
    HISTORY
--------------------------------------------------- */
+========================================================= */
 
 async function getHistory(
   stockSymbol,
@@ -3075,16 +3610,15 @@ async function getHistory(
       '1Y',
       '2Y',
       'ALL'
-    ]
-      .includes(
-        String(
-          range || ''
+    ].includes(
+      String(
+        range || ''
+      ).toUpperCase()
+    )
+      ? String(
+          range
         ).toUpperCase()
-      )
-        ? String(
-            range
-          ).toUpperCase()
-        : '1Y';
+      : '1Y';
 
   if (!symbol) {
     bad(
@@ -3120,9 +3654,6 @@ async function getHistory(
     end
   );
 
-  const query =
-    params.toString();
-
   const [
     result,
     companyMap,
@@ -3132,11 +3663,7 @@ async function getHistory(
       fetchJSON(
         `${PSX_API_BASE}/stocks/${encodeURIComponent(
           symbol
-        )}/historical${
-          query
-            ? `?${query}`
-            : ''
-        }`
+        )}/historical?${params.toString()}`
       ),
 
       loadCompanyMap(),
@@ -3144,116 +3671,30 @@ async function getHistory(
       loadSectorMap()
     ]);
 
-  const rawRows =
-    Array.isArray(
-      result.data
-    )
-      ? result.data
-      : [];
+  const normalized =
+    normalizeHistoricalRows(
+      result.data ||
+      []
+    );
 
-  const cleaned = [];
-  const anomalies = [];
+  const cleaned =
+    normalized.cleaned;
 
-  for (
-    const row
-    of rawRows
-  ) {
-    const date =
-      row.date;
-
-    const open =
-      safeNumber(
-        row.open
-      );
-
-    const high =
-      safeNumber(
-        row.high
-      );
-
-    const low =
-      safeNumber(
-        row.low
-      );
-
-    const close =
-      safeNumber(
-        row.close
-      );
-
-    const volume =
-      safeNumber(
-        row.volume
-      );
-
-    const suspicious =
-      row.is_anomaly ===
-        true ||
-      !date ||
-      close === null ||
-      close <= 0 ||
-      open === null ||
-      high === null ||
-      low === null ||
-      open <= 0 ||
-      high <= 0 ||
-      low <= 0;
-
-    const normalized = {
-      date,
-      open,
-      high,
-      low,
-      close,
-
-      volume:
-        volume ||
-        0,
-
-      isAnomaly:
-        suspicious
-    };
-
-    if (suspicious) {
-      anomalies.push(
-        normalized
-      );
-    } else {
-      cleaned.push(
-        normalized
-      );
-    }
-  }
-
-  cleaned.sort(
-    (
-      a,
-      b
-    ) =>
-      String(
-        a.date
-      )
-        .localeCompare(
-          String(
-            b.date
-          )
-        )
-  );
+  const anomalies =
+    normalized.anomalies;
 
   let summary =
     null;
 
   if (
-    cleaned.length >=
-    1
+    cleaned.length >= 1
   ) {
     const first =
       cleaned[0];
 
     const last =
       cleaned[
-        cleaned.length -
-        1
+        cleaned.length - 1
       ];
 
     const highs =
@@ -3387,9 +3828,9 @@ async function getHistory(
   };
 }
 
-/* --------------------------------------------------
-   FUNDAMENTALS / EVENTS
--------------------------------------------------- */
+/* =========================================================
+   FUNDAMENTALS
+========================================================= */
 
 async function getFundamentals(
   stockSymbol
@@ -3464,14 +3905,12 @@ async function getFundamentals(
       ...(company || {}),
 
       name:
-        snapshot
-          ?.companyName ||
+        snapshot?.companyName ||
         company?.name ||
         symbol,
 
       sector:
-        snapshot
-          ?.sectorName ||
+        snapshot?.sectorName ||
         company?.sector ||
         sectorMap.get(
           symbol
@@ -3485,19 +3924,18 @@ async function getFundamentals(
         : 'Unavailable',
 
     sourceUrl:
-      snapshot
-        ?.sourceUrl ||
+      snapshot?.sourceUrl ||
       null,
 
     fetchedAt:
-      snapshot
-        ?.fetchedAt ||
+      snapshot?.fetchedAt ||
       new Date()
         .toISOString(),
 
     valuation: {
       peRatio:
-        pe !== null &&
+        pe !==
+          null &&
         pe > 0
           ? pe
           : null,
@@ -3534,18 +3972,15 @@ async function getFundamentals(
     },
 
     annual:
-      snapshot
-        ?.annual ||
+      snapshot?.annual ||
       null,
 
     quarterly:
-      snapshot
-        ?.quarterly ||
+      snapshot?.quarterly ||
       null,
 
     ratios:
-      snapshot
-        ?.ratios ||
+      snapshot?.ratios ||
       null,
 
     available:
@@ -3559,6 +3994,10 @@ async function getFundamentals(
       )
   };
 }
+
+/* =========================================================
+   EVENTS
+========================================================= */
 
 async function getEvents(
   stockSymbol
@@ -3603,14 +4042,12 @@ async function getEvents(
       ...(company || {}),
 
       name:
-        snapshot
-          ?.companyName ||
+        snapshot?.companyName ||
         company?.name ||
         symbol,
 
       sector:
-        snapshot
-          ?.sectorName ||
+        snapshot?.sectorName ||
         company?.sector ||
         sectorMap.get(
           symbol
@@ -3624,26 +4061,1305 @@ async function getEvents(
         : 'Unavailable',
 
     sourceUrl:
-      snapshot
-        ?.sourceUrl ||
+      snapshot?.sourceUrl ||
       null,
 
     fetchedAt:
-      snapshot
-        ?.fetchedAt ||
+      snapshot?.fetchedAt ||
       new Date()
         .toISOString(),
 
     events:
-      snapshot
-        ?.announcements ||
+      snapshot?.announcements ||
       []
   };
 }
 
-/* --------------------------------------------------
+/* =========================================================
+   TECHNICAL ANALYSIS
+========================================================= */
+
+function mean(values) {
+  const valid =
+    values.filter(
+      value =>
+        Number.isFinite(
+          value
+        )
+    );
+
+  if (
+    !valid.length
+  ) {
+    return null;
+  }
+
+  return valid.reduce(
+    (
+      sum,
+      value
+    ) =>
+      sum +
+      value,
+    0
+  ) /
+  valid.length;
+}
+
+function standardDeviation(
+  values
+) {
+  const valid =
+    values.filter(
+      value =>
+        Number.isFinite(
+          value
+        )
+    );
+
+  if (
+    !valid.length
+  ) {
+    return null;
+  }
+
+  const average =
+    mean(valid);
+
+  const variance =
+    valid.reduce(
+      (
+        sum,
+        value
+      ) =>
+        sum +
+        Math.pow(
+          value -
+          average,
+          2
+        ),
+      0
+    ) /
+    valid.length;
+
+  return Math.sqrt(
+    variance
+  );
+}
+
+function smaSeries(
+  values,
+  period
+) {
+  const output =
+    Array(
+      values.length
+    ).fill(null);
+
+  let rolling = 0;
+
+  for (
+    let index = 0;
+    index < values.length;
+    index++
+  ) {
+    rolling +=
+      values[index];
+
+    if (
+      index >=
+      period
+    ) {
+      rolling -=
+        values[
+          index -
+          period
+        ];
+    }
+
+    if (
+      index >=
+      period - 1
+    ) {
+      output[index] =
+        rolling /
+        period;
+    }
+  }
+
+  return output;
+}
+
+function emaSeries(
+  values,
+  period
+) {
+  const output =
+    Array(
+      values.length
+    ).fill(null);
+
+  if (
+    values.length <
+    period
+  ) {
+    return output;
+  }
+
+  const seed =
+    mean(
+      values.slice(
+        0,
+        period
+      )
+    );
+
+  if (
+    seed === null
+  ) {
+    return output;
+  }
+
+  const multiplier =
+    2 /
+    (
+      period +
+      1
+    );
+
+  let previous =
+    seed;
+
+  output[
+    period - 1
+  ] =
+    seed;
+
+  for (
+    let index =
+      period;
+
+    index <
+      values.length;
+
+    index++
+  ) {
+    previous =
+      (
+        values[index] -
+        previous
+      ) *
+      multiplier +
+      previous;
+
+    output[index] =
+      previous;
+  }
+
+  return output;
+}
+
+function rsiSeries(
+  closes,
+  period = 14
+) {
+  const output =
+    Array(
+      closes.length
+    ).fill(null);
+
+  if (
+    closes.length <=
+    period
+  ) {
+    return output;
+  }
+
+  let gainTotal = 0;
+  let lossTotal = 0;
+
+  for (
+    let index = 1;
+    index <= period;
+    index++
+  ) {
+    const change =
+      closes[index] -
+      closes[
+        index - 1
+      ];
+
+    gainTotal +=
+      Math.max(
+        change,
+        0
+      );
+
+    lossTotal +=
+      Math.max(
+        -change,
+        0
+      );
+  }
+
+  let averageGain =
+    gainTotal /
+    period;
+
+  let averageLoss =
+    lossTotal /
+    period;
+
+  const calculate =
+    () => {
+      if (
+        averageLoss === 0
+      ) {
+        return 100;
+      }
+
+      const rs =
+        averageGain /
+        averageLoss;
+
+      return (
+        100 -
+        (
+          100 /
+          (
+            1 +
+            rs
+          )
+        )
+      );
+    };
+
+  output[period] =
+    calculate();
+
+  for (
+    let index =
+      period + 1;
+
+    index <
+      closes.length;
+
+    index++
+  ) {
+    const change =
+      closes[index] -
+      closes[
+        index - 1
+      ];
+
+    const gain =
+      Math.max(
+        change,
+        0
+      );
+
+    const loss =
+      Math.max(
+        -change,
+        0
+      );
+
+    averageGain =
+      (
+        averageGain *
+        (
+          period -
+          1
+        ) +
+        gain
+      ) /
+      period;
+
+    averageLoss =
+      (
+        averageLoss *
+        (
+          period -
+          1
+        ) +
+        loss
+      ) /
+      period;
+
+    output[index] =
+      calculate();
+  }
+
+  return output;
+}
+
+function atrSeries(
+  rows,
+  period = 14
+) {
+  const output =
+    Array(
+      rows.length
+    ).fill(null);
+
+  if (
+    rows.length <
+    period
+  ) {
+    return output;
+  }
+
+  const trueRanges =
+    rows.map(
+      (
+        row,
+        index
+      ) => {
+        if (
+          index === 0
+        ) {
+          return (
+            row.high -
+            row.low
+          );
+        }
+
+        const previousClose =
+          rows[
+            index - 1
+          ].close;
+
+        return Math.max(
+          row.high -
+          row.low,
+
+          Math.abs(
+            row.high -
+            previousClose
+          ),
+
+          Math.abs(
+            row.low -
+            previousClose
+          )
+        );
+      }
+    );
+
+  let previousATR =
+    mean(
+      trueRanges.slice(
+        0,
+        period
+      )
+    );
+
+  output[
+    period - 1
+  ] =
+    previousATR;
+
+  for (
+    let index =
+      period;
+
+    index <
+      rows.length;
+
+    index++
+  ) {
+    previousATR =
+      (
+        previousATR *
+        (
+          period -
+          1
+        ) +
+        trueRanges[index]
+      ) /
+      period;
+
+    output[index] =
+      previousATR;
+  }
+
+  return output;
+}
+
+function macdSeries(
+  closes
+) {
+  const ema12 =
+    emaSeries(
+      closes,
+      12
+    );
+
+  const ema26 =
+    emaSeries(
+      closes,
+      26
+    );
+
+  const macd =
+    Array(
+      closes.length
+    ).fill(null);
+
+  const validMacd = [];
+  const validIndexes = [];
+
+  for (
+    let index = 0;
+    index < closes.length;
+    index++
+  ) {
+    if (
+      ema12[index] !==
+        null &&
+      ema26[index] !==
+        null
+    ) {
+      macd[index] =
+        ema12[index] -
+        ema26[index];
+
+      validMacd.push(
+        macd[index]
+      );
+
+      validIndexes.push(
+        index
+      );
+    }
+  }
+
+  const validSignal =
+    emaSeries(
+      validMacd,
+      9
+    );
+
+  const signal =
+    Array(
+      closes.length
+    ).fill(null);
+
+  const histogram =
+    Array(
+      closes.length
+    ).fill(null);
+
+  for (
+    let index = 0;
+    index < validIndexes.length;
+    index++
+  ) {
+    const originalIndex =
+      validIndexes[index];
+
+    if (
+      validSignal[index] !==
+      null
+    ) {
+      signal[
+        originalIndex
+      ] =
+        validSignal[index];
+
+      histogram[
+        originalIndex
+      ] =
+        macd[
+          originalIndex
+        ] -
+        validSignal[index];
+    }
+  }
+
+  return {
+    ema12,
+    ema26,
+    macd,
+    signal,
+    histogram
+  };
+}
+
+function getTrendLabel(
+  close,
+  sma20,
+  sma50,
+  sma200
+) {
+  if (
+    [
+      close,
+      sma20,
+      sma50,
+      sma200
+    ].every(
+      value =>
+        Number.isFinite(
+          value
+        )
+    )
+  ) {
+    if (
+      close >
+        sma20 &&
+      sma20 >
+        sma50 &&
+      sma50 >
+        sma200
+    ) {
+      return 'Strong uptrend';
+    }
+
+    if (
+      close <
+        sma20 &&
+      sma20 <
+        sma50 &&
+      sma50 <
+        sma200
+    ) {
+      return 'Strong downtrend';
+    }
+  }
+
+  if (
+    Number.isFinite(
+      sma20
+    ) &&
+    Number.isFinite(
+      sma50
+    )
+  ) {
+    if (
+      close >
+        sma20 &&
+      sma20 >
+        sma50
+    ) {
+      return 'Uptrend';
+    }
+
+    if (
+      close <
+        sma20 &&
+      sma20 <
+        sma50
+    ) {
+      return 'Downtrend';
+    }
+  }
+
+  return 'Mixed / sideways';
+}
+
+function getRSILabel(rsi) {
+  if (
+    !Number.isFinite(
+      rsi
+    )
+  ) {
+    return 'Unavailable';
+  }
+
+  if (
+    rsi >= 70
+  ) {
+    return 'Overbought zone';
+  }
+
+  if (
+    rsi <= 30
+  ) {
+    return 'Oversold zone';
+  }
+
+  if (
+    rsi >= 55
+  ) {
+    return 'Positive momentum';
+  }
+
+  if (
+    rsi <= 45
+  ) {
+    return 'Negative momentum';
+  }
+
+  return 'Neutral momentum';
+}
+
+function getMACDLabel(
+  macd,
+  signal,
+  histogram
+) {
+  if (
+    ![
+      macd,
+      signal,
+      histogram
+    ].every(
+      value =>
+        Number.isFinite(
+          value
+        )
+    )
+  ) {
+    return 'Unavailable';
+  }
+
+  if (
+    macd >
+      signal &&
+    histogram > 0
+  ) {
+    return 'Positive momentum';
+  }
+
+  if (
+    macd <
+      signal &&
+    histogram < 0
+  ) {
+    return 'Negative momentum';
+  }
+
+  return 'Neutral / crossover';
+}
+
+function getVolumeLabel(
+  ratio
+) {
+  if (
+    !Number.isFinite(
+      ratio
+    )
+  ) {
+    return 'Unavailable';
+  }
+
+  if (
+    ratio >= 1.5
+  ) {
+    return 'High participation';
+  }
+
+  if (
+    ratio <= 0.5
+  ) {
+    return 'Low participation';
+  }
+
+  return 'Normal participation';
+}
+
+async function getTechnicalAnalysis(
+  stockSymbol
+) {
+  const symbol =
+    normalizeSymbol(
+      stockSymbol
+    );
+
+  if (!symbol) {
+    bad(
+      'Enter a PSX symbol.'
+    );
+  }
+
+  const now =
+    new Date();
+
+  const start =
+    new Date(
+      now.getTime() -
+      3 *
+      365 *
+      24 *
+      60 *
+      60 *
+      1000
+    )
+      .toISOString()
+      .slice(
+        0,
+        10
+      );
+
+  const end =
+    now
+      .toISOString()
+      .slice(
+        0,
+        10
+      );
+
+  const [
+    historyResult,
+    companyMap,
+    sectorMap
+  ] =
+    await Promise.all([
+      fetchJSON(
+        `${PSX_API_BASE}/stocks/${encodeURIComponent(
+          symbol
+        )}/historical?start=${start}&end=${end}`
+      ),
+
+      loadCompanyMap(),
+
+      loadSectorMap()
+    ]);
+
+  const normalized =
+    normalizeHistoricalRows(
+      historyResult.data ||
+      []
+    );
+
+  const rows =
+    normalized.cleaned;
+
+  if (
+    rows.length < 30
+  ) {
+    return {
+      symbol,
+
+      company:
+        companyMap.get(
+          symbol
+        ) || null,
+
+      available:
+        false,
+
+      reason:
+        'At least 30 valid trading sessions are required for technical analysis.',
+
+      dataQuality: {
+        validSessions:
+          rows.length,
+
+        excludedAnomalies:
+          normalized
+            .anomalies
+            .length
+      }
+    };
+  }
+
+  const closes =
+    rows.map(
+      row =>
+        row.close
+    );
+
+  const volumes =
+    rows.map(
+      row =>
+        row.volume ||
+        0
+    );
+
+  const sma20 =
+    smaSeries(
+      closes,
+      20
+    );
+
+  const sma50 =
+    smaSeries(
+      closes,
+      50
+    );
+
+  const sma200 =
+    smaSeries(
+      closes,
+      200
+    );
+
+  const rsi14 =
+    rsiSeries(
+      closes,
+      14
+    );
+
+  const atr14 =
+    atrSeries(
+      rows,
+      14
+    );
+
+  const macdResult =
+    macdSeries(
+      closes
+    );
+
+  const latestIndex =
+    rows.length -
+    1;
+
+  const latest =
+    rows[
+      latestIndex
+    ];
+
+  const latestClose =
+    latest.close;
+
+  const latestSMA20 =
+    sma20[
+      latestIndex
+    ];
+
+  const latestSMA50 =
+    sma50[
+      latestIndex
+    ];
+
+  const latestSMA200 =
+    sma200[
+      latestIndex
+    ];
+
+  const latestEMA12 =
+    macdResult
+      .ema12[
+        latestIndex
+      ];
+
+  const latestEMA26 =
+    macdResult
+      .ema26[
+        latestIndex
+      ];
+
+  const latestMACD =
+    macdResult
+      .macd[
+        latestIndex
+      ];
+
+  const latestSignal =
+    macdResult
+      .signal[
+        latestIndex
+      ];
+
+  const latestHistogram =
+    macdResult
+      .histogram[
+        latestIndex
+      ];
+
+  const latestRSI =
+    rsi14[
+      latestIndex
+    ];
+
+  const latestATR =
+    atr14[
+      latestIndex
+    ];
+
+  const atrPct =
+    latestATR !==
+      null &&
+    latestClose >
+      0
+      ? (
+          latestATR /
+          latestClose
+        ) *
+        100
+      : null;
+
+  const recentVolume =
+    volumes.slice(
+      -20
+    );
+
+  const averageVolume20 =
+    mean(
+      recentVolume
+    );
+
+  const latestVolume =
+    latest.volume ||
+    0;
+
+  const volumeRatio =
+    averageVolume20 !==
+      null &&
+    averageVolume20 > 0
+      ? latestVolume /
+        averageVolume20
+      : null;
+
+  const returns20 = [];
+
+  const returnRows =
+    rows.slice(
+      -21
+    );
+
+  for (
+    let index = 1;
+    index < returnRows.length;
+    index++
+  ) {
+    const previous =
+      returnRows[
+        index - 1
+      ].close;
+
+    const current =
+      returnRows[
+        index
+      ].close;
+
+    if (
+      previous > 0 &&
+      current > 0
+    ) {
+      returns20.push(
+        Math.log(
+          current /
+          previous
+        )
+      );
+    }
+  }
+
+  const dailyVolatility =
+    standardDeviation(
+      returns20
+    );
+
+  const annualizedVolatilityPct =
+    dailyVolatility !==
+      null
+      ? dailyVolatility *
+        Math.sqrt(
+          252
+        ) *
+        100
+      : null;
+
+  const recent20 =
+    rows.slice(
+      -20
+    );
+
+  const support =
+    recent20.length
+      ? Math.min(
+          ...recent20.map(
+            row =>
+              row.low
+          )
+        )
+      : null;
+
+  const resistance =
+    recent20.length
+      ? Math.max(
+          ...recent20.map(
+            row =>
+              row.high
+          )
+        )
+      : null;
+
+  const distanceToSupportPct =
+    support !==
+      null &&
+    support > 0
+      ? (
+          (
+            latestClose -
+            support
+          ) /
+          support
+        ) *
+        100
+      : null;
+
+  const distanceToResistancePct =
+    resistance !==
+      null &&
+    latestClose > 0
+      ? (
+          (
+            resistance -
+            latestClose
+          ) /
+          latestClose
+        ) *
+        100
+      : null;
+
+  const momentum20Pct =
+    rows.length >
+      20
+      ? (
+          (
+            latestClose -
+            rows[
+              rows.length -
+              21
+            ].close
+          ) /
+          rows[
+            rows.length -
+            21
+          ].close
+        ) *
+        100
+      : null;
+
+  const last252 =
+    rows.slice(
+      -252
+    );
+
+  const high52 =
+    last252.length
+      ? Math.max(
+          ...last252.map(
+            row =>
+              row.high
+          )
+        )
+      : null;
+
+  const low52 =
+    last252.length
+      ? Math.min(
+          ...last252.map(
+            row =>
+              row.low
+          )
+        )
+      : null;
+
+  const trendLabel =
+    getTrendLabel(
+      latestClose,
+      latestSMA20,
+      latestSMA50,
+      latestSMA200
+    );
+
+  const rsiLabel =
+    getRSILabel(
+      latestRSI
+    );
+
+  const macdLabel =
+    getMACDLabel(
+      latestMACD,
+      latestSignal,
+      latestHistogram
+    );
+
+  const volumeLabel =
+    getVolumeLabel(
+      volumeRatio
+    );
+
+  const chartRows =
+    rows.slice(
+      -260
+    );
+
+  const offset =
+    rows.length -
+    chartRows.length;
+
+  const chartData =
+    chartRows.map(
+      (
+        row,
+        index
+      ) => {
+        const originalIndex =
+          index +
+          offset;
+
+        return {
+          date:
+            row.date,
+
+          close:
+            row.close,
+
+          volume:
+            row.volume,
+
+          sma20:
+            sma20[
+              originalIndex
+            ],
+
+          sma50:
+            sma50[
+              originalIndex
+            ],
+
+          sma200:
+            sma200[
+              originalIndex
+            ]
+        };
+      }
+    );
+
+  const company =
+    companyMap.get(
+      symbol
+    );
+
+  return {
+    symbol,
+
+    company:
+      company
+        ? {
+            ...company,
+
+            sector:
+              company.sector ||
+              sectorMap.get(
+                symbol
+              ) ||
+              ''
+          }
+        : null,
+
+    available:
+      true,
+
+    asOf:
+      latest.date,
+
+    price:
+      latestClose,
+
+    trend: {
+      label:
+        trendLabel,
+
+      sma20:
+        latestSMA20,
+
+      sma50:
+        latestSMA50,
+
+      sma200:
+        latestSMA200,
+
+      ema12:
+        latestEMA12,
+
+      ema26:
+        latestEMA26
+    },
+
+    momentum: {
+      rsi14:
+        latestRSI,
+
+      rsiLabel,
+
+      macd:
+        latestMACD,
+
+      macdSignal:
+        latestSignal,
+
+      macdHistogram:
+        latestHistogram,
+
+      macdLabel,
+
+      momentum20Pct
+    },
+
+    risk: {
+      atr14:
+        latestATR,
+
+      atrPct,
+
+      annualizedVolatility20dPct:
+        annualizedVolatilityPct
+    },
+
+    volume: {
+      latest:
+        latestVolume,
+
+      average20:
+        averageVolume20,
+
+      ratio:
+        volumeRatio,
+
+      label:
+        volumeLabel
+    },
+
+    levels: {
+      support20:
+        support,
+
+      resistance20:
+        resistance,
+
+      distanceToSupportPct,
+
+      distanceToResistancePct,
+
+      high52,
+
+      low52
+    },
+
+    dataQuality: {
+      validSessions:
+        rows.length,
+
+      excludedAnomalies:
+        normalized
+          .anomalies
+          .length,
+
+      latestDate:
+        latest.date,
+
+      source:
+        'psxdata-api'
+    },
+
+    chartData,
+
+    disclaimer:
+      'Technical analysis is descriptive market analysis only. It is not a Buy, Sell or Hold recommendation.'
+  };
+}
+
+/* =========================================================
    AUTH
--------------------------------------------------- */
+========================================================= */
 
 function safeEqual(
   a,
@@ -3694,20 +5410,17 @@ function authorize(
 
   try {
     login =
-      Buffer
-        .from(
-          (
-            request
-              .headers
-              .authorization ||
-            ''
-          )
-            .replace(
-              /^Basic /,
-              ''
-            ),
-          'base64'
-        )
+      Buffer.from(
+        (
+          request.headers
+            .authorization ||
+          ''
+        ).replace(
+          /^Basic /,
+          ''
+        ),
+        'base64'
+      )
         .toString();
   } catch {}
 
@@ -3735,9 +5448,9 @@ function authorize(
   return true;
 }
 
-/* --------------------------------------------------
+/* =========================================================
    RESPONSE / HANDLER
--------------------------------------------------- */
+========================================================= */
 
 function sendJSON(
   response,
@@ -3795,10 +5508,9 @@ async function handler(
       );
 
     const action =
-      url.searchParams
-        .get(
-          'action'
-        ) ||
+      url.searchParams.get(
+        'action'
+      ) ||
       'app';
 
     if (
@@ -3838,6 +5550,9 @@ async function handler(
           fundamentalsProvider:
             'PSX Data Portal company page',
 
+          technicalEngine:
+            'IMPLEMENTED_DETERMINISTIC',
+
           pyPSXConfigured:
             Boolean(
               PYPSX_API_KEY_ID &&
@@ -3867,10 +5582,9 @@ async function handler(
     ) {
       const result =
         await getPyPSXIntraday(
-          url.searchParams
-            .get(
-              'symbol'
-            )
+          url.searchParams.get(
+            'symbol'
+          )
         );
 
       return sendJSON(
@@ -3921,10 +5635,9 @@ async function handler(
       return sendJSON(
         response,
         await getPyPSXIntraday(
-          url.searchParams
-            .get(
-              'symbol'
-            )
+          url.searchParams.get(
+            'symbol'
+          )
         )
       );
     }
@@ -3950,10 +5663,9 @@ async function handler(
       return sendJSON(
         response,
         await getQuote(
-          url.searchParams
-            .get(
-              'symbol'
-            )
+          url.searchParams.get(
+            'symbol'
+          )
         )
       );
     }
@@ -3967,16 +5679,14 @@ async function handler(
       return sendJSON(
         response,
         await getHistory(
-          url.searchParams
-            .get(
-              'symbol'
-            ),
+          url.searchParams.get(
+            'symbol'
+          ),
 
-          url.searchParams
-            .get(
-              'range'
-            ) ||
-            '1Y'
+          url.searchParams.get(
+            'range'
+          ) ||
+          '1Y'
         )
       );
     }
@@ -3990,10 +5700,9 @@ async function handler(
       return sendJSON(
         response,
         await getFundamentals(
-          url.searchParams
-            .get(
-              'symbol'
-            )
+          url.searchParams.get(
+            'symbol'
+          )
         )
       );
     }
@@ -4007,10 +5716,25 @@ async function handler(
       return sendJSON(
         response,
         await getEvents(
-          url.searchParams
-            .get(
-              'symbol'
-            )
+          url.searchParams.get(
+            'symbol'
+          )
+        )
+      );
+    }
+
+    if (
+      request.method ===
+        'GET' &&
+      action ===
+        'technical'
+    ) {
+      return sendJSON(
+        response,
+        await getTechnicalAnalysis(
+          url.searchParams.get(
+            'symbol'
+          )
         )
       );
     }
@@ -4037,9 +5761,9 @@ async function handler(
   }
 }
 
-/* --------------------------------------------------
-   UI
--------------------------------------------------- */
+/* =========================================================
+   PAGE
+========================================================= */
 
 function page() {
   return `<!doctype html>
@@ -4055,9 +5779,7 @@ function page() {
   content="width=device-width,initial-scale=1"
 >
 
-<title>
-NOMAD Invest
-</title>
+<title>NOMAD Invest</title>
 
 <style>
 
@@ -4065,7 +5787,6 @@ body {
   margin: 0;
   background: #f5f7fa;
   color: #182c3e;
-
   font-family:
     system-ui,
     -apple-system,
@@ -4145,12 +5866,10 @@ select {
 
 .filters {
   display: grid;
-
   grid-template-columns:
     minmax(240px,2fr)
     minmax(180px,1fr)
     minmax(210px,1fr);
-
   gap: 12px;
   margin: 18px 0;
 }
@@ -4250,13 +5969,11 @@ tbody tr:hover {
 
 .summaryGrid {
   display: grid;
-
   grid-template-columns:
     repeat(
       auto-fit,
       minmax(150px,1fr)
     );
-
   gap: 12px;
   margin: 18px 0;
 }
@@ -4298,7 +6015,6 @@ tbody tr:hover {
   font-size: 36px;
   line-height: 1.05;
   font-weight: 780;
-  letter-spacing: -.5px;
 }
 
 .decisionChange {
@@ -4334,12 +6050,10 @@ tbody tr:hover {
 
 .rangeHeader {
   display: flex;
-  align-items: center;
   justify-content: space-between;
   gap: 12px;
   font-size: 13px;
   color: #66788a;
-  margin-bottom: 10px;
 }
 
 .rangeTrack {
@@ -4388,7 +6102,6 @@ tbody tr:hover {
 
 .feedDot.live {
   background: #11823b;
-
   box-shadow:
     0 0 0 4px
     rgba(17,130,59,.10);
@@ -4431,7 +6144,8 @@ tbody tr:hover {
 }
 
 .chartModeToggle,
-.rangeToggle {
+.rangeToggle,
+.eventToggle {
   display: inline-flex;
   gap: 4px;
   padding: 4px;
@@ -4442,7 +6156,8 @@ tbody tr:hover {
 }
 
 .chartModeButton,
-.rangeButton {
+.rangeButton,
+.eventModeButton {
   background: transparent;
   color: #44596b;
   padding: 7px 12px;
@@ -4451,14 +6166,14 @@ tbody tr:hover {
 }
 
 .chartModeButton.active,
-.rangeButton.active {
+.rangeButton.active,
+.eventModeButton.active {
   background: #173f58;
   color: white;
 }
 
 .chartLegend {
   display: flex;
-  align-items: center;
   gap: 14px;
   flex-wrap: wrap;
   color: #66788a;
@@ -4480,6 +6195,22 @@ tbody tr:hover {
 
 .legendSwatch.down {
   background: #c73737;
+}
+
+.legendSwatch.price {
+  background: #173f58;
+}
+
+.legendSwatch.sma20 {
+  background: #9b59b6;
+}
+
+.legendSwatch.sma50 {
+  background: #e67e22;
+}
+
+.legendSwatch.sma200 {
+  background: #2c8c6b;
 }
 
 .candleChart {
@@ -4534,7 +6265,8 @@ tbody tr:hover {
   margin-bottom: 12px;
 }
 
-.priceChart {
+.priceChart,
+.technicalChart {
   display: block;
   width: 100%;
   height: 340px;
@@ -4555,6 +6287,30 @@ tbody tr:hover {
   fill: rgba(23,63,88,.08);
 }
 
+.technicalPrice {
+  fill: none;
+  stroke: #173f58;
+  stroke-width: 2.3;
+}
+
+.technicalSMA20 {
+  fill: none;
+  stroke: #9b59b6;
+  stroke-width: 1.6;
+}
+
+.technicalSMA50 {
+  fill: none;
+  stroke: #e67e22;
+  stroke-width: 1.6;
+}
+
+.technicalSMA200 {
+  fill: none;
+  stroke: #2c8c6b;
+  stroke-width: 1.6;
+}
+
 .chartLabel {
   font-size: 11px;
   fill: #66788a;
@@ -4566,6 +6322,15 @@ tbody tr:hover {
   border-radius: 8px;
   background: #fff8e8;
   color: #725217;
+}
+
+.infoBox {
+  margin-top: 14px;
+  padding: 12px 14px;
+  border-radius: 8px;
+  background: #eef4f7;
+  color: #44596b;
+  font-size: 13px;
 }
 
 .sourceNote {
@@ -4639,11 +6404,22 @@ tbody tr:hover {
 
 .pill {
   display: inline-block;
-  padding: 2px 7px;
+  padding: 3px 8px;
   border-radius: 999px;
   background: #eef3f6;
   color: #44596b;
   font-size: 11px;
+}
+
+.posture {
+  font-size: 22px;
+  font-weight: 760;
+}
+
+.techExplanation {
+  color: #5f7181;
+  line-height: 1.55;
+  font-size: 13px;
 }
 
 details {
@@ -4683,7 +6459,8 @@ pre {
     align-items: flex-start;
   }
 
-  .priceChart {
+  .priceChart,
+  .technicalChart {
     height: 260px;
   }
 
@@ -4709,9 +6486,7 @@ pre {
 
 <div>
 
-<h1>
-NOMAD Invest
-</h1>
+<h1>NOMAD Invest</h1>
 
 <div class="sub">
 PSX research and personal investment intelligence
@@ -4726,9 +6501,13 @@ Build ${VERSION}
 </header>
 
 <p class="notice">
-Market, company metadata and research data are connected.
+
+Market, company metadata, fundamentals and deterministic
+technical analysis are connected.
+
 Predictions and investment recommendations remain disabled
 until their models are built and validated.
+
 </p>
 
 <p id="status">
@@ -4777,6 +6556,10 @@ Live Chart
 
 <button id="loadHistory">
 History
+</button>
+
+<button id="loadTechnical">
+Technical
 </button>
 
 <button id="loadFundamentals">
@@ -4939,12 +6722,32 @@ let currentPage = 1;
 const PAGE_SIZE = 50;
 
 let liveRefreshTimer = null;
+
 let liveRefreshSymbol = null;
+
 let liveView = null;
-let liveChartMode = 'candles';
-let lastLiveChartResult = null;
-let lastQuoteResult = null;
-let selectedHistoryRange = '1Y';
+
+let liveChartMode =
+  'candles';
+
+let lastLiveChartResult =
+  null;
+
+let lastQuoteResult =
+  null;
+
+let selectedHistoryRange =
+  '1Y';
+
+let lastEventsResult =
+  null;
+
+let eventMode =
+  'key';
+
+/* =========================================================
+   UI HELPERS
+========================================================= */
 
 function escapeHtml(value) {
   return String(
@@ -4984,14 +6787,13 @@ function formatNumber(
     return '-';
   }
 
-  return number
-    .toLocaleString(
-      'en-PK',
-      {
-        maximumFractionDigits:
-          digits
-      }
-    );
+  return number.toLocaleString(
+    'en-PK',
+    {
+      maximumFractionDigits:
+        digits
+    }
+  );
 }
 
 function formatPercent(
@@ -5037,15 +6839,19 @@ function formatDate(value) {
     return value;
   }
 
-  return date
-    .toLocaleDateString(
-      'en-PK',
-      {
-        day: 'numeric',
-        month: 'short',
-        year: 'numeric'
-      }
-    );
+  return date.toLocaleDateString(
+    'en-PK',
+    {
+      day:
+        'numeric',
+
+      month:
+        'short',
+
+      year:
+        'numeric'
+    }
+  );
 }
 
 function formatDateTime(
@@ -5064,32 +6870,31 @@ function formatDateTime(
     );
   }
 
-  return date
-    .toLocaleString(
-      'en-PK',
-      {
-        timeZone:
-          'Asia/Karachi',
+  return date.toLocaleString(
+    'en-PK',
+    {
+      timeZone:
+        'Asia/Karachi',
 
-        day:
-          'numeric',
+      day:
+        'numeric',
 
-        month:
-          'short',
+      month:
+        'short',
 
-        year:
-          'numeric',
+      year:
+        'numeric',
 
-        hour:
-          'numeric',
+      hour:
+        'numeric',
 
-        minute:
-          '2-digit',
+      minute:
+        '2-digit',
 
-        second:
-          '2-digit'
-      }
-    );
+      second:
+        '2-digit'
+    }
+  );
 }
 
 function formatTime(value) {
@@ -5104,20 +6909,19 @@ function formatTime(value) {
     return '';
   }
 
-  return date
-    .toLocaleTimeString(
-      'en-PK',
-      {
-        timeZone:
-          'Asia/Karachi',
+  return date.toLocaleTimeString(
+    'en-PK',
+    {
+      timeZone:
+        'Asia/Karachi',
 
-        hour:
-          'numeric',
+      hour:
+        'numeric',
 
-        minute:
-          '2-digit'
-      }
-    );
+      minute:
+        '2-digit'
+    }
+  );
 }
 
 function formatCompactPKR(
@@ -5135,7 +6939,9 @@ function formatCompactPKR(
   }
 
   const absolute =
-    Math.abs(number);
+    Math.abs(
+      number
+    );
 
   if (
     absolute >=
@@ -5144,7 +6950,8 @@ function formatCompactPKR(
     return (
       'PKR ' +
       formatNumber(
-        number / 1e12,
+        number /
+        1e12,
         2
       ) +
       'T'
@@ -5158,7 +6965,8 @@ function formatCompactPKR(
     return (
       'PKR ' +
       formatNumber(
-        number / 1e9,
+        number /
+        1e9,
         2
       ) +
       'B'
@@ -5172,7 +6980,8 @@ function formatCompactPKR(
     return (
       'PKR ' +
       formatNumber(
-        number / 1e6,
+        number /
+        1e6,
         2
       ) +
       'M'
@@ -5188,9 +6997,27 @@ function formatCompactPKR(
   );
 }
 
-function finiteNumber(
+function formatFinancialThousands(
   value
 ) {
+  const number =
+    Number(value);
+
+  if (
+    !Number.isFinite(
+      number
+    )
+  ) {
+    return 'N/A';
+  }
+
+  return formatCompactPKR(
+    number *
+    1000
+  );
+}
+
+function finiteNumber(value) {
   if (
     value === null ||
     value === undefined ||
@@ -5199,15 +7026,14 @@ function finiteNumber(
     return null;
   }
 
-  const numeric =
+  const number =
     Number(value);
 
-  return Number
-    .isFinite(
-      numeric
-    )
-      ? numeric
-      : null;
+  return Number.isFinite(
+    number
+  )
+    ? number
+    : null;
 }
 
 async function api(
@@ -5219,11 +7045,10 @@ async function api(
       location.href
     );
 
-  url.searchParams
-    .set(
-      'action',
-      action
-    );
+  url.searchParams.set(
+    'action',
+    action
+  );
 
   for (
     const [
@@ -5239,11 +7064,10 @@ async function api(
       value !== undefined &&
       value !== ''
     ) {
-      url.searchParams
-        .set(
-          key,
-          value
-        );
+      url.searchParams.set(
+        key,
+        value
+      );
     }
   }
 
@@ -5253,7 +7077,9 @@ async function api(
   const result =
     await response.json();
 
-  if (!response.ok) {
+  if (
+    !response.ok
+  ) {
     throw new Error(
       result.message ||
       'Request failed.'
@@ -5282,27 +7108,27 @@ function rangePosition(
   low,
   high
 ) {
-  const numericValue =
+  const number =
     Number(value);
 
-  const numericLow =
+  const minimum =
     Number(low);
 
-  const numericHigh =
+  const maximum =
     Number(high);
 
   if (
     !Number.isFinite(
-      numericValue
+      number
     ) ||
     !Number.isFinite(
-      numericLow
+      minimum
     ) ||
     !Number.isFinite(
-      numericHigh
+      maximum
     ) ||
-    numericHigh <=
-      numericLow
+    maximum <=
+      minimum
   ) {
     return 50;
   }
@@ -5310,12 +7136,12 @@ function rangePosition(
   return clamp(
     (
       (
-        numericValue -
-        numericLow
+        number -
+        minimum
       ) /
       (
-        numericHigh -
-        numericLow
+        maximum -
+        minimum
       )
     ) *
     100,
@@ -5357,7 +7183,9 @@ function buildRangeCard(
     '<div class="rangeHeader">' +
 
     '<strong>' +
-    escapeHtml(title) +
+    escapeHtml(
+      title
+    ) +
     '</strong>' +
 
     '<span>PKR ' +
@@ -5379,11 +7207,15 @@ function buildRangeCard(
     '<div class="rangeLabels">' +
 
     '<span>Low PKR ' +
-    formatNumber(low) +
+    formatNumber(
+      low
+    ) +
     '</span>' +
 
     '<span>High PKR ' +
-    formatNumber(high) +
+    formatNumber(
+      high
+    ) +
     '</span>' +
 
     '</div>' +
@@ -5422,7 +7254,9 @@ function metricCard(
     '<div class="metric">' +
 
     '<div class="metricLabel">' +
-    escapeHtml(label) +
+    escapeHtml(
+      label
+    ) +
     '</div>' +
 
     '<div class="metricValue">' +
@@ -5431,15 +7265,23 @@ function metricCard(
 
     (
       sub
-        ? '<div class="metricSub">' +
-          escapeHtml(sub) +
-          '</div>'
+        ? (
+            '<div class="metricSub">' +
+            escapeHtml(
+              sub
+            ) +
+            '</div>'
+          )
         : ''
     ) +
 
     '</div>'
   );
 }
+
+/* =========================================================
+   OVERVIEW
+========================================================= */
 
 function decisionChangeValues(
   decision,
@@ -5461,20 +7303,17 @@ function decisionChangeValues(
 
   const previousClose =
     finiteNumber(
-      decision
-        ?.previousClose
+      decision?.previousClose
     );
 
   let change =
     finiteNumber(
-      decision
-        ?.dayChange
+      decision?.dayChange
     );
 
   let pct =
     finiteNumber(
-      decision
-        ?.dayChangePct
+      decision?.dayChangePct
     );
 
   if (
@@ -5535,8 +7374,8 @@ function renderDecisionOverview(
     null;
 
   const session =
-    live?.session ||
     decision.session ||
+    live?.session ||
     {};
 
   const values =
@@ -5560,9 +7399,7 @@ function renderDecisionOverview(
   const sessionLabel =
     live?.marketStatus
       ?.known
-      ? live
-          .marketStatus
-          .isOpen
+      ? live.marketStatus.isOpen
         ? 'Today'
         : 'Last session'
       : 'Session';
@@ -5602,12 +7439,8 @@ function renderDecisionOverview(
   const volumeVsAverage =
     sessionVolume !==
       null &&
-    sessionVolume !==
-      undefined &&
     averageVolume !==
       null &&
-    averageVolume !==
-      undefined &&
     Number(
       averageVolume
     ) > 0
@@ -5636,18 +7469,7 @@ function renderDecisionOverview(
           ) +
           '% of 30D avg'
         )
-      : averageVolume !==
-          null &&
-        averageVolume !==
-          undefined
-        ? (
-            '30D avg ' +
-            formatNumber(
-              averageVolume,
-              0
-            )
-          )
-        : '';
+      : '';
 
   let html =
     '<div class="decisionHeader">' +
@@ -5677,15 +7499,11 @@ function renderDecisionOverview(
     ) +
 
     (
-      live?.timestamp ||
-      decision
-        .priceTimestamp
+      decision.priceTimestamp
         ? (
             ' &bull; ' +
             escapeHtml(
               formatDateTime(
-                live
-                  ?.timestamp ||
                 decision
                   .priceTimestamp
               )
@@ -5751,6 +7569,23 @@ function renderDecisionOverview(
       values.price
     ) +
 
+    '<div class="sourceNote">' +
+
+    (
+      decision.sessionSource
+        ? (
+            'Session statistics: ' +
+            escapeHtml(
+              decision
+                .sessionSource
+            ) +
+            '.'
+          )
+        : ''
+    ) +
+
+    '</div>' +
+
     '</div>';
 
   html +=
@@ -5763,45 +7598,51 @@ function renderDecisionOverview(
     '<div class="summaryGrid">' +
 
     '<div class="metric">' +
+
     '<div class="metricLabel">' +
     'YTD change' +
     '</div>' +
+
     '<div class="metricValue ' +
     percentClass(
       decision.ytdChangePct
     ) +
     '">' +
+
     formatPercent(
       decision.ytdChangePct
     ) +
+
     '</div>' +
+
     '</div>' +
 
     '<div class="metric">' +
+
     '<div class="metricLabel">' +
     '1Y change' +
     '</div>' +
+
     '<div class="metricValue ' +
     percentClass(
       decision.change1yPct
     ) +
     '">' +
+
     formatPercent(
       decision.change1yPct
     ) +
+
     '</div>' +
+
     '</div>' +
 
     '</div>' +
 
     buildRangeCard(
       '52-week range',
-      decision
-        .range52
-        ?.low,
-      decision
-        .range52
-        ?.high,
+      decision.range52?.low,
+      decision.range52?.high,
       values.price
     ) +
 
@@ -5901,11 +7742,20 @@ function renderMoreData(
   ) {
     cards.push(
       metricCard(
-        'Market cap',
+        decision.marketCapSource ===
+          'estimated'
+          ? 'Estimated market cap'
+          : 'Market cap',
+
         formatCompactPKR(
           decision
             .marketCapPkr
-        )
+        ),
+
+        decision.marketCapSource ===
+          'estimated'
+          ? 'Latest price × shares outstanding'
+          : 'PSX / connected source'
       )
     );
   }
@@ -5976,7 +7826,7 @@ function renderMoreData(
         )
       : (
           '<div class="emptyState">' +
-          'No additional reliable market fields are available from the connected sources for this symbol.' +
+          'No additional reliable market fields are available for this symbol.' +
           '</div>'
         );
 
@@ -6004,27 +7854,29 @@ function renderMoreData(
               ? 'PSX Data Portal'
               : null,
 
+          sessionSource:
+            decision.sessionSource ||
+            null,
+
+          marketCapSource:
+            decision.marketCapSource ||
+            null,
+
           quoteTimestamp:
-            result
-              .meta
-              ?.timestamp ||
+            result.meta?.timestamp ||
             null,
 
           liveTimestamp:
-            result
-              .live
-              ?.timestamp ||
+            result.live?.timestamp ||
             null,
 
           companyFetchedAt:
-            result
-              .official
+            result.official
               ?.fetchedAt ||
             null,
 
           companySourceUrl:
-            result
-              .official
+            result.official
               ?.sourceUrl ||
             null
         },
@@ -6052,9 +7904,9 @@ function renderMoreData(
       html;
 }
 
-/* ---------------------------------------
-   LIVE PRICE / LIVE CHART
---------------------------------------- */
+/* =========================================================
+   LIVE REFRESH
+========================================================= */
 
 function stopLiveRefresh() {
   if (
@@ -6092,18 +7944,6 @@ function renderFeedStatus(
         ? 'delayed'
         : 'closed';
 
-  const marketNote =
-    result
-      .marketStatus
-      ?.holidayName
-      ? (
-          ' &bull; ' +
-          result
-            .marketStatus
-            .holidayName
-        )
-      : '';
-
   $('liveStatus')
     .innerHTML =
       '<span class="feedDot ' +
@@ -6128,7 +7968,6 @@ function renderFeedStatus(
           result.timestamp
         )
       ) +
-      marketNote +
       '</span>';
 }
 
@@ -6136,12 +7975,8 @@ function shouldAutoRefresh(
   result
 ) {
   return Boolean(
-    result
-      ?.marketStatus
-      ?.known &&
-    result
-      ?.marketStatus
-      ?.isOpen
+    result?.marketStatus?.known &&
+    result?.marketStatus?.isOpen
   );
 }
 
@@ -6155,10 +7990,10 @@ function scheduleLiveRefresh(
     clearInterval(
       liveRefreshTimer
     );
-
-    liveRefreshTimer =
-      null;
   }
+
+  liveRefreshTimer =
+    null;
 
   if (
     !shouldAutoRefresh(
@@ -6206,29 +8041,42 @@ async function refreshLiveOverview(
         lastQuoteResult.live =
           result;
 
+        if (
+          result.marketStatus
+            ?.isOpen
+        ) {
+          lastQuoteResult
+            .decision
+            .session =
+              result.session;
+
+          lastQuoteResult
+            .decision
+            .sessionSource =
+              'pyPSX';
+
+          lastQuoteResult
+            .decision
+            .price =
+              result.price;
+
+          lastQuoteResult
+            .decision
+            .priceTimestamp =
+              result.timestamp;
+        }
+
         renderDecisionOverview(
           lastQuoteResult
         );
-      }
-
-      if (
-        liveRefreshTimer &&
-        !shouldAutoRefresh(
-          result
-        )
-      ) {
-        clearInterval(
-          liveRefreshTimer
-        );
-
-        liveRefreshTimer =
-          null;
       }
     }
 
     return result;
   } catch (error) {
-    if (!silent) {
+    if (
+      !silent
+    ) {
       $('liveStatus')
         .innerHTML =
           '<span class="feedWarning">' +
@@ -6262,17 +8110,13 @@ async function startLiveOverview(
   let result =
     initialResult;
 
-  if (result) {
+  if (
+    result
+  ) {
     renderFeedStatus(
       result
     );
   } else {
-    $('liveStatus')
-      .innerHTML =
-        '<span class="feedMeta">' +
-        'Loading latest pyPSX price...' +
-        '</span>';
-
     result =
       await refreshLiveOverview(
         symbol
@@ -6280,11 +8124,7 @@ async function startLiveOverview(
   }
 
   if (
-    result &&
-    liveRefreshSymbol ===
-      symbol &&
-    liveView ===
-      'overview'
+    result
   ) {
     scheduleLiveRefresh(
       () =>
@@ -6292,10 +8132,15 @@ async function startLiveOverview(
           symbol,
           true
         ),
+
       result
     );
   }
 }
+
+/* =========================================================
+   LIVE CHART
+========================================================= */
 
 function chartDirectionClass(
   row,
@@ -6346,7 +8191,8 @@ function buildPriceGrid(
     index++
   ) {
     const fraction =
-      index / 4;
+      index /
+      4;
 
     const price =
       max -
@@ -6401,25 +8247,25 @@ function buildIntradayLineChart(
     rows.length < 2
   ) {
     return (
-      '<p class="muted">' +
-      'Not enough intraday data to draw the chart.' +
-      '</p>'
+      '<div class="emptyState">' +
+      'Not enough intraday data.' +
+      '</div>'
     );
   }
 
   const width = 1000;
   const height = 410;
-  const paddingLeft = 65;
-  const paddingRight = 20;
-  const paddingTop = 20;
+  const left = 65;
+  const right = 20;
+  const top = 20;
   const priceHeight = 265;
   const volumeTop = 310;
   const volumeHeight = 58;
 
   const usableWidth =
     width -
-    paddingLeft -
-    paddingRight;
+    left -
+    right;
 
   const closes =
     rows.map(
@@ -6446,13 +8292,16 @@ function buildIntradayLineChart(
     max *= 1.005;
   }
 
-  const range =
-    max - min;
-
   const margin =
     Math.max(
-      range * .08,
-      max * .002
+      (
+        max -
+        min
+      ) *
+      .08,
+
+      max *
+      .002
     );
 
   min -= margin;
@@ -6460,7 +8309,7 @@ function buildIntradayLineChart(
 
   const x =
     index =>
-      paddingLeft +
+      left +
       (
         index /
         (
@@ -6472,7 +8321,7 @@ function buildIntradayLineChart(
 
   const y =
     price =>
-      paddingTop +
+      top +
       (
         1 -
         (
@@ -6489,22 +8338,21 @@ function buildIntradayLineChart(
       priceHeight;
 
   const points =
-    rows
-      .map(
-        (
-          row,
-          index
-        ) =>
-          x(index) +
-          ',' +
-          y(
-            row.close
-          )
-      )
+    rows.map(
+      (
+        row,
+        index
+      ) =>
+        x(index) +
+        ',' +
+        y(
+          row.close
+        )
+    )
       .join(' ');
 
   const bottomY =
-    paddingTop +
+    top +
     priceHeight;
 
   const areaPoints =
@@ -6521,138 +8369,14 @@ function buildIntradayLineChart(
     ',' +
     bottomY;
 
-  const maxVolume =
-    Math.max(
-      1,
-      ...rows.map(
-        row =>
-          Number(
-            row.volume ||
-            0
-          )
-      )
-    );
-
-  const step =
-    usableWidth /
-    rows.length;
-
-  const barWidth =
-    Math.max(
-      1,
-      Math.min(
-        7,
-        step * .72
-      )
-    );
-
-  const volumeBars =
-    rows.map(
-      (
-        row,
-        index
-      ) => {
-        const volume =
-          Number(
-            row.volume ||
-            0
-          );
-
-        const barHeight =
-          maxVolume > 0
-            ? (
-                volume /
-                maxVolume
-              ) *
-              volumeHeight
-            : 0;
-
-        const barX =
-          paddingLeft +
-          index *
-          step +
-          (
-            step -
-            barWidth
-          ) /
-          2;
-
-        const barY =
-          volumeTop +
-          volumeHeight -
-          barHeight;
-
-        return (
-          '<rect x="' +
-          barX +
-          '" y="' +
-          barY +
-          '" width="' +
-          barWidth +
-          '" height="' +
-          Math.max(
-            .5,
-            barHeight
-          ) +
-          '" class="' +
-          chartDirectionClass(
-            row,
-            'volume'
-          ) +
-          '">' +
-
-          '<title>' +
-          escapeHtml(
-            formatTime(
-              row.timestamp
-            ) +
-            ' - Volume ' +
-            formatNumber(
-              volume,
-              0
-            )
-          ) +
-          '</title>' +
-
-          '</rect>'
-        );
-      }
-    )
-    .join('');
-
-  const firstTime =
-    formatTime(
-      rows[0]
-        .timestamp
-    );
-
-  const middleTime =
-    formatTime(
-      rows[
-        Math.floor(
-          rows.length /
-          2
-        )
-      ].timestamp
-    );
-
-  const lastTime =
-    formatTime(
-      rows[
-        rows.length -
-        1
-      ].timestamp
-    );
-
   return (
     '<div class="chartBox">' +
 
     '<div class="chartTitle">' +
-    'Intraday line + volume - 1-minute candles' +
+    'Intraday line + volume' +
     '</div>' +
 
-    '<svg class="candleChart" ' +
-    'viewBox="0 0 ' +
+    '<svg class="candleChart" viewBox="0 0 ' +
     width +
     ' ' +
     height +
@@ -6662,9 +8386,9 @@ function buildIntradayLineChart(
       min,
       max,
       width,
-      paddingLeft,
-      paddingRight,
-      paddingTop,
+      left,
+      right,
+      top,
       priceHeight
     ) +
 
@@ -6675,83 +8399,6 @@ function buildIntradayLineChart(
     '<polyline points="' +
     points +
     '" class="chartLine" />' +
-
-    '<line x1="' +
-    paddingLeft +
-    '" x2="' +
-    (
-      width -
-      paddingRight
-    ) +
-    '" y1="' +
-    (
-      volumeTop -
-      10
-    ) +
-    '" y2="' +
-    (
-      volumeTop -
-      10
-    ) +
-    '" class="volumeSeparator" />' +
-
-    volumeBars +
-
-    '<text x="5" y="' +
-    (
-      volumeTop +
-      12
-    ) +
-    '" class="chartLabel">' +
-    'Vol' +
-    '</text>' +
-
-    '<text x="' +
-    paddingLeft +
-    '" y="' +
-    (
-      height -
-      8
-    ) +
-    '" class="chartLabel">' +
-    escapeHtml(
-      firstTime
-    ) +
-    '</text>' +
-
-    '<text x="' +
-    (
-      width /
-      2
-    ) +
-    '" y="' +
-    (
-      height -
-      8
-    ) +
-    '" text-anchor="middle" ' +
-    'class="chartLabel">' +
-    escapeHtml(
-      middleTime
-    ) +
-    '</text>' +
-
-    '<text x="' +
-    (
-      width -
-      paddingRight
-    ) +
-    '" y="' +
-    (
-      height -
-      8
-    ) +
-    '" text-anchor="end" ' +
-    'class="chartLabel">' +
-    escapeHtml(
-      lastTime
-    ) +
-    '</text>' +
 
     '</svg>' +
 
@@ -6767,25 +8414,25 @@ function buildIntradayCandlestickChart(
     rows.length < 2
   ) {
     return (
-      '<p class="muted">' +
-      'Not enough intraday data to draw candlesticks.' +
-      '</p>'
+      '<div class="emptyState">' +
+      'Not enough intraday data.' +
+      '</div>'
     );
   }
 
   const width = 1000;
   const height = 430;
-  const paddingLeft = 65;
-  const paddingRight = 20;
-  const paddingTop = 20;
+  const left = 65;
+  const right = 20;
+  const top = 20;
   const priceHeight = 275;
   const volumeTop = 322;
   const volumeHeight = 64;
 
   const usableWidth =
     width -
-    paddingLeft -
-    paddingRight;
+    left -
+    right;
 
   const normalized =
     rows.map(
@@ -6806,7 +8453,7 @@ function buildIntradayCandlestickChart(
               )
             : close;
 
-        const rawHigh =
+        const high =
           Number.isFinite(
             Number(
               row.high
@@ -6820,7 +8467,7 @@ function buildIntradayCandlestickChart(
                 close
               );
 
-        const rawLow =
+        const low =
           Number.isFinite(
             Number(
               row.low
@@ -6841,14 +8488,14 @@ function buildIntradayCandlestickChart(
 
           high:
             Math.max(
-              rawHigh,
+              high,
               open,
               close
             ),
 
           low:
             Math.min(
-              rawLow,
+              low,
               open,
               close
             ),
@@ -6880,20 +8527,16 @@ function buildIntradayCandlestickChart(
       )
     );
 
-  if (
-    min === max
-  ) {
-    min *= .995;
-    max *= 1.005;
-  }
-
-  const range =
-    max - min;
-
   const margin =
     Math.max(
-      range * .06,
-      max * .0015
+      (
+        max -
+        min
+      ) *
+      .06,
+
+      max *
+      .0015
     );
 
   min -= margin;
@@ -6901,7 +8544,7 @@ function buildIntradayCandlestickChart(
 
   const y =
     price =>
-      paddingTop +
+      top +
       (
         1 -
         (
@@ -6926,7 +8569,8 @@ function buildIntradayCandlestickChart(
       .8,
       Math.min(
         7,
-        step * .68
+        step *
+        .68
       )
     );
 
@@ -6939,14 +8583,14 @@ function buildIntradayCandlestickChart(
       )
     );
 
-  const candleSvg =
+  const candles =
     normalized.map(
       (
         row,
         index
       ) => {
         const centerX =
-          paddingLeft +
+          left +
           index *
           step +
           step /
@@ -6987,7 +8631,7 @@ function buildIntradayCandlestickChart(
             )
           );
 
-        const directionClass =
+        const candleClass =
           chartDirectionClass(
             row,
             'candle'
@@ -7011,38 +8655,35 @@ function buildIntradayCandlestickChart(
           volumeHeight -
           volumeHeightPx;
 
-        const title =
-          formatTime(
-            row.timestamp
-          ) +
-          ' - O ' +
-          formatNumber(
-            row.open
-          ) +
-          ' H ' +
-          formatNumber(
-            row.high
-          ) +
-          ' L ' +
-          formatNumber(
-            row.low
-          ) +
-          ' C ' +
-          formatNumber(
-            row.close
-          ) +
-          ' - Vol ' +
-          formatNumber(
-            row.volume,
-            0
-          );
-
         return (
           '<g>' +
 
           '<title>' +
           escapeHtml(
-            title
+            formatTime(
+              row.timestamp
+            ) +
+            ' | O ' +
+            formatNumber(
+              row.open
+            ) +
+            ' H ' +
+            formatNumber(
+              row.high
+            ) +
+            ' L ' +
+            formatNumber(
+              row.low
+            ) +
+            ' C ' +
+            formatNumber(
+              row.close
+            ) +
+            ' | Volume ' +
+            formatNumber(
+              row.volume,
+              0
+            )
           ) +
           '</title>' +
 
@@ -7055,7 +8696,7 @@ function buildIntradayCandlestickChart(
           '" y2="' +
           lowY +
           '" class="' +
-          directionClass +
+          candleClass +
           '" />' +
 
           '<rect x="' +
@@ -7071,7 +8712,7 @@ function buildIntradayCandlestickChart(
           '" height="' +
           bodyHeight +
           '" class="' +
-          directionClass +
+          candleClass +
           '" />' +
 
           '<rect x="' +
@@ -7097,31 +8738,7 @@ function buildIntradayCandlestickChart(
         );
       }
     )
-    .join('');
-
-  const firstTime =
-    formatTime(
-      normalized[0]
-        .timestamp
-    );
-
-  const middleTime =
-    formatTime(
-      normalized[
-        Math.floor(
-          normalized.length /
-          2
-        )
-      ].timestamp
-    );
-
-  const lastTime =
-    formatTime(
-      normalized[
-        normalized.length -
-        1
-      ].timestamp
-    );
+      .join('');
 
   return (
     '<div class="chartBox">' +
@@ -7134,7 +8751,7 @@ function buildIntradayCandlestickChart(
 
     '<span>' +
     '<span class="legendSwatch up"></span>' +
-    'Close >= open' +
+    'Close ≥ open' +
     '</span>' +
 
     '<span>' +
@@ -7143,13 +8760,12 @@ function buildIntradayCandlestickChart(
     '</span>' +
 
     '<span>' +
-    'Hover a candle for OHLCV' +
+    'Hover for OHLCV' +
     '</span>' +
 
     '</div>' +
 
-    '<svg class="candleChart" ' +
-    'viewBox="0 0 ' +
+    '<svg class="candleChart" viewBox="0 0 ' +
     width +
     ' ' +
     height +
@@ -7159,18 +8775,18 @@ function buildIntradayCandlestickChart(
       min,
       max,
       width,
-      paddingLeft,
-      paddingRight,
-      paddingTop,
+      left,
+      right,
+      top,
       priceHeight
     ) +
 
     '<line x1="' +
-    paddingLeft +
+    left +
     '" x2="' +
     (
       width -
-      paddingRight
+      right
     ) +
     '" y1="' +
     (
@@ -7184,7 +8800,7 @@ function buildIntradayCandlestickChart(
     ) +
     '" class="volumeSeparator" />' +
 
-    candleSvg +
+    candles +
 
     '<text x="5" y="' +
     (
@@ -7193,53 +8809,6 @@ function buildIntradayCandlestickChart(
     ) +
     '" class="chartLabel">' +
     'Vol' +
-    '</text>' +
-
-    '<text x="' +
-    paddingLeft +
-    '" y="' +
-    (
-      height -
-      8
-    ) +
-    '" class="chartLabel">' +
-    escapeHtml(
-      firstTime
-    ) +
-    '</text>' +
-
-    '<text x="' +
-    (
-      width /
-      2
-    ) +
-    '" y="' +
-    (
-      height -
-      8
-    ) +
-    '" text-anchor="middle" ' +
-    'class="chartLabel">' +
-    escapeHtml(
-      middleTime
-    ) +
-    '</text>' +
-
-    '<text x="' +
-    (
-      width -
-      paddingRight
-    ) +
-    '" y="' +
-    (
-      height -
-      8
-    ) +
-    '" text-anchor="end" ' +
-    'class="chartLabel">' +
-    escapeHtml(
-      lastTime
-    ) +
     '</text>' +
 
     '</svg>' +
@@ -7257,26 +8826,12 @@ function bindLiveChartModeButtons() {
       button => {
         button.onclick =
           () => {
-            const mode =
+            liveChartMode =
               button.dataset
                 .mode;
 
             if (
-              mode !==
-                'candles' &&
-              mode !==
-                'line'
-            ) {
-              return;
-            }
-
-            liveChartMode =
-              mode;
-
-            if (
-              lastLiveChartResult &&
-              liveView ===
-                'chart'
+              lastLiveChartResult
             ) {
               renderLiveChart(
                 lastLiveChartResult
@@ -7300,17 +8855,13 @@ function renderLiveChart(
   const stateNote =
     result.feedState ===
       'LIVE'
-      ? 'Market open - auto-refreshing every 15 seconds'
+      ? 'Market open - refreshing every 15 seconds'
       : result.feedState ===
         'DELAYED'
-        ? 'Market open, but the latest pyPSX candle is delayed'
-        : result
-            .marketStatus
-            ?.known
-          ? 'Market closed - showing the latest trading session'
-          : 'Showing the latest available trading session';
+        ? 'Market open, but latest candle is delayed'
+        : 'Market closed - showing latest trading session';
 
-  const chartMarkup =
+  const chart =
     liveChartMode ===
       'candles'
       ? buildIntradayCandlestickChart(
@@ -7351,7 +8902,7 @@ function renderLiveChart(
 
       '<div class="chartModeToggle">' +
 
-      '<button type="button" class="chartModeButton ' +
+      '<button class="chartModeButton ' +
       (
         liveChartMode ===
           'candles'
@@ -7362,7 +8913,7 @@ function renderLiveChart(
       'Candles' +
       '</button>' +
 
-      '<button type="button" class="chartModeButton ' +
+      '<button class="chartModeButton ' +
       (
         liveChartMode ===
           'line'
@@ -7383,9 +8934,7 @@ function renderLiveChart(
         'Session open',
         'PKR ' +
         formatNumber(
-          result
-            .session
-            ?.open
+          result.session?.open
         )
       ) +
 
@@ -7393,9 +8942,7 @@ function renderLiveChart(
         'Session high',
         'PKR ' +
         formatNumber(
-          result
-            .session
-            ?.high
+          result.session?.high
         )
       ) +
 
@@ -7403,25 +8950,21 @@ function renderLiveChart(
         'Session low',
         'PKR ' +
         formatNumber(
-          result
-            .session
-            ?.low
+          result.session?.low
         )
       ) +
 
       metricCard(
         'Session volume',
         formatNumber(
-          result
-            .session
-            ?.volume,
+          result.session?.volume,
           0
         )
       ) +
 
       '</div>' +
 
-      chartMarkup;
+      chart;
 
   bindLiveChartModeButtons();
 }
@@ -7448,29 +8991,13 @@ async function refreshLiveChart(
       renderLiveChart(
         result
       );
-
-      if (
-        liveRefreshTimer &&
-        !shouldAutoRefresh(
-          result
-        )
-      ) {
-        clearInterval(
-          liveRefreshTimer
-        );
-
-        liveRefreshTimer =
-          null;
-      }
     }
 
     return result;
   } catch (error) {
-    if (!silent) {
-      $('research')
-        .innerHTML =
-          '';
-
+    if (
+      !silent
+    ) {
       $('error')
         .textContent =
           error.message;
@@ -7484,10 +9011,6 @@ async function startLiveChart(
   symbol
 ) {
   stopLiveRefresh();
-
-  if (!symbol) {
-    return;
-  }
 
   liveRefreshSymbol =
     symbol;
@@ -7510,11 +9033,7 @@ async function startLiveChart(
     );
 
   if (
-    result &&
-    liveRefreshSymbol ===
-      symbol &&
-    liveView ===
-      'chart'
+    result
   ) {
     scheduleLiveRefresh(
       () =>
@@ -7522,14 +9041,15 @@ async function startLiveChart(
           symbol,
           true
         ),
+
       result
     );
   }
 }
 
-/* ---------------------------------------
-   COMPANY DISPLAY / MARKET TABLE
---------------------------------------- */
+/* =========================================================
+   COMPANY / MARKET TABLE
+========================================================= */
 
 function showSelectedCompany(
   symbol
@@ -7575,42 +9095,37 @@ function showSelectedCompany(
 function updateSelectedCompany(
   result
 ) {
-  if (!result) {
+  if (
+    !result?.company?.name
+  ) {
     return;
   }
 
-  const company =
-    result.company;
+  $('selectedCompany')
+    .innerHTML =
+      '<strong>' +
+      escapeHtml(
+        result.company.name
+      ) +
+      '</strong>' +
 
-  if (
-    company?.name
-  ) {
-    $('selectedCompany')
-      .innerHTML =
-        '<strong>' +
-        escapeHtml(
-          company.name
-        ) +
-        '</strong>' +
+      '<span>' +
+      escapeHtml(
+        result.symbol
+      ) +
 
-        '<span>' +
-        escapeHtml(
-          result.symbol
-        ) +
-
-        (
-          company.sector
-            ? (
-                ' &bull; ' +
-                escapeHtml(
-                  company.sector
-                )
+      (
+        result.company.sector
+          ? (
+              ' &bull; ' +
+              escapeHtml(
+                result.company.sector
               )
-            : ''
-        ) +
+            )
+          : ''
+      ) +
 
-        '</span>';
-  }
+      '</span>';
 }
 
 function getFilteredRows() {
@@ -7626,39 +9141,32 @@ function getFilteredRows() {
 
   let rows =
     marketRows.filter(
-      stock => {
-        const searchable =
-          (
-            stock.symbol +
-            ' ' +
-            stock.companyName +
-            ' ' +
-            stock.sector
-          )
-            .toLowerCase();
-
-        return (
-          searchable
-            .includes(
-              query
-            ) &&
-          (
-            !sector ||
-            stock.sector ===
-              sector
-          )
-        );
-      }
+      stock =>
+        (
+          stock.symbol +
+          ' ' +
+          stock.companyName +
+          ' ' +
+          stock.sector
+        )
+          .toLowerCase()
+          .includes(
+            query
+          ) &&
+        (
+          !sector ||
+          stock.sector ===
+            sector
+        )
     );
 
-  rows = [...rows];
+  rows =
+    [...rows];
 
   switch (
     $('sort').value
   ) {
-
     case 'priceAsc':
-
       rows.sort(
         (
           a,
@@ -7673,11 +9181,9 @@ function getFilteredRows() {
             Infinity
           )
       );
-
       break;
 
     case 'priceDesc':
-
       rows.sort(
         (
           a,
@@ -7692,11 +9198,9 @@ function getFilteredRows() {
             -Infinity
           )
       );
-
       break;
 
     case 'changeDesc':
-
       rows.sort(
         (
           a,
@@ -7711,11 +9215,9 @@ function getFilteredRows() {
             -Infinity
           )
       );
-
       break;
 
     case 'changeAsc':
-
       rows.sort(
         (
           a,
@@ -7730,11 +9232,9 @@ function getFilteredRows() {
             Infinity
           )
       );
-
       break;
 
     case 'dividendDesc':
-
       rows.sort(
         (
           a,
@@ -7749,19 +9249,16 @@ function getFilteredRows() {
             -Infinity
           )
       );
-
       break;
 
     case 'peAsc':
-
       rows =
         rows
           .filter(
             row =>
               row.peRatio !==
                 null &&
-              row.peRatio >
-                0
+              row.peRatio > 0
           )
           .sort(
             (
@@ -7771,11 +9268,9 @@ function getFilteredRows() {
               a.peRatio -
               b.peRatio
           );
-
       break;
 
     case 'volumeDesc':
-
       rows.sort(
         (
           a,
@@ -7790,11 +9285,9 @@ function getFilteredRows() {
             -Infinity
           )
       );
-
       break;
 
     default:
-
       rows.sort(
         (
           a,
@@ -7852,18 +9345,6 @@ function renderStocks() {
       .innerHTML =
         '<p>No matching stocks.</p>';
 
-    $('pageInfo')
-      .textContent =
-        '0 results';
-
-    $('previousPage')
-      .disabled =
-        true;
-
-    $('nextPage')
-      .disabled =
-        true;
-
     return;
   }
 
@@ -7890,84 +9371,79 @@ function renderStocks() {
 
       '<tbody>' +
 
-      pageRows
-        .map(
-          stock =>
-            '<tr data-symbol="' +
-            escapeHtml(
-              stock.symbol
-            ) +
-            '">' +
+      pageRows.map(
+        stock =>
+          '<tr data-symbol="' +
+          escapeHtml(
+            stock.symbol
+          ) +
+          '">' +
 
-            '<td class="symbol">' +
-            escapeHtml(
-              stock.symbol
-            ) +
-            '</td>' +
+          '<td class="symbol">' +
+          escapeHtml(
+            stock.symbol
+          ) +
+          '</td>' +
 
-            '<td class="company">' +
-            escapeHtml(
-              stock.companyName
-            ) +
-            '</td>' +
+          '<td class="company">' +
+          escapeHtml(
+            stock.companyName
+          ) +
+          '</td>' +
 
-            '<td>' +
-            escapeHtml(
-              stock.sector
-            ) +
-            '</td>' +
+          '<td>' +
+          escapeHtml(
+            stock.sector
+          ) +
+          '</td>' +
 
-            '<td>' +
-            formatNumber(
-              stock.price
-            ) +
-            '</td>' +
+          '<td>' +
+          formatNumber(
+            stock.price
+          ) +
+          '</td>' +
 
-            '<td>' +
-            (
-              stock.peRatio !==
-                null &&
-              stock.peRatio >
-                0
-                ? formatNumber(
-                    stock.peRatio
-                  )
-                : 'N/A'
-            ) +
-            '</td>' +
+          '<td>' +
+          (
+            stock.peRatio ===
+              null
+              ? 'N/A'
+              : formatNumber(
+                  stock.peRatio
+                )
+          ) +
+          '</td>' +
 
-            '<td>' +
-            (
-              stock.dividendYield ===
-                null ||
-              stock.dividendYield ===
-                undefined
-                ? 'N/A'
-                : formatPercent(
-                    stock.dividendYield
-                  )
-            ) +
-            '</td>' +
+          '<td>' +
+          (
+            stock.dividendYield ===
+              null
+              ? 'N/A'
+              : formatPercent(
+                  stock.dividendYield
+                )
+          ) +
+          '</td>' +
 
-            '<td>' +
-            formatNumber(
-              stock.averageVolume30d,
-              0
-            ) +
-            '</td>' +
+          '<td>' +
+          formatNumber(
+            stock.averageVolume30d,
+            0
+          ) +
+          '</td>' +
 
-            '<td class="' +
-            percentClass(
-              stock.change1yPct
-            ) +
-            '">' +
-            formatPercent(
-              stock.change1yPct
-            ) +
-            '</td>' +
+          '<td class="' +
+          percentClass(
+            stock.change1yPct
+          ) +
+          '">' +
+          formatPercent(
+            stock.change1yPct
+          ) +
+          '</td>' +
 
-            '</tr>'
-        )
+          '</tr>'
+      )
         .join('') +
 
       '</tbody>' +
@@ -7975,8 +9451,7 @@ function renderStocks() {
       '</table>';
 
   const first =
-    start +
-    1;
+    start + 1;
 
   const last =
     Math.min(
@@ -7999,18 +9474,16 @@ function renderStocks() {
 
   $('previousPage')
     .disabled =
-      currentPage <=
-      1;
+      currentPage <= 1;
 
   $('nextPage')
     .disabled =
       currentPage >=
       pageCount;
 
-  document
-    .querySelectorAll(
-      '#stocks tbody tr'
-    )
+  document.querySelectorAll(
+    '#stocks tbody tr'
+  )
     .forEach(
       row => {
         row.onclick =
@@ -8065,142 +9538,24 @@ function populateSectors() {
       'All sectors' +
       '</option>' +
 
-      sectors
-        .map(
-          sector =>
-            '<option value="' +
-            escapeHtml(
-              sector
-            ) +
-            '">' +
-            escapeHtml(
-              sector
-            ) +
-            '</option>'
-        )
+      sectors.map(
+        sector =>
+          '<option value="' +
+          escapeHtml(
+            sector
+          ) +
+          '">' +
+          escapeHtml(
+            sector
+          ) +
+          '</option>'
+      )
         .join('');
 }
 
-$('loadMarket')
-  .onclick =
-    async () => {
-
-      $('error')
-        .textContent =
-          '';
-
-      $('loadMarket')
-        .disabled =
-          true;
-
-      try {
-        const result =
-          await api(
-            'market'
-          );
-
-        marketRows =
-          result.stocks ||
-          [];
-
-        currentPage = 1;
-
-        $('coverage')
-          .textContent =
-            result.totalStocks +
-            ' usable stocks | Company names matched ' +
-            result.companyNamesMatched +
-            '/' +
-            result.totalStocks +
-            ' | Sectors matched ' +
-            result.sectorsMatched +
-            '/' +
-            result.totalStocks +
-            ' | Updated ' +
-            result.asOf;
-
-        populateSectors();
-
-        renderStocks();
-
-      } catch (error) {
-
-        $('error')
-          .textContent =
-            error.message;
-
-      } finally {
-
-        $('loadMarket')
-          .disabled =
-            false;
-      }
-    };
-
-$('search')
-  .oninput =
-    () => {
-
-      currentPage = 1;
-
-      renderStocks();
-    };
-
-$('sectorFilter')
-  .onchange =
-    () => {
-
-      currentPage = 1;
-
-      renderStocks();
-    };
-
-$('sort')
-  .onchange =
-    () => {
-
-      currentPage = 1;
-
-      renderStocks();
-    };
-
-$('previousPage')
-  .onclick =
-    () => {
-
-      if (
-        currentPage > 1
-      ) {
-        currentPage--;
-
-        renderStocks();
-      }
-    };
-
-$('nextPage')
-  .onclick =
-    () => {
-
-      const pageCount =
-        Math.ceil(
-          getFilteredRows()
-            .length /
-          PAGE_SIZE
-        );
-
-      if (
-        currentPage <
-        pageCount
-      ) {
-        currentPage++;
-
-        renderStocks();
-      }
-    };
-
-/* ---------------------------------------
-   HISTORY
---------------------------------------- */
+/* =========================================================
+   HISTORY UI
+========================================================= */
 
 function buildPriceChart(
   rows
@@ -8209,29 +9564,25 @@ function buildPriceChart(
     !rows ||
     rows.length < 2
   ) {
-    return (
-      '<p class="muted">' +
-      'Not enough valid history to draw a chart.' +
-      '</p>'
-    );
+    return '';
   }
 
   const width = 1000;
   const height = 330;
-  const paddingLeft = 65;
-  const paddingRight = 20;
-  const paddingTop = 20;
-  const paddingBottom = 42;
+  const left = 65;
+  const right = 20;
+  const top = 20;
+  const bottom = 42;
 
   const usableWidth =
     width -
-    paddingLeft -
-    paddingRight;
+    left -
+    right;
 
   const usableHeight =
     height -
-    paddingTop -
-    paddingBottom;
+    top -
+    bottom;
 
   const closes =
     rows.map(
@@ -8251,25 +9602,19 @@ function buildPriceChart(
       ...closes
     );
 
-  if (
-    min === max
-  ) {
-    min *= .98;
-    max *= 1.02;
-  }
-
-  const range =
-    max - min;
-
   const margin =
-    range * .08;
+    (
+      max -
+      min
+    ) *
+    .08;
 
   min -= margin;
   max += margin;
 
   const x =
     index =>
-      paddingLeft +
+      left +
       (
         index /
         (
@@ -8281,7 +9626,7 @@ function buildPriceChart(
 
   const y =
     price =>
-      paddingTop +
+      top +
       (
         1 -
         (
@@ -8298,114 +9643,36 @@ function buildPriceChart(
       usableHeight;
 
   const points =
-    rows
-      .map(
-        (
-          row,
-          index
-        ) =>
-          x(index) +
-          ',' +
-          y(
-            row.close
-          )
-      )
+    rows.map(
+      (
+        row,
+        index
+      ) =>
+        x(index) +
+        ',' +
+        y(
+          row.close
+        )
+    )
       .join(' ');
 
-  const firstX =
-    x(0);
-
-  const lastX =
-    x(
-      rows.length -
-      1
-    );
-
   const bottomY =
-    paddingTop +
+    top +
     usableHeight;
 
   const areaPoints =
-    firstX +
+    x(0) +
     ',' +
     bottomY +
     ' ' +
     points +
     ' ' +
-    lastX +
-    ',' +
-    bottomY;
-
-  let horizontalLines =
-    '';
-
-  for (
-    let index = 0;
-    index < 5;
-    index++
-  ) {
-    const fraction =
-      index / 4;
-
-    const price =
-      max -
-      fraction *
-      (
-        max -
-        min
-      );
-
-    const lineY =
-      paddingTop +
-      fraction *
-      usableHeight;
-
-    horizontalLines +=
-      '<line x1="' +
-      paddingLeft +
-      '" x2="' +
-      (
-        width -
-        paddingRight
-      ) +
-      '" y1="' +
-      lineY +
-      '" y2="' +
-      lineY +
-      '" class="chartAxis" />' +
-
-      '<text x="5" y="' +
-      (
-        lineY +
-        4
-      ) +
-      '" class="chartLabel">' +
-
-      formatNumber(
-        price,
-        2
-      ) +
-
-      '</text>';
-  }
-
-  const firstDate =
-    rows[0]
-      .date;
-
-  const middleDate =
-    rows[
-      Math.floor(
-        rows.length /
-        2
-      )
-    ].date;
-
-  const lastDate =
-    rows[
+    x(
       rows.length -
       1
-    ].date;
+    ) +
+    ',' +
+    bottomY;
 
   return (
     '<div class="chartBox">' +
@@ -8414,14 +9681,11 @@ function buildPriceChart(
     'Closing price history (PKR)' +
     '</div>' +
 
-    '<svg class="priceChart" ' +
-    'viewBox="0 0 ' +
+    '<svg class="priceChart" viewBox="0 0 ' +
     width +
     ' ' +
     height +
     '" preserveAspectRatio="none">' +
-
-    horizontalLines +
 
     '<polygon points="' +
     areaPoints +
@@ -8430,65 +9694,6 @@ function buildPriceChart(
     '<polyline points="' +
     points +
     '" class="chartLine" />' +
-
-    '<text x="' +
-    paddingLeft +
-    '" y="' +
-    (
-      height -
-      8
-    ) +
-    '" class="chartLabel">' +
-
-    escapeHtml(
-      formatDate(
-        firstDate
-      )
-    ) +
-
-    '</text>' +
-
-    '<text x="' +
-    (
-      width /
-      2
-    ) +
-    '" y="' +
-    (
-      height -
-      8
-    ) +
-    '" text-anchor="middle" ' +
-    'class="chartLabel">' +
-
-    escapeHtml(
-      formatDate(
-        middleDate
-      )
-    ) +
-
-    '</text>' +
-
-    '<text x="' +
-    (
-      width -
-      paddingRight
-    ) +
-    '" y="' +
-    (
-      height -
-      8
-    ) +
-    '" text-anchor="end" ' +
-    'class="chartLabel">' +
-
-    escapeHtml(
-      formatDate(
-        lastDate
-      )
-    ) +
-
-    '</text>' +
 
     '</svg>' +
 
@@ -8499,15 +9704,6 @@ function buildPriceChart(
 function historyRangeToggle(
   activeRange
 ) {
-  const ranges =
-    [
-      '1M',
-      '6M',
-      '1Y',
-      '2Y',
-      'ALL'
-    ];
-
   return (
     '<div class="liveChartHeader">' +
 
@@ -8518,17 +9714,23 @@ function historyRangeToggle(
     '</div>' +
 
     '<div class="muted">' +
-    'Choose a period to recalculate performance and chart statistics.' +
+    'Choose a period to recalculate performance.' +
     '</div>' +
 
     '</div>' +
 
     '<div class="rangeToggle">' +
 
-    ranges
+    [
+      '1M',
+      '6M',
+      '1Y',
+      '2Y',
+      'ALL'
+    ]
       .map(
         range =>
-          '<button type="button" class="rangeButton ' +
+          '<button class="rangeButton ' +
           (
             range ===
               activeRange
@@ -8552,15 +9754,13 @@ function historyRangeToggle(
 function bindHistoryRangeButtons(
   symbol
 ) {
-  document
-    .querySelectorAll(
-      '.rangeButton'
-    )
+  document.querySelectorAll(
+    '.rangeButton'
+  )
     .forEach(
       button => {
         button.onclick =
           () => {
-
             selectedHistoryRange =
               button.dataset
                 .range ||
@@ -8578,14 +9778,16 @@ function bindHistoryRangeButtons(
 function renderHistory(
   result
 ) {
-  const summary =
-    result.summary;
-
   updateSelectedCompany(
     result
   );
 
-  if (!summary) {
+  const summary =
+    result.summary;
+
+  if (
+    !summary
+  ) {
     $('research')
       .innerHTML =
         historyRangeToggle(
@@ -8593,7 +9795,7 @@ function renderHistory(
         ) +
 
         '<div class="emptyState">' +
-        'No valid historical price data was available for this range.' +
+        'No valid historical price data was available.' +
         '</div>';
 
     bindHistoryRangeButtons(
@@ -8603,130 +9805,87 @@ function renderHistory(
     return;
   }
 
-  const changeClass =
-    percentClass(
-      summary.changePct
-    );
-
-  let html =
-    historyRangeToggle(
-      result.range
-    );
-
-  html +=
-    '<div class="summaryGrid">' +
-
-    metricCard(
-      'Latest daily close',
-      'PKR ' +
-      formatNumber(
-        summary.endPrice
-      ),
-      summary.endDate
-    ) +
-
-    metricCard(
-      summary.rangeLabel +
-      ' change',
-
-      '<span class="' +
-      changeClass +
-      '">' +
-      formatPercent(
-        summary.changePct
-      ) +
-      '</span>',
-
-      summary.startDate +
-      ' to ' +
-      summary.endDate
-    ) +
-
-    metricCard(
-      'Period high',
-      'PKR ' +
-      formatNumber(
-        summary.high
-      )
-    ) +
-
-    metricCard(
-      'Period low',
-      'PKR ' +
-      formatNumber(
-        summary.low
-      )
-    ) +
-
-    metricCard(
-      'Average volume',
-      formatNumber(
-        summary.averageVolume,
-        0
-      )
-    ) +
-
-    '</div>';
-
-  html +=
-    buildPriceChart(
-      result.data
-    );
-
-  if (
-    summary
-      .excludedAnomalies >
-    0
-  ) {
-    html +=
-      '<div class="warningBox">' +
-
-      summary
-        .excludedAnomalies +
-
-      ' suspicious historical row' +
-
-      (
-        summary
-          .excludedAnomalies ===
-        1
-          ? ' was'
-          : 's were'
-      ) +
-
-      ' excluded from this range.' +
-
-      '</div>';
-  }
-
-  html +=
-    '<div class="sourceNote">' +
-    'Historical daily data source: psxdata-api. ' +
-    'Latest live/session price is shown separately in Overview and Live Chart.' +
-    '</div>';
-
-  html +=
-    '<details>' +
-
-    '<summary>' +
-    'View raw historical data' +
-    '</summary>' +
-
-    '<pre>' +
-    escapeHtml(
-      JSON.stringify(
-        result.data,
-        null,
-        2
-      )
-    ) +
-    '</pre>' +
-
-    '</details>';
-
   $('research')
     .innerHTML =
-      html;
+      historyRangeToggle(
+        result.range
+      ) +
+
+      '<div class="summaryGrid">' +
+
+      metricCard(
+        'Latest daily close',
+        'PKR ' +
+        formatNumber(
+          summary.endPrice
+        ),
+        summary.endDate
+      ) +
+
+      metricCard(
+        summary.rangeLabel +
+        ' change',
+
+        '<span class="' +
+        percentClass(
+          summary.changePct
+        ) +
+        '">' +
+        formatPercent(
+          summary.changePct
+        ) +
+        '</span>',
+
+        summary.startDate +
+        ' to ' +
+        summary.endDate
+      ) +
+
+      metricCard(
+        'Period high',
+        'PKR ' +
+        formatNumber(
+          summary.high
+        )
+      ) +
+
+      metricCard(
+        'Period low',
+        'PKR ' +
+        formatNumber(
+          summary.low
+        )
+      ) +
+
+      metricCard(
+        'Average volume',
+        formatNumber(
+          summary.averageVolume,
+          0
+        )
+      ) +
+
+      '</div>' +
+
+      buildPriceChart(
+        result.data
+      ) +
+
+      (
+        summary.excludedAnomalies >
+          0
+          ? (
+              '<div class="warningBox">' +
+              summary.excludedAnomalies +
+              ' suspicious historical rows were excluded.' +
+              '</div>'
+            )
+          : ''
+      ) +
+
+      '<div class="sourceNote">' +
+      'Historical daily data: psxdata-api. Live/session price is shown separately.' +
+      '</div>';
 
   bindHistoryRangeButtons(
     result.symbol
@@ -8735,7 +9894,7 @@ function renderHistory(
 
 async function loadHistoryView(
   symbol,
-  range = '1Y'
+  range
 ) {
   stopLiveRefresh();
 
@@ -8743,18 +9902,10 @@ async function loadHistoryView(
     .innerHTML =
       '';
 
-  showSelectedCompany(
-    symbol
-  );
-
   $('research')
     .innerHTML =
       '<p class="muted">' +
-      'Loading ' +
-      escapeHtml(
-        range
-      ) +
-      ' history...' +
+      'Loading history...' +
       '</p>';
 
   try {
@@ -8768,62 +9919,647 @@ async function loadHistoryView(
       );
 
     selectedHistoryRange =
-      result.range ||
-      range;
+      result.range;
 
     renderHistory(
       result
     );
-
   } catch (error) {
-
-    $('research')
-      .innerHTML =
-        '';
-
     $('error')
       .textContent =
         error.message;
   }
 }
 
-/* ---------------------------------------
-   FUNDAMENTALS
---------------------------------------- */
+/* =========================================================
+   TECHNICAL UI
+========================================================= */
+
+function buildTechnicalChart(
+  rows
+) {
+  if (
+    !rows ||
+    rows.length < 2
+  ) {
+    return '';
+  }
+
+  const width = 1000;
+  const height = 360;
+  const left = 60;
+  const right = 20;
+  const top = 20;
+  const bottom = 30;
+
+  const usableWidth =
+    width -
+    left -
+    right;
+
+  const usableHeight =
+    height -
+    top -
+    bottom;
+
+  const allValues = [];
+
+  rows.forEach(
+    row => {
+      [
+        row.close,
+        row.sma20,
+        row.sma50,
+        row.sma200
+      ]
+        .forEach(
+          value => {
+            const number =
+              Number(value);
+
+            if (
+              Number.isFinite(
+                number
+              )
+            ) {
+              allValues.push(
+                number
+              );
+            }
+          }
+        );
+    }
+  );
+
+  if (
+    !allValues.length
+  ) {
+    return '';
+  }
+
+  let min =
+    Math.min(
+      ...allValues
+    );
+
+  let max =
+    Math.max(
+      ...allValues
+    );
+
+  const margin =
+    Math.max(
+      (
+        max -
+        min
+      ) *
+      .06,
+      max *
+      .002
+    );
+
+  min -= margin;
+  max += margin;
+
+  const x =
+    index =>
+      left +
+      (
+        index /
+        (
+          rows.length -
+          1
+        )
+      ) *
+      usableWidth;
+
+  const y =
+    value =>
+      top +
+      (
+        1 -
+        (
+          (
+            value -
+            min
+          ) /
+          (
+            max -
+            min
+          )
+        )
+      ) *
+      usableHeight;
+
+  function polyline(
+    key,
+    className
+  ) {
+    let segments = [];
+    let current = [];
+
+    rows.forEach(
+      (
+        row,
+        index
+      ) => {
+        const number =
+          Number(
+            row[key]
+          );
+
+        if (
+          Number.isFinite(
+            number
+          )
+        ) {
+          current.push(
+            x(index) +
+            ',' +
+            y(number)
+          );
+        } else if (
+          current.length
+        ) {
+          segments.push(
+            current
+          );
+
+          current = [];
+        }
+      }
+    );
+
+    if (
+      current.length
+    ) {
+      segments.push(
+        current
+      );
+    }
+
+    return segments.map(
+      segment =>
+        '<polyline points="' +
+        segment.join(' ') +
+        '" class="' +
+        className +
+        '" />'
+    )
+      .join('');
+  }
+
+  return (
+    '<div class="chartBox">' +
+
+    '<div class="chartTitle">' +
+    'Price with moving averages' +
+    '</div>' +
+
+    '<div class="chartLegend">' +
+
+    '<span><span class="legendSwatch price"></span>Price</span>' +
+
+    '<span><span class="legendSwatch sma20"></span>SMA 20</span>' +
+
+    '<span><span class="legendSwatch sma50"></span>SMA 50</span>' +
+
+    '<span><span class="legendSwatch sma200"></span>SMA 200</span>' +
+
+    '</div>' +
+
+    '<svg class="technicalChart" viewBox="0 0 ' +
+    width +
+    ' ' +
+    height +
+    '" preserveAspectRatio="none">' +
+
+    polyline(
+      'close',
+      'technicalPrice'
+    ) +
+
+    polyline(
+      'sma20',
+      'technicalSMA20'
+    ) +
+
+    polyline(
+      'sma50',
+      'technicalSMA50'
+    ) +
+
+    polyline(
+      'sma200',
+      'technicalSMA200'
+    ) +
+
+    '</svg>' +
+
+    '</div>'
+  );
+}
+
+function renderTechnical(
+  result
+) {
+  updateSelectedCompany(
+    result
+  );
+
+  if (
+    !result.available
+  ) {
+    $('research')
+      .innerHTML =
+        '<div class="emptyState">' +
+        escapeHtml(
+          result.reason ||
+          'Technical analysis unavailable.'
+        ) +
+        '</div>';
+
+    return;
+  }
+
+  const trend =
+    result.trend ||
+    {};
+
+  const momentum =
+    result.momentum ||
+    {};
+
+  const risk =
+    result.risk ||
+    {};
+
+  const volume =
+    result.volume ||
+    {};
+
+  const levels =
+    result.levels ||
+    {};
+
+  let html =
+    '<div class="decisionSectionTitle">' +
+    'Technical posture' +
+    '</div>' +
+
+    '<div class="posture">' +
+    escapeHtml(
+      trend.label ||
+      'Unavailable'
+    ) +
+    '</div>' +
+
+    '<div class="sourceNote">' +
+    'Based on daily historical price and volume through ' +
+    escapeHtml(
+      result.asOf ||
+      ''
+    ) +
+    '.' +
+    '</div>';
+
+  html +=
+    '<div class="summaryGrid">' +
+
+    metricCard(
+      'RSI (14)',
+      formatNumber(
+        momentum.rsi14,
+        1
+      ),
+      momentum.rsiLabel ||
+      ''
+    ) +
+
+    metricCard(
+      'MACD',
+      formatNumber(
+        momentum.macd,
+        2
+      ),
+      momentum.macdLabel ||
+      ''
+    ) +
+
+    metricCard(
+      '20-day momentum',
+      formatPercent(
+        momentum.momentum20Pct
+      )
+    ) +
+
+    metricCard(
+      '20D volatility',
+      formatPercent(
+        risk.annualizedVolatility20dPct
+      ),
+      'Annualized'
+    ) +
+
+    metricCard(
+      'ATR (14)',
+      risk.atr14 !==
+        null
+        ? (
+            'PKR ' +
+            formatNumber(
+              risk.atr14
+            )
+          )
+        : 'N/A',
+
+      risk.atrPct !==
+        null
+        ? (
+            formatPercent(
+              risk.atrPct
+            ) +
+            ' of price'
+          )
+        : ''
+    ) +
+
+    metricCard(
+      'Volume vs 20D',
+      volume.ratio !==
+        null
+        ? (
+            formatNumber(
+              volume.ratio,
+              2
+            ) +
+            'x'
+          )
+        : 'N/A',
+
+      volume.label ||
+      ''
+    ) +
+
+    '</div>';
+
+  html +=
+    '<div class="decisionSection">' +
+
+    '<div class="decisionSectionTitle">' +
+    'Trend structure' +
+    '</div>' +
+
+    '<div class="summaryGrid">' +
+
+    metricCard(
+      'Price',
+      'PKR ' +
+      formatNumber(
+        result.price
+      )
+    ) +
+
+    metricCard(
+      'SMA 20',
+      trend.sma20 !==
+        null
+        ? (
+            'PKR ' +
+            formatNumber(
+              trend.sma20
+            )
+          )
+        : 'N/A'
+    ) +
+
+    metricCard(
+      'SMA 50',
+      trend.sma50 !==
+        null
+        ? (
+            'PKR ' +
+            formatNumber(
+              trend.sma50
+            )
+          )
+        : 'N/A'
+    ) +
+
+    metricCard(
+      'SMA 200',
+      trend.sma200 !==
+        null
+        ? (
+            'PKR ' +
+            formatNumber(
+              trend.sma200
+            )
+          )
+        : 'N/A'
+    ) +
+
+    '</div>' +
+
+    '</div>';
+
+  html +=
+    '<div class="decisionSection">' +
+
+    '<div class="decisionSectionTitle">' +
+    'Recent price levels' +
+    '</div>' +
+
+    '<div class="summaryGrid">' +
+
+    metricCard(
+      '20D support',
+      levels.support20 !==
+        null
+        ? (
+            'PKR ' +
+            formatNumber(
+              levels.support20
+            )
+          )
+        : 'N/A',
+
+      levels.distanceToSupportPct !==
+        null
+        ? (
+            formatPercent(
+              levels.distanceToSupportPct
+            ) +
+            ' above support'
+          )
+        : ''
+    ) +
+
+    metricCard(
+      '20D resistance',
+      levels.resistance20 !==
+        null
+        ? (
+            'PKR ' +
+            formatNumber(
+              levels.resistance20
+            )
+          )
+        : 'N/A',
+
+      levels.distanceToResistancePct !==
+        null
+        ? (
+            formatPercent(
+              levels.distanceToResistancePct
+            ) +
+            ' to resistance'
+          )
+        : ''
+    ) +
+
+    '</div>' +
+
+    '</div>';
+
+  html +=
+    buildTechnicalChart(
+      result.chartData
+    );
+
+  html +=
+    '<div class="infoBox">' +
+    escapeHtml(
+      result.disclaimer
+    ) +
+    '</div>';
+
+  html +=
+    '<details>' +
+
+    '<summary>' +
+    'Indicator details & data quality' +
+    '</summary>' +
+
+    '<pre>' +
+    escapeHtml(
+      JSON.stringify(
+        {
+          trend:
+            result.trend,
+
+          momentum:
+            result.momentum,
+
+          risk:
+            result.risk,
+
+          volume:
+            result.volume,
+
+          levels:
+            result.levels,
+
+          dataQuality:
+            result.dataQuality
+        },
+        null,
+        2
+      )
+    ) +
+    '</pre>' +
+
+    '</details>';
+
+  $('research')
+    .innerHTML =
+      html;
+}
+
+/* =========================================================
+   FUNDAMENTALS UI
+========================================================= */
+
+function financialMetricRow(
+  table,
+  matcher
+) {
+  return table?.rows
+    ?.find(
+      row =>
+        matcher.test(
+          String(
+            row.label ||
+            ''
+          )
+        )
+    ) ||
+    null;
+}
 
 function financialMetricFromTable(
   table,
-  labelMatcher
+  matcher
 ) {
-  if (
-    !table
-      ?.rows
-      ?.length
-  ) {
-    return null;
-  }
-
   const row =
-    table.rows
-      .find(
-        item =>
-          labelMatcher.test(
-            String(
-              item.label ||
-              ''
-            )
-          )
-      );
+    financialMetricRow(
+      table,
+      matcher
+    );
+
+  return row
+    ?.values?.[0] ||
+    null;
+}
+
+function financialYoYChange(
+  table,
+  matcher
+) {
+  const row =
+    financialMetricRow(
+      table,
+      matcher
+    );
 
   if (
-    !row
-      ?.values
-      ?.length
+    !row?.values ||
+    row.values.length <
+      2
   ) {
     return null;
   }
 
-  return row.values[0];
+  const latest =
+    finiteNumber(
+      row.values[0]
+        .value
+    );
+
+  const previous =
+    finiteNumber(
+      row.values[1]
+        .value
+    );
+
+  if (
+    latest === null ||
+    previous === null ||
+    previous === 0
+  ) {
+    return null;
+  }
+
+  return (
+    (
+      latest -
+      previous
+    ) /
+    Math.abs(
+      previous
+    )
+  ) *
+  100;
 }
 
 function renderFinancialTable(
@@ -8831,17 +10567,13 @@ function renderFinancialTable(
   table
 ) {
   if (
-    !table
-      ?.periods
-      ?.length ||
-    !table
-      ?.rows
-      ?.length
+    !table?.periods?.length ||
+    !table?.rows?.length
   ) {
     return '';
   }
 
-  let html =
+  return (
     '<div class="decisionSection">' +
 
     '<div class="decisionSectionTitle">' +
@@ -8860,60 +10592,55 @@ function renderFinancialTable(
 
     '<th>Metric</th>' +
 
-    table.periods
-      .map(
-        period =>
-          '<th>' +
-          escapeHtml(
-            period
-          ) +
-          '</th>'
-      )
+    table.periods.map(
+      period =>
+        '<th>' +
+        escapeHtml(
+          period
+        ) +
+        '</th>'
+    )
       .join('') +
 
     '</tr>' +
 
     '</thead>' +
 
-    '<tbody>';
+    '<tbody>' +
 
-  for (
-    const row
-    of table.rows
-  ) {
-    html +=
-      '<tr>' +
+    table.rows.map(
+      row =>
+        '<tr>' +
 
-      '<td>' +
-      '<strong>' +
-      escapeHtml(
-        row.label
-      ) +
-      '</strong>' +
-      '</td>' +
+        '<td><strong>' +
+        escapeHtml(
+          row.label
+        ) +
+        '</strong></td>' +
 
-      row.values
-        .map(
-          item =>
+        row.values.map(
+          value =>
             '<td>' +
             escapeHtml(
-              item.raw ||
+              value.raw ||
               'N/A'
             ) +
             '</td>'
         )
-        .join('') +
+          .join('') +
 
-      '</tr>';
-  }
+        '</tr>'
+    )
+      .join('') +
 
-  html +=
     '</tbody>' +
-    '</table>' +
-    '</div>' +
-    '</div>';
 
-  return html;
+    '</table>' +
+
+    '</div>' +
+
+    '</div>'
+  );
 }
 
 function renderFundamentals(
@@ -8929,201 +10656,201 @@ function renderFundamentals(
     $('research')
       .innerHTML =
         '<div class="emptyState">' +
-
-        '<strong>' +
-        'Structured fundamentals are not available for this symbol from the connected PSX source.' +
-        '</strong>' +
-
-        '<div class="sourceNote">' +
-        'NOMAD will not invent or backfill missing financials.' +
-        '</div>' +
-
+        'Structured fundamentals are unavailable from the connected PSX source. NOMAD will not invent missing values.' +
         '</div>';
 
     return;
   }
 
-  const annualEPS =
+  const eps =
     financialMetricFromTable(
       result.annual,
       /^EPS$/i
     );
 
-  const annualPAT =
+  const pat =
     financialMetricFromTable(
       result.annual,
       /profit after taxation/i
     );
 
-  const annualIncome =
-    financialMetricFromTable(
+  const incomeRow =
+    financialMetricRow(
       result.annual,
       /^(sales|total income|mark-up earned)$/i
     );
 
-  const incomeRow =
-    result
-      .annual
-      ?.rows
-      ?.find(
-        item =>
-          /^(sales|total income|mark-up earned)$/i
-            .test(
-              item.label
-            )
-      );
+  const income =
+    incomeRow
+      ?.values?.[0] ||
+    null;
+
+  const epsYoY =
+    financialYoYChange(
+      result.annual,
+      /^EPS$/i
+    );
+
+  const patYoY =
+    financialYoYChange(
+      result.annual,
+      /profit after taxation/i
+    );
+
+  const incomeYoY =
+    financialYoYChange(
+      result.annual,
+      /^(sales|total income|mark-up earned)$/i
+    );
 
   let html =
     '<div class="decisionSectionTitle">' +
     'Fundamental snapshot' +
     '</div>' +
 
-    '<div class="summaryGrid">';
+    '<div class="summaryGrid">' +
 
-  html +=
     metricCard(
       'P/E',
-      result
-        .valuation
-        ?.peRatio ===
-          null ||
-      result
-        .valuation
-        ?.peRatio ===
-          undefined
-        ? 'N/A'
-        : formatNumber(
-            result
-              .valuation
-              .peRatio
+      result.valuation?.peRatio !==
+        null &&
+      result.valuation?.peRatio !==
+        undefined
+        ? formatNumber(
+            result.valuation.peRatio
           )
-    );
+        : 'N/A'
+    ) +
 
-  html +=
     metricCard(
       'Dividend yield',
-      result
-        .valuation
-        ?.dividendYield ===
-          null ||
-      result
-        .valuation
-        ?.dividendYield ===
-          undefined
-        ? 'N/A'
-        : formatPercent(
-            result
-              .valuation
-              .dividendYield
+      result.valuation?.dividendYield !==
+        null &&
+      result.valuation?.dividendYield !==
+        undefined
+        ? formatPercent(
+            result.valuation.dividendYield
           )
+        : 'N/A'
     );
 
-  if (annualEPS) {
+  if (
+    eps
+  ) {
     html +=
       metricCard(
         'Latest annual EPS',
-        escapeHtml(
-          annualEPS.raw ||
-          'N/A'
+        formatNumber(
+          eps.value
         ),
-        annualEPS.period
-      );
-  }
-
-  if (annualPAT) {
-    html +=
-      metricCard(
-        'Latest annual PAT',
-        escapeHtml(
-          annualPAT.raw ||
-          'N/A'
-        ) +
-        ' (000s)',
-        annualPAT.period
-      );
-  }
-
-  if (annualIncome) {
-    html +=
-      metricCard(
-        incomeRow
-          ?.label ||
-        'Latest annual income',
-
-        escapeHtml(
-          annualIncome.raw ||
-          'N/A'
-        ) +
-        ' (000s)',
-
-        annualIncome.period
+        eps.period
       );
   }
 
   if (
-    result
-      .valuation
-      ?.marketCapPkr !==
-      null &&
-    result
-      .valuation
-      ?.marketCapPkr !==
-      undefined
+    epsYoY !== null
   ) {
     html +=
       metricCard(
-        'Market cap',
-        formatCompactPKR(
-          result
-            .valuation
-            .marketCapPkr
-        )
+        'EPS YoY',
+        '<span class="' +
+        percentClass(
+          epsYoY
+        ) +
+        '">' +
+        formatPercent(
+          epsYoY
+        ) +
+        '</span>'
+      );
+  }
+
+  if (
+    pat
+  ) {
+    html +=
+      metricCard(
+        'Profit after tax',
+        formatFinancialThousands(
+          pat.value
+        ),
+        pat.period
+      );
+  }
+
+  if (
+    patYoY !== null
+  ) {
+    html +=
+      metricCard(
+        'PAT YoY',
+        '<span class="' +
+        percentClass(
+          patYoY
+        ) +
+        '">' +
+        formatPercent(
+          patYoY
+        ) +
+        '</span>'
+      );
+  }
+
+  if (
+    income
+  ) {
+    html +=
+      metricCard(
+        incomeRow.label,
+        formatFinancialThousands(
+          income.value
+        ),
+        income.period
+      );
+  }
+
+  if (
+    incomeYoY !== null
+  ) {
+    html +=
+      metricCard(
+        'Income YoY',
+        '<span class="' +
+        percentClass(
+          incomeYoY
+        ) +
+        '">' +
+        formatPercent(
+          incomeYoY
+        ) +
+        '</span>'
       );
   }
 
   html +=
-    '</div>';
+    '</div>' +
 
-  html +=
     renderFinancialTable(
       'Annual financials',
       result.annual
-    );
+    ) +
 
-  html +=
     renderFinancialTable(
       'Recent quarterly financials',
       result.quarterly
-    );
+    ) +
 
-  html +=
     renderFinancialTable(
       'Ratios',
       result.ratios
-    );
+    ) +
 
-  html +=
     '<div class="sourceNote">' +
     'Source: ' +
     escapeHtml(
       result.source
     ) +
-
-    (
-      result.fetchedAt
-        ? (
-            ' &bull; fetched ' +
-            escapeHtml(
-              formatDateTime(
-                result.fetchedAt
-              )
-            )
-          )
-        : ''
-    ) +
-
-    '. Values are shown as published/standardized by the source; no missing values are invented.' +
-
+    '. Summary PKR figures are converted from source values reported in thousands where applicable.' +
     '</div>';
 
   $('research')
@@ -9131,41 +10858,165 @@ function renderFundamentals(
       html;
 }
 
-/* ---------------------------------------
-   EVENTS
---------------------------------------- */
+/* =========================================================
+   EVENTS UI
+========================================================= */
+
+function isKeyEvent(
+  item
+) {
+  if (
+    item.type ===
+      'Financial' ||
+    item.type ===
+      'Payout'
+  ) {
+    return true;
+  }
+
+  const title =
+    String(
+      item.title ||
+      ''
+    ).toLowerCase();
+
+  if (
+    item.type ===
+      'Meeting' &&
+    title.includes(
+      'financial result'
+    )
+  ) {
+    return true;
+  }
+
+  return (
+    title.includes(
+      'dividend'
+    ) ||
+    title.includes(
+      'bonus'
+    ) ||
+    title.includes(
+      'right issue'
+    ) ||
+    title.includes(
+      'financial result'
+    )
+  );
+}
+
+function bindEventModeButtons() {
+  document.querySelectorAll(
+    '.eventModeButton'
+  )
+    .forEach(
+      button => {
+        button.onclick =
+          () => {
+            eventMode =
+              button.dataset
+                .mode ||
+              'key';
+
+            if (
+              lastEventsResult
+            ) {
+              renderEvents(
+                lastEventsResult
+              );
+            }
+          };
+      }
+    );
+}
 
 function renderEvents(
   result
 ) {
+  lastEventsResult =
+    result;
+
   updateSelectedCompany(
     result
   );
 
+  const allEvents =
+    Array.isArray(
+      result.events
+    )
+      ? result.events
+      : [];
+
+  const events =
+    eventMode ===
+      'all'
+      ? allEvents
+      : allEvents.filter(
+          isKeyEvent
+        );
+
   let html =
+    '<div class="liveChartHeader">' +
+
+    '<div>' +
+
     '<div class="decisionSectionTitle">' +
-    'Recent company events & announcements' +
+    'Company events & announcements' +
+    '</div>' +
+
+    '<div class="muted">' +
+    eventMode ===
+      'key'
+      ? 'Showing events most likely to matter to an investment decision.'
+      : 'Showing all available company announcements.' +
+    '</div>' +
+
+    '</div>' +
+
+    '<div class="eventToggle">' +
+
+    '<button class="eventModeButton ' +
+    (
+      eventMode ===
+        'key'
+        ? 'active'
+        : ''
+    ) +
+    '" data-mode="key">' +
+    'Key Events' +
+    '</button>' +
+
+    '<button class="eventModeButton ' +
+    (
+      eventMode ===
+        'all'
+        ? 'active'
+        : ''
+    ) +
+    '" data-mode="all">' +
+    'All' +
+    '</button>' +
+
+    '</div>' +
+
     '</div>';
 
   if (
-    !Array.isArray(
-      result.events
-    ) ||
-    !result.events.length
+    !events.length
   ) {
     html +=
       '<div class="emptyState">' +
-      'No recent structured announcements were available from the connected PSX source for this symbol.' +
+      'No matching announcements are available.' +
       '</div>';
   } else {
     html +=
       '<div class="eventList">' +
 
-      result.events
-        .slice(
-          0,
-          15
-        )
+      events.slice(
+        0,
+        20
+      )
         .map(
           item =>
             '<div class="eventItem">' +
@@ -9220,35 +11071,134 @@ function renderEvents(
     escapeHtml(
       result.source
     ) +
-
-    (
-      result.fetchedAt
-        ? (
-            ' &bull; fetched ' +
-            escapeHtml(
-              formatDateTime(
-                result.fetchedAt
-              )
-            )
-          )
-        : ''
-    ) +
-
-    '.</div>';
+    '</div>';
 
   $('research')
     .innerHTML =
       html;
+
+  bindEventModeButtons();
 }
 
-/* ---------------------------------------
-   BUTTON ACTIONS
---------------------------------------- */
+/* =========================================================
+   BUTTONS
+========================================================= */
+
+$('loadMarket')
+  .onclick =
+    async () => {
+
+      $('error')
+        .textContent =
+          '';
+
+      $('loadMarket')
+        .disabled =
+          true;
+
+      try {
+        const result =
+          await api(
+            'market'
+          );
+
+        marketRows =
+          result.stocks ||
+          [];
+
+        currentPage =
+          1;
+
+        $('coverage')
+          .textContent =
+            result.totalStocks +
+            ' usable stocks | Company names matched ' +
+            result.companyNamesMatched +
+            '/' +
+            result.totalStocks +
+            ' | Sectors matched ' +
+            result.sectorsMatched +
+            '/' +
+            result.totalStocks +
+            ' | Updated ' +
+            result.asOf;
+
+        populateSectors();
+
+        renderStocks();
+      } catch (error) {
+        $('error')
+          .textContent =
+            error.message;
+      } finally {
+        $('loadMarket')
+          .disabled =
+            false;
+      }
+    };
+
+$('search')
+  .oninput =
+    () => {
+      currentPage =
+        1;
+
+      renderStocks();
+    };
+
+$('sectorFilter')
+  .onchange =
+    () => {
+      currentPage =
+        1;
+
+      renderStocks();
+    };
+
+$('sort')
+  .onchange =
+    () => {
+      currentPage =
+        1;
+
+      renderStocks();
+    };
+
+$('previousPage')
+  .onclick =
+    () => {
+      if (
+        currentPage > 1
+      ) {
+        currentPage--;
+
+        renderStocks();
+      }
+    };
+
+$('nextPage')
+  .onclick =
+    () => {
+      const pageCount =
+        Math.ceil(
+          getFilteredRows()
+            .length /
+          PAGE_SIZE
+        );
+
+      if (
+        currentPage <
+        pageCount
+      ) {
+        currentPage++;
+
+        renderStocks();
+      }
+    };
 
 $('loadQuote')
   .onclick =
     async () => {
-
       $('error')
         .textContent =
           '';
@@ -9259,7 +11209,9 @@ $('loadQuote')
           .trim()
           .toUpperCase();
 
-      if (!symbol) {
+      if (
+        !symbol
+      ) {
         $('error')
           .textContent =
             'Enter a PSX symbol.';
@@ -9274,7 +11226,7 @@ $('loadQuote')
       $('research')
         .innerHTML =
           '<p class="muted">' +
-          'Loading decision overview...' +
+          'Loading overview...' +
           '</p>';
 
       try {
@@ -9302,23 +11254,16 @@ $('loadQuote')
           result.live ||
           null
         );
-
       } catch (error) {
-
         $('error')
           .textContent =
             error.message;
-
-        $('research')
-          .innerHTML =
-            '';
       }
     };
 
 $('loadLiveChart')
   .onclick =
-    async () => {
-
+    () => {
       $('error')
         .textContent =
           '';
@@ -9329,17 +11274,15 @@ $('loadLiveChart')
           .trim()
           .toUpperCase();
 
-      if (!symbol) {
+      if (
+        !symbol
+      ) {
         $('error')
           .textContent =
             'Enter a PSX symbol.';
 
         return;
       }
-
-      showSelectedCompany(
-        symbol
-      );
 
       startLiveChart(
         symbol
@@ -9348,8 +11291,7 @@ $('loadLiveChart')
 
 $('loadHistory')
   .onclick =
-    async () => {
-
+    () => {
       $('error')
         .textContent =
           '';
@@ -9360,7 +11302,9 @@ $('loadHistory')
           .trim()
           .toUpperCase();
 
-      if (!symbol) {
+      if (
+        !symbol
+      ) {
         $('error')
           .textContent =
             'Enter a PSX symbol.';
@@ -9370,15 +11314,13 @@ $('loadHistory')
 
       loadHistoryView(
         symbol,
-        selectedHistoryRange ||
-        '1Y'
+        selectedHistoryRange
       );
     };
 
-$('loadFundamentals')
+$('loadTechnical')
   .onclick =
     async () => {
-
       $('error')
         .textContent =
           '';
@@ -9389,7 +11331,9 @@ $('loadFundamentals')
           .trim()
           .toUpperCase();
 
-      if (!symbol) {
+      if (
+        !symbol
+      ) {
         $('error')
           .textContent =
             'Enter a PSX symbol.';
@@ -9403,14 +11347,64 @@ $('loadFundamentals')
         .innerHTML =
           '';
 
-      showSelectedCompany(
-        symbol
-      );
+      $('research')
+        .innerHTML =
+          '<p class="muted">' +
+          'Calculating technical indicators...' +
+          '</p>';
+
+      try {
+        const result =
+          await api(
+            'technical',
+            {
+              symbol
+            }
+          );
+
+        renderTechnical(
+          result
+        );
+      } catch (error) {
+        $('error')
+          .textContent =
+            error.message;
+      }
+    };
+
+$('loadFundamentals')
+  .onclick =
+    async () => {
+      $('error')
+        .textContent =
+          '';
+
+      const symbol =
+        $('stockSymbol')
+          .value
+          .trim()
+          .toUpperCase();
+
+      if (
+        !symbol
+      ) {
+        $('error')
+          .textContent =
+            'Enter a PSX symbol.';
+
+        return;
+      }
+
+      stopLiveRefresh();
+
+      $('liveStatus')
+        .innerHTML =
+          '';
 
       $('research')
         .innerHTML =
           '<p class="muted">' +
-          'Loading company fundamentals...' +
+          'Loading fundamentals...' +
           '</p>';
 
       try {
@@ -9425,13 +11419,7 @@ $('loadFundamentals')
         renderFundamentals(
           result
         );
-
       } catch (error) {
-
-        $('research')
-          .innerHTML =
-            '';
-
         $('error')
           .textContent =
             error.message;
@@ -9441,7 +11429,6 @@ $('loadFundamentals')
 $('loadEvents')
   .onclick =
     async () => {
-
       $('error')
         .textContent =
           '';
@@ -9452,7 +11439,9 @@ $('loadEvents')
           .trim()
           .toUpperCase();
 
-      if (!symbol) {
+      if (
+        !symbol
+      ) {
         $('error')
           .textContent =
             'Enter a PSX symbol.';
@@ -9466,15 +11455,14 @@ $('loadEvents')
         .innerHTML =
           '';
 
-      showSelectedCompany(
-        symbol
-      );
-
       $('research')
         .innerHTML =
           '<p class="muted">' +
-          'Loading recent company events...' +
+          'Loading company events...' +
           '</p>';
+
+      eventMode =
+        'key';
 
       try {
         const result =
@@ -9488,13 +11476,7 @@ $('loadEvents')
         renderEvents(
           result
         );
-
       } catch (error) {
-
-        $('research')
-          .innerHTML =
-            '';
-
         $('error')
           .textContent =
             error.message;
@@ -9504,7 +11486,6 @@ $('loadEvents')
 $('loadMore')
   .onclick =
     async () => {
-
       $('error')
         .textContent =
           '';
@@ -9515,7 +11496,9 @@ $('loadMore')
           .trim()
           .toUpperCase();
 
-      if (!symbol) {
+      if (
+        !symbol
+      ) {
         $('error')
           .textContent =
             'Enter a PSX symbol.';
@@ -9529,10 +11512,6 @@ $('loadMore')
         .innerHTML =
           '';
 
-      showSelectedCompany(
-        symbol
-      );
-
       try {
         let result =
           lastQuoteResult &&
@@ -9541,13 +11520,9 @@ $('loadMore')
             ? lastQuoteResult
             : null;
 
-        if (!result) {
-          $('research')
-            .innerHTML =
-              '<p class="muted">' +
-              'Loading additional market data...' +
-              '</p>';
-
+        if (
+          !result
+        ) {
           result =
             await api(
               'quote',
@@ -9567,26 +11542,22 @@ $('loadMore')
         renderMoreData(
           result
         );
-
       } catch (error) {
-
         $('error')
           .textContent =
             error.message;
-
-        $('research')
-          .innerHTML =
-            '';
       }
     };
 
 $('stockSymbol')
   .oninput =
     () => {
-
       stopLiveRefresh();
 
       lastQuoteResult =
+        null;
+
+      lastEventsResult =
         null;
 
       selectedHistoryRange =
@@ -9597,16 +11568,15 @@ $('stockSymbol')
           '';
     };
 
-/* ---------------------------------------
+/* =========================================================
    HEALTH
---------------------------------------- */
+========================================================= */
 
 api(
   'health'
 )
   .then(
     result => {
-
       $('status')
         .textContent =
           'Market: connected | ' +
@@ -9617,14 +11587,14 @@ api(
               ? 'configured'
               : 'not configured'
           ) +
-          ' | Fundamentals: PSX company data' +
+          ' | Fundamentals: connected' +
+          ' | Technical engine: deterministic' +
           ' | Prediction engine: ' +
           result.predictionEngine;
     }
   )
   .catch(
     error => {
-
       $('status')
         .textContent =
           error.message;
@@ -9659,7 +11629,6 @@ if (
       port,
       '127.0.0.1',
       () => {
-
         console.log(
           `NOMAD Invest running at http://127.0.0.1:${port}`
         );
