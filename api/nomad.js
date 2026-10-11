@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.8.2';
+const VERSION = '0.8.3';
 
 
 const SUPABASE_URL =
@@ -12446,7 +12446,7 @@ async function supabaseRest(
       'application/json',
 
     'User-Agent':
-      'NOMAD-Invest-Server/0.8.2'
+      'NOMAD-Invest-Server/0.8.3'
   };
 
   if (
@@ -13303,7 +13303,7 @@ async function runContinuousMemoryTest(
 
 
 /* =========================================================
-   PORTFOLIO + HISTORICAL SITUATION CONTEXT - BUILD 0.8.2
+   PORTFOLIO + HISTORICAL SITUATION CONTEXT - BUILD 0.8.3
 ========================================================= */
 
 function sessionReturn(
@@ -13449,6 +13449,20 @@ function buildHistoricalContext(
       rows[rows.length - 1]?.close
     );
 
+  const closes =
+    rows
+      .map(
+        row =>
+          safeNumber(
+            row.close
+          )
+      )
+      .filter(
+        value =>
+          value !== null &&
+          value > 0
+      );
+
   const sma20 =
     simpleAverageClose(
       rows,
@@ -13573,6 +13587,235 @@ function buildHistoricalContext(
       price
     );
 
+  const rsiValues =
+    closes.length >= 15
+      ? rsiSeries(
+          closes,
+          14
+        )
+      : [];
+
+  const latestRsi =
+    rsiValues.length
+      ? safeNumber(
+          rsiValues[
+            rsiValues.length - 1
+          ]
+        )
+      : null;
+
+  const macd =
+    closes.length >= 35
+      ? macdSeries(
+          closes
+        )
+      : null;
+
+  const latestMacd =
+    macd?.macd?.length
+      ? safeNumber(
+          macd.macd[
+            macd.macd.length - 1
+          ]
+        )
+      : null;
+
+  const latestMacdSignal =
+    macd?.signal?.length
+      ? safeNumber(
+          macd.signal[
+            macd.signal.length - 1
+          ]
+        )
+      : null;
+
+  const latestMacdHistogram =
+    macd?.histogram?.length
+      ? safeNumber(
+          macd.histogram[
+            macd.histogram.length - 1
+          ]
+        )
+      : null;
+
+  const recentReturnRows =
+    rows.slice(-21);
+
+  const logReturns = [];
+
+  for (
+    let index = 1;
+    index < recentReturnRows.length;
+    index++
+  ) {
+    const previous =
+      safeNumber(
+        recentReturnRows[
+          index - 1
+        ]?.close
+      );
+
+    const current =
+      safeNumber(
+        recentReturnRows[
+          index
+        ]?.close
+      );
+
+    if (
+      previous !== null &&
+      current !== null &&
+      previous > 0 &&
+      current > 0
+    ) {
+      logReturns.push(
+        Math.log(
+          current /
+          previous
+        )
+      );
+    }
+  }
+
+  const dailyVolatility =
+    standardDeviation(
+      logReturns
+    );
+
+  const annualizedVolatility20dPct =
+    dailyVolatility !== null
+      ? dailyVolatility *
+        Math.sqrt(252) *
+        100
+      : null;
+
+  const recent20 =
+    rows.slice(-20);
+
+  const recentVolumes =
+    recent20
+      .map(
+        row =>
+          safeNumber(
+            row.volume
+          ) ??
+          0
+      );
+
+  const averageVolume20 =
+    recentVolumes.length
+      ? mean(
+          recentVolumes
+        )
+      : null;
+
+  const latestVolume =
+    safeNumber(
+      rows[
+        rows.length - 1
+      ]?.volume
+    );
+
+  const volumeRatio20d =
+    latestVolume !== null &&
+    averageVolume20 !== null &&
+    averageVolume20 > 0
+      ? latestVolume /
+        averageVolume20
+      : null;
+
+  const support20 =
+    recent20.length
+      ? Math.min(
+          ...recent20
+            .map(
+              row =>
+                safeNumber(
+                  row.low
+                ) ??
+                safeNumber(
+                  row.close
+                )
+            )
+            .filter(
+              value =>
+                value !== null
+            )
+        )
+      : null;
+
+  const resistance20 =
+    recent20.length
+      ? Math.max(
+          ...recent20
+            .map(
+              row =>
+                safeNumber(
+                  row.high
+                ) ??
+                safeNumber(
+                  row.close
+                )
+            )
+            .filter(
+              value =>
+                value !== null
+            )
+        )
+      : null;
+
+  let runningPeak =
+    null;
+
+  let maxDrawdown52wPct =
+    0;
+
+  for (
+    const row
+    of last252
+  ) {
+    const close =
+      safeNumber(
+        row.close
+      );
+
+    if (
+      close === null ||
+      close <= 0
+    ) {
+      continue;
+    }
+
+    if (
+      runningPeak === null ||
+      close > runningPeak
+    ) {
+      runningPeak =
+        close;
+    }
+
+    if (
+      runningPeak !== null &&
+      runningPeak > 0
+    ) {
+      const drawdown =
+        (
+          close -
+          runningPeak
+        ) /
+        runningPeak *
+        100;
+
+      if (
+        drawdown <
+        maxDrawdown52wPct
+      ) {
+        maxDrawdown52wPct =
+          drawdown;
+      }
+    }
+  }
+
   const flags = [];
 
   if (
@@ -13653,6 +13896,33 @@ function buildHistoricalContext(
     );
   }
 
+  if (
+    latestRsi !== null &&
+    latestRsi >= 70
+  ) {
+    flags.push(
+      'RSI is in an overbought zone'
+    );
+  }
+
+  if (
+    latestRsi !== null &&
+    latestRsi <= 30
+  ) {
+    flags.push(
+      'RSI is in an oversold zone'
+    );
+  }
+
+  if (
+    volumeRatio20d !== null &&
+    volumeRatio20d >= 1.5
+  ) {
+    flags.push(
+      'Volume is elevated versus the recent average'
+    );
+  }
+
   return {
     symbol,
     available: true,
@@ -13716,6 +13986,58 @@ function buildHistoricalContext(
         return1m,
         trend
       ),
+    technical: {
+      rsi14:
+        roundMemoryNumber(
+          latestRsi,
+          2
+        ),
+      macd:
+        roundMemoryNumber(
+          latestMacd,
+          4
+        ),
+      macdSignal:
+        roundMemoryNumber(
+          latestMacdSignal,
+          4
+        ),
+      macdHistogram:
+        roundMemoryNumber(
+          latestMacdHistogram,
+          4
+        ),
+      volumeRatio20d:
+        roundMemoryNumber(
+          volumeRatio20d,
+          2
+        ),
+      annualizedVolatility20dPct:
+        roundMemoryNumber(
+          annualizedVolatility20dPct,
+          2
+        ),
+      momentum20Pct:
+        roundMemoryNumber(
+          return1m,
+          2
+        ),
+      support20:
+        roundMemoryNumber(
+          support20,
+          2
+        ),
+      resistance20:
+        roundMemoryNumber(
+          resistance20,
+          2
+        ),
+      maxDrawdown52wPct:
+        roundMemoryNumber(
+          maxDrawdown52wPct,
+          2
+        )
+    },
     range52: {
       high:
         roundMemoryNumber(
@@ -14475,7 +14797,2895 @@ async function readJsonRequestBody(
 }
 
 /* =========================================================
-   CONTINUOUS INTELLIGENCE SCANNER - BUILD 0.8.2
+   DECISION LAB - BUILD 0.8.3
+   Experimental shadow engine. No automatic trading.
+========================================================= */
+
+const DECISION_MODELS = {
+  long_term: {
+    id: 'NOMAD-LT-0.1',
+    horizon: 'long_term',
+    status: 'SHADOW_UNVALIDATED',
+    realMoneyEligible: false,
+    weights: {
+      fundamental: 0.35,
+      valuation: 0.20,
+      entry: 0.20,
+      risk: 0.15,
+      dataQuality: 0.10
+    }
+  },
+  short_term: {
+    id: 'NOMAD-ST-0.1',
+    horizon: 'short_term',
+    status: 'SHADOW_UNVALIDATED',
+    realMoneyEligible: false,
+    weights: {
+      fundamental: 0.15,
+      valuation: 0.10,
+      entry: 0.40,
+      risk: 0.25,
+      dataQuality: 0.10
+    }
+  }
+};
+
+const DECISION_RISK_POLICIES = {
+  conservative: {
+    id: 'RISK-CONSERVATIVE-0.1',
+    minAverageVolume30d: 150000,
+    maxAnnualizedVolatilityPct: 45,
+    minDataQualityScore: 80,
+    minOverallScore: 74,
+    minRiskScore: 60,
+    maxStockPct: 0.35,
+    maxSectorPct: 0.45,
+    maxAllocations: 3
+  },
+  balanced: {
+    id: 'RISK-BALANCED-0.1',
+    minAverageVolume30d: 50000,
+    maxAnnualizedVolatilityPct: 65,
+    minDataQualityScore: 72,
+    minOverallScore: 68,
+    minRiskScore: 48,
+    maxStockPct: 0.45,
+    maxSectorPct: 0.60,
+    maxAllocations: 3
+  },
+  aggressive: {
+    id: 'RISK-AGGRESSIVE-0.1',
+    minAverageVolume30d: 15000,
+    maxAnnualizedVolatilityPct: 85,
+    minDataQualityScore: 65,
+    minOverallScore: 63,
+    minRiskScore: 35,
+    maxStockPct: 0.60,
+    maxSectorPct: 0.80,
+    maxAllocations: 4
+  }
+};
+
+function decisionClamp(
+  value,
+  minimum = 0,
+  maximum = 100
+) {
+  const number =
+    safeNumber(value);
+
+  if (number === null) {
+    return minimum;
+  }
+
+  return Math.min(
+    maximum,
+    Math.max(
+      minimum,
+      number
+    )
+  );
+}
+
+function decisionRound(
+  value,
+  digits = 2
+) {
+  return roundMemoryNumber(
+    value,
+    digits
+  );
+}
+
+function decisionPercentile(
+  value,
+  values,
+  higherIsBetter = true
+) {
+  const number =
+    safeNumber(value);
+
+  const clean =
+    (Array.isArray(values)
+      ? values
+      : [])
+      .map(
+        item =>
+          safeNumber(item)
+      )
+      .filter(
+        item =>
+          item !== null
+      )
+      .sort(
+        (
+          a,
+          b
+        ) =>
+          a - b
+      );
+
+  if (
+    number === null ||
+    !clean.length
+  ) {
+    return 40;
+  }
+
+  if (clean.length === 1) {
+    return 60;
+  }
+
+  let belowOrEqual =
+    0;
+
+  for (
+    const item
+    of clean
+  ) {
+    if (item <= number) {
+      belowOrEqual++;
+    }
+  }
+
+  const percentile =
+    (
+      belowOrEqual - 1
+    ) /
+    Math.max(
+      1,
+      clean.length - 1
+    );
+
+  return decisionClamp(
+    (
+      higherIsBetter
+        ? percentile
+        : 1 - percentile
+    ) *
+      100
+  );
+}
+
+function decisionFinancialRow(
+  table,
+  matcher
+) {
+  return table?.rows
+    ?.find(
+      row =>
+        matcher.test(
+          String(
+            row.label ||
+            ''
+          )
+        )
+    ) ||
+    null;
+}
+
+function decisionFinancialMetric(
+  table,
+  matcher
+) {
+  const row =
+    decisionFinancialRow(
+      table,
+      matcher
+    );
+
+  const item =
+    row?.values?.[0] ||
+    null;
+
+  return item
+    ? {
+        label:
+          row.label,
+        period:
+          item.period ||
+          null,
+        value:
+          safeNumber(
+            item.value
+          )
+      }
+    : null;
+}
+
+function decisionFinancialYoY(
+  table,
+  matcher
+) {
+  const row =
+    decisionFinancialRow(
+      table,
+      matcher
+    );
+
+  if (
+    !row?.values ||
+    row.values.length < 2
+  ) {
+    return null;
+  }
+
+  const latest =
+    safeNumber(
+      row.values[0]?.value
+    );
+
+  const previous =
+    safeNumber(
+      row.values[1]?.value
+    );
+
+  if (
+    latest === null ||
+    previous === null ||
+    previous === 0
+  ) {
+    return null;
+  }
+
+  return (
+    latest -
+    previous
+  ) /
+    Math.abs(previous) *
+    100;
+}
+
+function decisionMetricFromRatios(
+  ratios,
+  matcher
+) {
+  return decisionFinancialMetric(
+    ratios,
+    matcher
+  );
+}
+
+function scoreDecisionFundamentals(
+  fundamentals
+) {
+  if (!fundamentals?.available) {
+    return {
+      available: false,
+      score: 35,
+      coverage: 0,
+      metrics: {},
+      reasons: [
+        'Structured PSX fundamentals were unavailable during this decision run.'
+      ],
+      risks: [
+        'NOMAD will not issue a validated long-term buy without sufficient fundamental evidence.'
+      ]
+    };
+  }
+
+  const eps =
+    decisionFinancialMetric(
+      fundamentals.annual,
+      /^EPS$/i
+    );
+
+  const pat =
+    decisionFinancialMetric(
+      fundamentals.annual,
+      /profit after taxation/i
+    );
+
+  const income =
+    decisionFinancialMetric(
+      fundamentals.annual,
+      /^(sales|total income|mark-up earned|revenue)$/i
+    );
+
+  const roe =
+    decisionMetricFromRatios(
+      fundamentals.ratios,
+      /return on equity|\broe\b/i
+    );
+
+  const margin =
+    decisionMetricFromRatios(
+      fundamentals.ratios,
+      /net profit margin/i
+    );
+
+  const epsYoY =
+    decisionFinancialYoY(
+      fundamentals.annual,
+      /^EPS$/i
+    );
+
+  const patYoY =
+    decisionFinancialYoY(
+      fundamentals.annual,
+      /profit after taxation/i
+    );
+
+  const incomeYoY =
+    decisionFinancialYoY(
+      fundamentals.annual,
+      /^(sales|total income|mark-up earned|revenue)$/i
+    );
+
+  let score = 50;
+  let observed = 0;
+  const reasons = [];
+  const risks = [];
+
+  if (eps?.value !== null && eps?.value !== undefined) {
+    observed++;
+
+    if (eps.value > 0) {
+      score += 10;
+      reasons.push(
+        'Latest annual EPS is positive.'
+      );
+    } else {
+      score -= 25;
+      risks.push(
+        'Latest annual EPS is not positive.'
+      );
+    }
+  }
+
+  if (epsYoY !== null) {
+    observed++;
+
+    if (epsYoY >= 15) {
+      score += 12;
+      reasons.push(
+        'Annual EPS growth is strong.'
+      );
+    } else if (epsYoY >= 0) {
+      score += 6;
+      reasons.push(
+        'Annual EPS is growing.'
+      );
+    } else if (epsYoY <= -20) {
+      score -= 15;
+      risks.push(
+        'Annual EPS has declined materially.'
+      );
+    } else {
+      score -= 6;
+      risks.push(
+        'Annual EPS growth is negative.'
+      );
+    }
+  }
+
+  if (pat?.value !== null && pat?.value !== undefined) {
+    observed++;
+
+    if (pat.value > 0) {
+      score += 8;
+      reasons.push(
+        'Latest annual profit after tax is positive.'
+      );
+    } else {
+      score -= 20;
+      risks.push(
+        'Latest annual profit after tax is not positive.'
+      );
+    }
+  }
+
+  if (patYoY !== null) {
+    observed++;
+
+    if (patYoY >= 15) {
+      score += 10;
+      reasons.push(
+        'Profit after tax growth is strong.'
+      );
+    } else if (patYoY >= 0) {
+      score += 5;
+    } else if (patYoY <= -20) {
+      score -= 12;
+      risks.push(
+        'Profit after tax has declined materially.'
+      );
+    } else {
+      score -= 5;
+    }
+  }
+
+  if (incomeYoY !== null) {
+    observed++;
+
+    if (incomeYoY >= 10) {
+      score += 6;
+      reasons.push(
+        'Top-line/income growth is positive.'
+      );
+    } else if (incomeYoY < -10) {
+      score -= 6;
+      risks.push(
+        'Top-line/income growth is weak.'
+      );
+    }
+  }
+
+  if (roe?.value !== null && roe?.value !== undefined) {
+    observed++;
+
+    if (roe.value >= 20) {
+      score += 10;
+      reasons.push(
+        'Return on equity is strong.'
+      );
+    } else if (roe.value >= 12) {
+      score += 6;
+    } else if (roe.value < 0) {
+      score -= 12;
+      risks.push(
+        'Return on equity is negative.'
+      );
+    }
+  }
+
+  if (margin?.value !== null && margin?.value !== undefined) {
+    observed++;
+
+    if (margin.value > 0) {
+      score += 4;
+    } else {
+      score -= 8;
+    }
+  }
+
+  const coverage =
+    decisionClamp(
+      observed /
+        7 *
+        100
+    );
+
+  if (coverage < 40) {
+    risks.push(
+      'Fundamental metric coverage is limited.'
+    );
+  }
+
+  return {
+    available: true,
+    score:
+      decisionRound(
+        decisionClamp(score),
+        2
+      ),
+    coverage:
+      decisionRound(
+        coverage,
+        2
+      ),
+    metrics: {
+      eps,
+      epsYoY:
+        decisionRound(
+          epsYoY,
+          2
+        ),
+      profitAfterTax:
+        pat,
+      profitAfterTaxYoY:
+        decisionRound(
+          patYoY,
+          2
+        ),
+      income,
+      incomeYoY:
+        decisionRound(
+          incomeYoY,
+          2
+        ),
+      roe,
+      netProfitMargin:
+        margin
+    },
+    reasons,
+    risks
+  };
+}
+
+function scoreDecisionValuation(
+  row,
+  eligibleRows
+) {
+  const pe =
+    safeNumber(
+      row?.peRatio
+    );
+
+  const dividendYield =
+    safeNumber(
+      row?.dividendYield
+    );
+
+  const sectorRows =
+    (eligibleRows || [])
+      .filter(
+        item =>
+          String(
+            item.sector ||
+            ''
+          ) ===
+            String(
+              row?.sector ||
+              ''
+            ) &&
+          safeNumber(
+            item.peRatio
+          ) !== null &&
+          safeNumber(
+            item.peRatio
+          ) > 0 &&
+          safeNumber(
+            item.peRatio
+          ) < 100
+      );
+
+  const comparisonRows =
+    sectorRows.length >= 4
+      ? sectorRows
+      : (eligibleRows || [])
+          .filter(
+            item => {
+              const value =
+                safeNumber(
+                  item.peRatio
+                );
+
+              return (
+                value !== null &&
+                value > 0 &&
+                value < 100
+              );
+            }
+          );
+
+  const relativePeScore =
+    pe !== null &&
+    pe > 0
+      ? decisionPercentile(
+          pe,
+          comparisonRows.map(
+            item =>
+              item.peRatio
+          ),
+          false
+        )
+      : 40;
+
+  let absolutePeScore = 40;
+
+  if (
+    pe !== null &&
+    pe > 0
+  ) {
+    if (pe < 3) {
+      absolutePeScore = 50;
+    } else if (pe <= 10) {
+      absolutePeScore = 90;
+    } else if (pe <= 15) {
+      absolutePeScore = 78;
+    } else if (pe <= 25) {
+      absolutePeScore = 62;
+    } else if (pe <= 40) {
+      absolutePeScore = 38;
+    } else {
+      absolutePeScore = 20;
+    }
+  }
+
+  let dividendScore = 45;
+
+  if (dividendYield !== null) {
+    if (dividendYield >= 8 && dividendYield <= 15) {
+      dividendScore = 88;
+    } else if (dividendYield >= 4) {
+      dividendScore = 72;
+    } else if (dividendYield > 0) {
+      dividendScore = 56;
+    } else {
+      dividendScore = 40;
+    }
+
+    if (dividendYield > 15) {
+      dividendScore = 62;
+    }
+  }
+
+  const score =
+    relativePeScore *
+      0.55 +
+    absolutePeScore *
+      0.30 +
+    dividendScore *
+      0.15;
+
+  const reasons = [];
+  const risks = [];
+
+  if (pe !== null) {
+    reasons.push(
+      'P/E ' +
+      decisionRound(
+        pe,
+        2
+      ) +
+      ' is compared with the stock\'s sector where sufficient peers exist.'
+    );
+  } else {
+    risks.push(
+      'Positive P/E data is unavailable.'
+    );
+  }
+
+  if (
+    dividendYield !== null &&
+    dividendYield >= 4
+  ) {
+    reasons.push(
+      'Dividend yield contributes positively to the valuation/income view.'
+    );
+  }
+
+  return {
+    score:
+      decisionRound(
+        decisionClamp(score),
+        2
+      ),
+    peRatio:
+      decisionRound(
+        pe,
+        2
+      ),
+    dividendYield:
+      decisionRound(
+        dividendYield,
+        2
+      ),
+    relativePeScore:
+      decisionRound(
+        relativePeScore,
+        2
+      ),
+    reasons,
+    risks
+  };
+}
+
+function scoreDecisionEntry(
+  context,
+  horizon,
+  riskPolicy
+) {
+  if (!context?.available) {
+    return {
+      score: 20,
+      reasons: [],
+      risks: [
+        'Historical price context is unavailable.'
+      ]
+    };
+  }
+
+  let score = 50;
+  const reasons = [];
+  const risks = [];
+  const returns =
+    context.returns ||
+    {};
+  const technical =
+    context.technical ||
+    {};
+  const averages =
+    context.movingAverages ||
+    {};
+  const price =
+    safeNumber(
+      context.price
+    );
+
+  const rsi =
+    safeNumber(
+      technical.rsi14
+    );
+
+  const macdHistogram =
+    safeNumber(
+      technical.macdHistogram
+    );
+
+  const volumeRatio =
+    safeNumber(
+      technical.volumeRatio20d
+    );
+
+  const volatility =
+    safeNumber(
+      technical.annualizedVolatility20dPct
+    );
+
+  if (horizon === 'short_term') {
+    if (context.trend === 'Uptrend') {
+      score += 18;
+      reasons.push(
+        'Short/medium trend is positive.'
+      );
+    } else if (context.trend === 'Downtrend') {
+      score -= 18;
+      risks.push(
+        'Short/medium trend is negative.'
+      );
+    }
+
+    const d5 =
+      safeNumber(
+        returns.d5
+      );
+
+    const m1 =
+      safeNumber(
+        returns.m1
+      );
+
+    if (d5 !== null) {
+      if (d5 > 0 && d5 <= 8) {
+        score += 8;
+      } else if (d5 > 8 && d5 <= 15) {
+        score += 3;
+        risks.push(
+          'Recent move is already extended; chase risk is higher.'
+        );
+      } else if (d5 > 15) {
+        score -= 5;
+        risks.push(
+          'Five-session move is very extended.'
+        );
+      } else if (d5 < 0) {
+        score -= 8;
+      }
+    }
+
+    if (m1 !== null) {
+      if (m1 > 0) {
+        score += 10;
+      } else {
+        score -= 10;
+      }
+    }
+
+    if (rsi !== null) {
+      if (rsi >= 50 && rsi <= 68) {
+        score += 8;
+        reasons.push(
+          'RSI supports positive momentum without being extremely extended.'
+        );
+      } else if (rsi >= 75) {
+        score -= 10;
+        risks.push(
+          'RSI is highly extended.'
+        );
+      } else if (rsi < 35) {
+        score -= 8;
+        risks.push(
+          'RSI shows weak momentum.'
+        );
+      }
+    }
+
+    if (macdHistogram !== null) {
+      if (macdHistogram > 0) {
+        score += 8;
+      } else {
+        score -= 8;
+      }
+    }
+
+    if (volumeRatio !== null) {
+      if (volumeRatio >= 1.2 && volumeRatio <= 3) {
+        score += 8;
+        reasons.push(
+          'Volume participation is above its recent average.'
+        );
+      } else if (volumeRatio < 0.5) {
+        score -= 5;
+      }
+    }
+  } else {
+    if (context.trend === 'Uptrend') {
+      score += 15;
+      reasons.push(
+        'Price is above the short and medium moving averages.'
+      );
+    } else if (context.trend === 'Downtrend') {
+      score -= 12;
+      risks.push(
+        'Price remains below the short and medium moving averages.'
+      );
+    }
+
+    const sma200 =
+      safeNumber(
+        averages.sma200
+      );
+
+    if (
+      price !== null &&
+      sma200 !== null
+    ) {
+      if (price >= sma200) {
+        score += 8;
+        reasons.push(
+          'Price is above the 200-session moving average.'
+        );
+      } else {
+        score -= 8;
+        risks.push(
+          'Price is below the 200-session moving average.'
+        );
+      }
+    }
+
+    const m1 =
+      safeNumber(
+        returns.m1
+      );
+
+    const m3 =
+      safeNumber(
+        returns.m3
+      );
+
+    if (m1 !== null) {
+      if (m1 >= -5 && m1 <= 10) {
+        score += 5;
+      } else if (m1 > 10 && m1 <= 20) {
+        score += 2;
+      } else if (m1 > 20) {
+        score -= 4;
+        risks.push(
+          'One-month price move is extended; entry risk is higher.'
+        );
+      } else if (m1 < -10) {
+        score -= 8;
+        risks.push(
+          'One-month performance is weak.'
+        );
+      }
+    }
+
+    if (m3 !== null) {
+      if (m3 > 0) {
+        score += 6;
+      } else if (m3 < -15) {
+        score -= 8;
+      }
+    }
+
+    if (rsi !== null) {
+      if (rsi >= 40 && rsi <= 65) {
+        score += 8;
+      } else if (rsi >= 70) {
+        score -= 7;
+        risks.push(
+          'RSI indicates a stretched entry.'
+        );
+      } else if (rsi <= 25) {
+        score -= 4;
+        risks.push(
+          'Very low RSI is treated as weakness, not an automatic buy signal.'
+        );
+      }
+    }
+
+    if (macdHistogram !== null) {
+      if (macdHistogram > 0) {
+        score += 6;
+      } else {
+        score -= 6;
+      }
+    }
+
+    if (
+      volumeRatio !== null &&
+      volumeRatio >= 0.8 &&
+      volumeRatio <= 2.5
+    ) {
+      score += 3;
+    }
+  }
+
+  if (
+    volatility !== null &&
+    volatility >
+      riskPolicy.maxAnnualizedVolatilityPct
+  ) {
+    score -= 12;
+    risks.push(
+      'Recent annualized volatility exceeds this risk profile\'s experimental limit.'
+    );
+  }
+
+  return {
+    score:
+      decisionRound(
+        decisionClamp(score),
+        2
+      ),
+    reasons,
+    risks
+  };
+}
+
+function scoreDecisionRisk(
+  row,
+  context,
+  eligibleRows
+) {
+  const liquidityScore =
+    decisionPercentile(
+      row?.averageVolume30d,
+      (eligibleRows || []).map(
+        item =>
+          item.averageVolume30d
+      ),
+      true
+    );
+
+  const sizeScore =
+    decisionPercentile(
+      row?.marketCap,
+      (eligibleRows || []).map(
+        item =>
+          item.marketCap
+      ),
+      true
+    );
+
+  const volatility =
+    safeNumber(
+      context?.technical
+        ?.annualizedVolatility20dPct
+    );
+
+  let volatilityScore = 45;
+
+  if (volatility !== null) {
+    if (volatility <= 30) {
+      volatilityScore = 90;
+    } else if (volatility <= 45) {
+      volatilityScore = 76;
+    } else if (volatility <= 60) {
+      volatilityScore = 58;
+    } else if (volatility <= 80) {
+      volatilityScore = 38;
+    } else {
+      volatilityScore = 18;
+    }
+  }
+
+  const drawdown =
+    safeNumber(
+      context?.technical
+        ?.maxDrawdown52wPct
+    );
+
+  let drawdownScore = 45;
+
+  if (drawdown !== null) {
+    if (drawdown >= -15) {
+      drawdownScore = 88;
+    } else if (drawdown >= -30) {
+      drawdownScore = 68;
+    } else if (drawdown >= -50) {
+      drawdownScore = 42;
+    } else {
+      drawdownScore = 20;
+    }
+  }
+
+  let score =
+    liquidityScore * 0.35 +
+    sizeScore * 0.25 +
+    volatilityScore * 0.25 +
+    drawdownScore * 0.15;
+
+  const statusCodes =
+    Array.isArray(
+      row?.statusCodes
+    )
+      ? row.statusCodes
+      : [];
+
+  const risks = [];
+  const reasons = [];
+
+  if (statusCodes.includes('NC')) {
+    score = Math.min(
+      score,
+      15
+    );
+    risks.push(
+      'PSX non-compliant-segment status is present; NOMAD excludes this from new-buy decisions.'
+    );
+  }
+
+  if (liquidityScore >= 70) {
+    reasons.push(
+      '30-day trading liquidity ranks well within the eligible universe.'
+    );
+  }
+
+  if (
+    volatility !== null &&
+    volatility <= 45
+  ) {
+    reasons.push(
+      'Recent volatility is moderate relative to the engine\'s current risk scale.'
+    );
+  }
+
+  return {
+    score:
+      decisionRound(
+        decisionClamp(score),
+        2
+      ),
+    liquidityScore:
+      decisionRound(
+        liquidityScore,
+        2
+      ),
+    sizeScore:
+      decisionRound(
+        sizeScore,
+        2
+      ),
+    volatility:
+      decisionRound(
+        volatility,
+        2
+      ),
+    maxDrawdown52wPct:
+      decisionRound(
+        drawdown,
+        2
+      ),
+    reasons,
+    risks
+  };
+}
+
+function scoreDecisionDataQuality(
+  row,
+  context,
+  fundamental
+) {
+  let score = 0;
+  const missing = [];
+
+  if (
+    safeNumber(
+      row?.price
+    ) !== null
+  ) {
+    score += 10;
+  } else {
+    missing.push('price');
+  }
+
+  if (
+    safeNumber(
+      row?.averageVolume30d
+    ) !== null
+  ) {
+    score += 10;
+  } else {
+    missing.push('30-day liquidity');
+  }
+
+  if (context?.available) {
+    score += 25;
+
+    if (
+      safeNumber(
+        context.validSessions
+      ) >= 200
+    ) {
+      score += 10;
+    }
+  } else {
+    missing.push('price history');
+  }
+
+  if (fundamental?.available) {
+    score += 25;
+
+    if (
+      fundamental.coverage >= 40
+    ) {
+      score += 10;
+    }
+  } else {
+    missing.push('structured fundamentals');
+  }
+
+  if (
+    safeNumber(
+      row?.peRatio
+    ) !== null
+  ) {
+    score += 5;
+  }
+
+  if (
+    row?.companyName &&
+    row?.sector &&
+    row.sector !== 'Unknown'
+  ) {
+    score += 5;
+  }
+
+  return {
+    score:
+      decisionRound(
+        decisionClamp(score),
+        2
+      ),
+    missing
+  };
+}
+
+function decisionScreeningScore(
+  row,
+  eligibleRows
+) {
+  const liquidity =
+    decisionPercentile(
+      row.averageVolume30d,
+      eligibleRows.map(
+        item =>
+          item.averageVolume30d
+      ),
+      true
+    );
+
+  const size =
+    decisionPercentile(
+      row.marketCap,
+      eligibleRows.map(
+        item =>
+          item.marketCap
+      ),
+      true
+    );
+
+  const valuation =
+    scoreDecisionValuation(
+      row,
+      eligibleRows
+    ).score;
+
+  const oneYear =
+    safeNumber(
+      row.change1yPct
+    );
+
+  let stability = 50;
+
+  if (oneYear !== null) {
+    if (
+      oneYear >= -20 &&
+      oneYear <= 60
+    ) {
+      stability = 70;
+    } else if (
+      oneYear < -40 ||
+      oneYear > 120
+    ) {
+      stability = 25;
+    } else {
+      stability = 48;
+    }
+  }
+
+  return decisionRound(
+    liquidity * 0.35 +
+    size * 0.20 +
+    valuation * 0.35 +
+    stability * 0.10,
+    2
+  );
+}
+
+function decisionCandidateAction(
+  candidate,
+  model,
+  riskPolicy
+) {
+  const dataQuality =
+    safeNumber(
+      candidate.dataQuality?.score
+    ) ||
+    0;
+
+  const fundamentalScore =
+    safeNumber(
+      candidate.fundamental?.score
+    ) ||
+    0;
+
+  const entryScore =
+    safeNumber(
+      candidate.entry?.score
+    ) ||
+    0;
+
+  const riskScore =
+    safeNumber(
+      candidate.risk?.score
+    ) ||
+    0;
+
+  const overallScore =
+    safeNumber(
+      candidate.overallScore
+    ) ||
+    0;
+
+  if (
+    candidate.statusCodes
+      ?.includes('NC')
+  ) {
+    return {
+      action: 'AVOID',
+      reason:
+        'Listing-compliance status is present.'
+    };
+  }
+
+  if (
+    dataQuality <
+    riskPolicy.minDataQualityScore
+  ) {
+    return {
+      action: 'WAIT_DATA',
+      reason:
+        'Critical evidence coverage is below this risk profile\'s threshold.'
+    };
+  }
+
+  if (
+    !candidate.fundamental?.available
+  ) {
+    return {
+      action: 'WAIT_DATA',
+      reason:
+        'NOMAD will not promote a new-buy candidate without structured company fundamentals.'
+    };
+  }
+
+  if (fundamentalScore < 45) {
+    return {
+      action: 'AVOID',
+      reason:
+        'Current fundamental evidence is too weak for a new position.'
+    };
+  }
+
+  if (
+    riskScore <
+    riskPolicy.minRiskScore
+  ) {
+    return {
+      action: 'AVOID',
+      reason:
+        'Risk/liquidity evidence does not pass the selected profile.'
+    };
+  }
+
+  if (
+    overallScore >=
+      riskPolicy.minOverallScore &&
+    entryScore >=
+      (
+        model.horizon ===
+          'short_term'
+          ? 65
+          : 60
+      )
+  ) {
+    return {
+      action: 'BUY_NOW',
+      reason:
+        'The current shadow model passes quality, risk and entry gates.'
+    };
+  }
+
+  if (
+    model.horizon ===
+      'long_term' &&
+    overallScore >=
+      riskPolicy.minOverallScore - 2 &&
+    fundamentalScore >= 62 &&
+    entryScore >= 46
+  ) {
+    return {
+      action: 'STAGED_BUY',
+      reason:
+        'Long-term evidence is acceptable, but entry quality is not strong enough for a full allocation.'
+    };
+  }
+
+  if (
+    overallScore >=
+      riskPolicy.minOverallScore - 10 &&
+    fundamentalScore >= 55
+  ) {
+    return {
+      action: 'WAIT',
+      reason:
+        'The company remains worth monitoring, but the full decision threshold is not met.'
+    };
+  }
+
+  return {
+    action: 'AVOID',
+    reason:
+      'The candidate does not pass the current shadow model.'
+  };
+}
+
+async function decisionMapWithConcurrency(
+  items,
+  concurrency,
+  worker
+) {
+  const source =
+    Array.isArray(items)
+      ? items
+      : [];
+
+  const results =
+    new Array(
+      source.length
+    );
+
+  let nextIndex = 0;
+
+  async function runWorker() {
+    while (true) {
+      const index =
+        nextIndex++;
+
+      if (index >= source.length) {
+        return;
+      }
+
+      try {
+        results[index] =
+          await worker(
+            source[index],
+            index
+          );
+      } catch (error) {
+        results[index] = {
+          error:
+            error.message ||
+            'Decision evidence request failed.'
+        };
+      }
+    }
+  }
+
+  await Promise.all(
+    Array.from(
+      {
+        length:
+          Math.max(
+            1,
+            Math.min(
+              concurrency,
+              source.length ||
+              1
+            )
+          )
+      },
+      () =>
+        runWorker()
+    )
+  );
+
+  return results;
+}
+
+async function decisionWithTimeout(
+  promise,
+  milliseconds,
+  label
+) {
+  let timeoutId;
+
+  const timeoutPromise =
+    new Promise(
+      (
+        resolve,
+        reject
+      ) => {
+        timeoutId =
+          setTimeout(
+            () =>
+              reject(
+                new Error(
+                  label +
+                  ' timed out.'
+                )
+              ),
+            milliseconds
+          );
+      }
+    );
+
+  try {
+    return await Promise.race([
+      promise,
+      timeoutPromise
+    ]);
+  } finally {
+    clearTimeout(
+      timeoutId
+    );
+  }
+}
+
+async function decisionHistoricalContext(
+  row,
+  memoryMap
+) {
+  const symbol =
+    normalizeSymbol(
+      row.symbol
+    );
+
+  const memory =
+    memoryMap?.get(
+      symbol
+    ) ||
+    null;
+
+  const cachedContext =
+    memory?.market_state
+      ?.historicalContext ||
+    null;
+
+  const evaluatedAt =
+    Date.parse(
+      memory?.evaluated_at ||
+      ''
+    );
+
+  if (
+    cachedContext?.available &&
+    Number.isFinite(
+      evaluatedAt
+    ) &&
+    Date.now() -
+      evaluatedAt <
+      24 *
+        60 *
+        60 *
+        1000
+  ) {
+    return {
+      ...cachedContext,
+      cacheState: 'memory'
+    };
+  }
+
+  const context =
+    await decisionWithTimeout(
+      getHistoricalSituation(
+        symbol,
+        row.price
+      ),
+      7000,
+      symbol +
+      ' history'
+    );
+
+  if (context?.available) {
+    saveHistoricalSituationToMemory(
+      symbol,
+      context,
+      row
+    ).catch(
+      () => {}
+    );
+  }
+
+  return {
+    ...context,
+    cacheState: 'fresh'
+  };
+}
+
+function decisionOverallScore(
+  model,
+  fundamental,
+  valuation,
+  entry,
+  risk,
+  dataQuality
+) {
+  const weights =
+    model.weights;
+
+  return decisionRound(
+    decisionClamp(
+      (
+        safeNumber(
+          fundamental?.score
+        ) ||
+        0
+      ) *
+        weights.fundamental +
+      (
+        safeNumber(
+          valuation?.score
+        ) ||
+        0
+      ) *
+        weights.valuation +
+      (
+        safeNumber(
+          entry?.score
+        ) ||
+        0
+      ) *
+        weights.entry +
+      (
+        safeNumber(
+          risk?.score
+        ) ||
+        0
+      ) *
+        weights.risk +
+      (
+        safeNumber(
+          dataQuality?.score
+        ) ||
+        0
+      ) *
+        weights.dataQuality
+    ),
+    2
+  );
+}
+
+function decisionCandidateNarrative(
+  candidate
+) {
+  const positives = [
+    ...(
+      candidate.fundamental
+        ?.reasons ||
+      []
+    ),
+    ...(
+      candidate.valuation
+        ?.reasons ||
+      []
+    ),
+    ...(
+      candidate.entry
+        ?.reasons ||
+      []
+    ),
+    ...(
+      candidate.risk
+        ?.reasons ||
+      []
+    )
+  ];
+
+  const risks = [
+    ...(
+      candidate.fundamental
+        ?.risks ||
+      []
+    ),
+    ...(
+      candidate.valuation
+        ?.risks ||
+      []
+    ),
+    ...(
+      candidate.entry
+        ?.risks ||
+      []
+    ),
+    ...(
+      candidate.risk
+        ?.risks ||
+      []
+    )
+  ];
+
+  return {
+    positives:
+      uniqueStrings(
+        positives
+      ).slice(0, 4),
+    risks:
+      uniqueStrings(
+        risks
+      ).slice(0, 4)
+  };
+}
+
+function allocateDecisionCandidates(
+  candidates,
+  amount,
+  riskPolicy
+) {
+  const budgetPaisa =
+    Math.max(
+      0,
+      Math.round(
+        Number(amount) *
+        100
+      )
+    );
+
+  let remaining =
+    budgetPaisa;
+
+  const allocations = [];
+  const sectorSpent =
+    new Map();
+
+  const actionable =
+    candidates
+      .filter(
+        candidate =>
+          candidate.action ===
+            'BUY_NOW' ||
+          candidate.action ===
+            'STAGED_BUY'
+      )
+      .sort(
+        (
+          a,
+          b
+        ) =>
+          b.overallScore -
+          a.overallScore
+      )
+      .slice(
+        0,
+        riskPolicy.maxAllocations
+      );
+
+  for (
+    const candidate
+    of actionable
+  ) {
+    const pricePaisa =
+      Math.round(
+        Number(
+          candidate.price
+        ) *
+        100
+      );
+
+    if (
+      !Number.isFinite(
+        pricePaisa
+      ) ||
+      pricePaisa <= 0
+    ) {
+      continue;
+    }
+
+    const stagedMultiplier =
+      candidate.action ===
+        'STAGED_BUY'
+        ? 0.50
+        : 1;
+
+    const stockCap =
+      Math.floor(
+        budgetPaisa *
+        riskPolicy.maxStockPct *
+        stagedMultiplier
+      );
+
+    const existingSectorSpent =
+      sectorSpent.get(
+        candidate.sector
+      ) ||
+      0;
+
+    const sectorCap =
+      Math.floor(
+        budgetPaisa *
+        riskPolicy.maxSectorPct
+      );
+
+    const allowed =
+      Math.max(
+        0,
+        Math.min(
+          remaining,
+          stockCap,
+          sectorCap -
+            existingSectorSpent
+        )
+      );
+
+    const shares =
+      Math.floor(
+        allowed /
+        pricePaisa
+      );
+
+    if (shares < 1) {
+      continue;
+    }
+
+    const spent =
+      shares *
+      pricePaisa;
+
+    remaining -=
+      spent;
+
+    sectorSpent.set(
+      candidate.sector,
+      existingSectorSpent +
+        spent
+    );
+
+    allocations.push({
+      symbol:
+        candidate.symbol,
+      companyName:
+        candidate.companyName,
+      sector:
+        candidate.sector,
+      action:
+        candidate.action,
+      shares,
+      referencePrice:
+        decisionRound(
+          candidate.price,
+          2
+        ),
+      principalPkr:
+        decisionRound(
+          spent /
+          100,
+          2
+        ),
+      budgetPct:
+        decisionRound(
+          budgetPaisa > 0
+            ? spent /
+              budgetPaisa *
+              100
+            : 0,
+          2
+        ),
+      overallScore:
+        candidate.overallScore,
+      evidenceStrength:
+        candidate.dataQuality
+          ?.score ||
+        null,
+      note:
+        candidate.action ===
+          'STAGED_BUY'
+          ? 'Shadow model limits this to a smaller staged allocation because entry quality is not yet strong.'
+          : 'Shadow-model allocation before brokerage, levies, taxes and execution slippage.'
+    });
+  }
+
+  const investedPaisa =
+    budgetPaisa -
+    remaining;
+
+  return {
+    allocations,
+    amountInvestedPkr:
+      decisionRound(
+        investedPaisa /
+        100,
+        2
+      ),
+    cashRemainingPkr:
+      decisionRound(
+        remaining /
+        100,
+        2
+      ),
+    investedPct:
+      decisionRound(
+        budgetPaisa > 0
+          ? investedPaisa /
+            budgetPaisa *
+            100
+          : 0,
+        2
+      ),
+    executionCostsIncluded: false
+  };
+}
+
+async function recordDecisionRun(
+  result
+) {
+  if (!continuousMemoryConfigured()) {
+    return {
+      recorded: false,
+      reason:
+        'Supabase is not configured.'
+    };
+  }
+
+  try {
+    const rows =
+      await supabaseRest(
+        'decision_runs?select=id,created_at',
+        {
+          method: 'POST',
+          prefer:
+            'return=representation',
+          body: {
+            model_id:
+              result.model.id,
+            engine_mode:
+              'shadow',
+            validation_status:
+              result.validationStatus,
+            real_money_eligible:
+              false,
+            horizon:
+              result.input.horizon,
+            risk_profile:
+              result.input.risk,
+            amount_pkr:
+              result.input.amount,
+            market_as_of:
+              result.market.asOf ||
+              null,
+            decision_action:
+              result.decision.action,
+            amount_invested_pkr:
+              result.decision.amountInvestedPkr,
+            cash_remaining_pkr:
+              result.decision.cashRemainingPkr,
+            evidence_strength:
+              result.decision.evidenceStrength,
+            data_quality: {
+              deepCandidates:
+                result.screening.deepAnalyzed,
+              eligibleUniverse:
+                result.screening.eligibleUniverse,
+              affordableUniverse:
+                result.screening.affordableUniverse
+            },
+            allocation:
+              result.allocations,
+            summary: {
+              headline:
+                result.decision.headline,
+              reason:
+                result.decision.reason,
+              topCandidates:
+                result.candidates
+                  .slice(0, 5)
+                  .map(
+                    candidate => ({
+                      symbol:
+                        candidate.symbol,
+                      action:
+                        candidate.action,
+                      overallScore:
+                        candidate.overallScore
+                    })
+                  )
+            },
+            raw_result:
+              result
+          }
+        }
+      );
+
+    const run =
+      Array.isArray(rows) &&
+      rows.length
+        ? rows[0]
+        : null;
+
+    if (!run?.id) {
+      return {
+        recorded: false,
+        reason:
+          'Decision run insert did not return an ID.'
+      };
+    }
+
+    const candidateRows =
+      result.candidates
+        .slice(0, 8)
+        .map(
+          (
+            candidate,
+            index
+          ) => {
+            const allocation =
+              result.allocations.find(
+                item =>
+                  item.symbol ===
+                  candidate.symbol
+              );
+
+            return {
+              run_id:
+                run.id,
+              symbol:
+                candidate.symbol,
+              company_name:
+                candidate.companyName,
+              sector:
+                candidate.sector,
+              candidate_rank:
+                index + 1,
+              candidate_action:
+                candidate.action,
+              reference_price:
+                candidate.price,
+              shares:
+                allocation?.shares ||
+                0,
+              allocated_pkr:
+                allocation?.principalPkr ||
+                0,
+              overall_score:
+                candidate.overallScore,
+              fundamental_score:
+                candidate.fundamental
+                  ?.score ||
+                null,
+              valuation_score:
+                candidate.valuation
+                  ?.score ||
+                null,
+              entry_score:
+                candidate.entry
+                  ?.score ||
+                null,
+              risk_score:
+                candidate.risk
+                  ?.score ||
+                null,
+              data_quality_score:
+                candidate.dataQuality
+                  ?.score ||
+                null,
+              evidence: {
+                historicalContext:
+                  candidate.historicalContext,
+                fundamentalMetrics:
+                  candidate.fundamental
+                    ?.metrics ||
+                  {},
+                narrative:
+                  candidate.narrative,
+                reason:
+                  candidate.actionReason
+              }
+            };
+          }
+        );
+
+    if (candidateRows.length) {
+      await supabaseRest(
+        'decision_candidates?select=id',
+        {
+          method: 'POST',
+          prefer:
+            'return=minimal',
+          body:
+            candidateRows
+        }
+      );
+    }
+
+    return {
+      recorded: true,
+      runId:
+        run.id,
+      createdAt:
+        run.created_at ||
+        null
+    };
+  } catch (error) {
+    return {
+      recorded: false,
+      reason:
+        error.message ||
+        'Decision run could not be recorded.'
+    };
+  }
+}
+
+async function runDecisionLab(
+  input
+) {
+  const amount =
+    safeNumber(
+      input?.amount
+    );
+
+  const horizon =
+    String(
+      input?.horizon ||
+      'long_term'
+    );
+
+  const risk =
+    String(
+      input?.risk ||
+      'balanced'
+    );
+
+  if (
+    amount === null ||
+    amount <= 0 ||
+    amount > 100000000000
+  ) {
+    bad(
+      'Enter a valid positive PKR amount.'
+    );
+  }
+
+  const model =
+    DECISION_MODELS[
+      horizon
+    ];
+
+  const riskPolicy =
+    DECISION_RISK_POLICIES[
+      risk
+    ];
+
+  if (!model) {
+    bad(
+      'Select a valid investment horizon.'
+    );
+  }
+
+  if (!riskPolicy) {
+    bad(
+      'Select a valid risk profile.'
+    );
+  }
+
+  const startedAt =
+    new Date()
+      .toISOString();
+
+  const [
+    market,
+    memoryRows
+  ] =
+    await Promise.all([
+      loadPSXMarket(),
+      continuousMemoryConfigured()
+        ? readAllSecurityMemory()
+            .catch(
+              () => []
+            )
+        : Promise.resolve([])
+    ]);
+
+  const eligibleRows =
+    market.stocks
+      .filter(
+        row =>
+          row.recommendationEligible ===
+            true &&
+          safeNumber(
+            row.price
+          ) !== null &&
+          safeNumber(
+            row.price
+          ) > 0
+      );
+
+  const affordableRows =
+    eligibleRows
+      .filter(
+        row =>
+          safeNumber(
+            row.price
+          ) <= amount
+      );
+
+  const liquidityPassed =
+    affordableRows
+      .filter(
+        row => {
+          const volume =
+            safeNumber(
+              row.averageVolume30d
+            );
+
+          return (
+            volume !== null &&
+            volume >=
+              riskPolicy.minAverageVolume30d &&
+            !(
+              row.statusCodes ||
+              []
+            ).includes('NC')
+          );
+        }
+      );
+
+  const preScreened =
+    liquidityPassed
+      .map(
+        row => ({
+          row,
+          screeningScore:
+            decisionScreeningScore(
+              row,
+              eligibleRows
+            )
+        })
+      )
+      .sort(
+        (
+          a,
+          b
+        ) =>
+          b.screeningScore -
+          a.screeningScore
+      );
+
+  const shortList = [];
+  const sectorCounts =
+    new Map();
+
+  for (
+    const item
+    of preScreened
+  ) {
+    const sector =
+      item.row.sector ||
+      'Unknown';
+
+    const count =
+      sectorCounts.get(
+        sector
+      ) ||
+      0;
+
+    if (count >= 3) {
+      continue;
+    }
+
+    shortList.push(
+      item
+    );
+
+    sectorCounts.set(
+      sector,
+      count + 1
+    );
+
+    if (shortList.length >= 8) {
+      break;
+    }
+  }
+
+  if (!shortList.length) {
+    const emptyResult = {
+      status: 'OK',
+      build: VERSION,
+      engineMode: 'SHADOW',
+      validationStatus:
+        model.status,
+      realMoneyEligible: false,
+      startedAt,
+      completedAt:
+        new Date()
+          .toISOString(),
+      model,
+      riskPolicy: {
+        id:
+          riskPolicy.id
+      },
+      input: {
+        amount:
+          decisionRound(
+            amount,
+            2
+          ),
+        horizon,
+        risk
+      },
+      market: {
+        asOf:
+          market.marketWatchAsOf ||
+          market.asOf ||
+          null,
+        source:
+          'psxdata-api + PSX market watch'
+      },
+      screening: {
+        eligibleUniverse:
+          eligibleRows.length,
+        affordableUniverse:
+          affordableRows.length,
+        liquidityPassed:
+          liquidityPassed.length,
+        historicalAnalyzed: 0,
+        deepAnalyzed: 0
+      },
+      decision: {
+        action: 'WAIT',
+        headline:
+          'No investable candidate passed the first safety gates.',
+        reason:
+          'The current amount, liquidity policy and eligible universe produced no candidate suitable for deeper analysis.',
+        amountInvestedPkr: 0,
+        cashRemainingPkr:
+          decisionRound(
+            amount,
+            2
+          ),
+        evidenceStrength: 0
+      },
+      allocations: [],
+      candidates: [],
+      exclusions: {
+        unaffordable:
+          eligibleRows.length -
+          affordableRows.length,
+        liquidityOrStatus:
+          affordableRows.length -
+          liquidityPassed.length
+      },
+      warnings: [
+        'This is an experimental shadow decision, not a real-money instruction.',
+        'No order-execution capability exists.'
+      ]
+    };
+
+    emptyResult.recording =
+      await recordDecisionRun(
+        emptyResult
+      );
+
+    return emptyResult;
+  }
+
+  const memoryMap =
+    new Map(
+      memoryRows.map(
+        row => [
+          normalizeSymbol(
+            row.symbol
+          ),
+          row
+        ]
+      )
+    );
+
+  const historyResults =
+    await decisionMapWithConcurrency(
+      shortList,
+      4,
+      async item => {
+        const historicalContext =
+          await decisionHistoricalContext(
+            item.row,
+            memoryMap
+          );
+
+        const valuation =
+          scoreDecisionValuation(
+            item.row,
+            eligibleRows
+          );
+
+        const entry =
+          scoreDecisionEntry(
+            historicalContext,
+            horizon,
+            riskPolicy
+          );
+
+        const riskScore =
+          scoreDecisionRisk(
+            item.row,
+            historicalContext,
+            eligibleRows
+          );
+
+        return {
+          ...item,
+          historicalContext,
+          valuation,
+          entry,
+          risk:
+            riskScore,
+          deepProxyScore:
+            decisionRound(
+              item.screeningScore *
+                0.30 +
+              valuation.score *
+                0.20 +
+              entry.score *
+                0.30 +
+              riskScore.score *
+                0.20,
+              2
+            )
+        };
+      }
+    );
+
+  const historyReady =
+    historyResults
+      .filter(
+        item =>
+          item &&
+          !item.error &&
+          item.historicalContext
+            ?.available
+      )
+      .sort(
+        (
+          a,
+          b
+        ) =>
+          b.deepProxyScore -
+          a.deepProxyScore
+      );
+
+  const deepShortList =
+    historyReady
+      .slice(0, 4);
+
+  const deepResults =
+    await decisionMapWithConcurrency(
+      deepShortList,
+      2,
+      async item => {
+        let fundamentals =
+          null;
+
+        let fundamentalError =
+          null;
+
+        try {
+          fundamentals =
+            await decisionWithTimeout(
+              getFundamentals(
+                item.row.symbol
+              ),
+              9000,
+              item.row.symbol +
+              ' fundamentals'
+            );
+        } catch (error) {
+          fundamentalError =
+            error.message ||
+            'Fundamental evidence unavailable.';
+        }
+
+        const fundamental =
+          scoreDecisionFundamentals(
+            fundamentals
+          );
+
+        if (fundamentalError) {
+          fundamental.risks =
+            uniqueStrings([
+              ...(
+                fundamental.risks ||
+                []
+              ),
+              fundamentalError
+            ]);
+        }
+
+        const dataQuality =
+          scoreDecisionDataQuality(
+            item.row,
+            item.historicalContext,
+            fundamental
+          );
+
+        const overallScore =
+          decisionOverallScore(
+            model,
+            fundamental,
+            item.valuation,
+            item.entry,
+            item.risk,
+            dataQuality
+          );
+
+        const candidate = {
+          symbol:
+            item.row.symbol,
+          companyName:
+            item.row.companyName,
+          sector:
+            item.row.sector,
+          statusCodes:
+            item.row.statusCodes ||
+            [],
+          price:
+            decisionRound(
+              item.row.price,
+              4
+            ),
+          marketAsOf:
+            item.row.asOf ||
+            market.asOf ||
+            null,
+          averageVolume30d:
+            decisionRound(
+              item.row.averageVolume30d,
+              0
+            ),
+          screeningScore:
+            item.screeningScore,
+          historicalContext:
+            item.historicalContext,
+          fundamental,
+          valuation:
+            item.valuation,
+          entry:
+            item.entry,
+          risk:
+            item.risk,
+          dataQuality,
+          overallScore
+        };
+
+        const action =
+          decisionCandidateAction(
+            candidate,
+            model,
+            riskPolicy
+          );
+
+        candidate.action =
+          action.action;
+
+        candidate.actionReason =
+          action.reason;
+
+        candidate.narrative =
+          decisionCandidateNarrative(
+            candidate
+          );
+
+        return candidate;
+      }
+    );
+
+  const candidates =
+    deepResults
+      .filter(
+        candidate =>
+          candidate &&
+          !candidate.error &&
+          candidate.symbol
+      )
+      .sort(
+        (
+          a,
+          b
+        ) =>
+          b.overallScore -
+          a.overallScore
+      );
+
+  const allocation =
+    allocateDecisionCandidates(
+      candidates,
+      amount,
+      riskPolicy
+    );
+
+  let action = 'WAIT';
+  let headline =
+    'Wait — the shadow engine found no candidate strong enough to allocate this amount.';
+  let reason =
+    'Cash remains a valid decision when the evidence or entry conditions are not strong enough.';
+
+  if (
+    allocation.allocations.length &&
+    allocation.investedPct >= 75
+  ) {
+    action = 'INVEST';
+    headline =
+      'Experimental shadow allocation found.';
+    reason =
+      'The current model found candidates that pass its provisional quality, timing, risk and data gates.';
+  } else if (
+    allocation.allocations.length
+  ) {
+    action =
+      'PARTIAL_INVEST';
+    headline =
+      'Experimental partial allocation found; keep part of the amount in cash.';
+    reason =
+      'NOMAD deliberately leaves cash when diversification, entry quality or risk limits prevent a fuller allocation.';
+  }
+
+  const evidenceStrength =
+    candidates.length
+      ? decisionRound(
+          candidates
+            .slice(0, 3)
+            .reduce(
+              (
+                sum,
+                candidate
+              ) =>
+                sum +
+                (
+                  safeNumber(
+                    candidate.dataQuality
+                      ?.score
+                  ) ||
+                  0
+                ),
+              0
+            ) /
+            Math.min(
+              3,
+              candidates.length
+            ),
+          2
+        )
+      : 0;
+
+  const result = {
+    status: 'OK',
+    build: VERSION,
+    engineMode: 'SHADOW',
+    validationStatus:
+      model.status,
+    realMoneyEligible: false,
+    startedAt,
+    completedAt:
+      new Date()
+        .toISOString(),
+    model: {
+      id:
+        model.id,
+      horizon:
+        model.horizon,
+      status:
+        model.status,
+      realMoneyEligible:
+        false,
+      weights:
+        model.weights
+    },
+    riskPolicy: {
+      id:
+        riskPolicy.id,
+      assumptions: {
+        minAverageVolume30d:
+          riskPolicy.minAverageVolume30d,
+        maxAnnualizedVolatilityPct:
+          riskPolicy.maxAnnualizedVolatilityPct,
+        minDataQualityScore:
+          riskPolicy.minDataQualityScore,
+        minOverallScore:
+          riskPolicy.minOverallScore,
+        maxStockPct:
+          riskPolicy.maxStockPct *
+          100,
+        maxSectorPct:
+          riskPolicy.maxSectorPct *
+          100
+      }
+    },
+    input: {
+      amount:
+        decisionRound(
+          amount,
+          2
+        ),
+      horizon,
+      risk
+    },
+    market: {
+      asOf:
+        market.marketWatchAsOf ||
+        market.asOf ||
+        null,
+      source:
+        'psxdata-api + PSX market watch',
+      canonicalUniverseVersion:
+        PSX_UNIVERSE_MASTER.masterVersion
+    },
+    screening: {
+      eligibleUniverse:
+        eligibleRows.length,
+      affordableUniverse:
+        affordableRows.length,
+      liquidityPassed:
+        liquidityPassed.length,
+      shortlisted:
+        shortList.length,
+      historicalAnalyzed:
+        historyReady.length,
+      deepAnalyzed:
+        candidates.length
+    },
+    decision: {
+      action,
+      headline,
+      reason,
+      amountInvestedPkr:
+        allocation.amountInvestedPkr,
+      cashRemainingPkr:
+        allocation.cashRemainingPkr,
+      investedPct:
+        allocation.investedPct,
+      evidenceStrength,
+      probabilityClaim:
+        'NONE — evidence strength is not a calibrated probability.'
+    },
+    allocations:
+      allocation.allocations,
+    candidates:
+      candidates.slice(0, 5),
+    exclusions: {
+      unaffordable:
+        eligibleRows.length -
+        affordableRows.length,
+      liquidityOrStatus:
+        affordableRows.length -
+        liquidityPassed.length,
+      historicalUnavailable:
+        shortList.length -
+        historyReady.length
+    },
+    warnings: [
+      'SHADOW MODE: this model has not passed historical and forward validation for real-money use.',
+      'Allocations are planning principals only. Brokerage, levies, taxes and execution slippage are not yet included.',
+      'No order-execution capability exists. The user remains the final decision maker.',
+      'Current scoring rules are versioned experimental hypotheses and must earn promotion through recorded performance.'
+    ]
+  };
+
+  result.recording =
+    await recordDecisionRun(
+      result
+    );
+
+  return result;
+}
+
+function runDecisionEngineSelfTests() {
+  const assert =
+    require(
+      'node:assert/strict'
+    );
+
+  const riskBalanced =
+    DECISION_RISK_POLICIES
+      .balanced;
+
+  const upContext = {
+    available: true,
+    price: 100,
+    trend: 'Uptrend',
+    returns: {
+      d5: 2,
+      m1: 5,
+      m3: 12
+    },
+    movingAverages: {
+      sma20: 96,
+      sma50: 92,
+      sma200: 85
+    },
+    technical: {
+      rsi14: 56,
+      macdHistogram: 1,
+      volumeRatio20d: 1.3,
+      annualizedVolatility20dPct: 30,
+      maxDrawdown52wPct: -12
+    },
+    validSessions: 260
+  };
+
+  const downContext = {
+    ...upContext,
+    trend: 'Downtrend',
+    returns: {
+      d5: -4,
+      m1: -14,
+      m3: -22
+    },
+    movingAverages: {
+      sma20: 110,
+      sma50: 115,
+      sma200: 120
+    },
+    technical: {
+      ...upContext.technical,
+      rsi14: 31,
+      macdHistogram: -1
+    }
+  };
+
+  assert.ok(
+    scoreDecisionEntry(
+      upContext,
+      'long_term',
+      riskBalanced
+    ).score >
+      scoreDecisionEntry(
+        downContext,
+        'long_term',
+        riskBalanced
+      ).score,
+    'positive entry context must score above negative context'
+  );
+
+  const goodCandidate = {
+    statusCodes: [],
+    overallScore: 80,
+    fundamental: {
+      available: true,
+      score: 78
+    },
+    entry: {
+      score: 70
+    },
+    risk: {
+      score: 70
+    },
+    dataQuality: {
+      score: 90
+    }
+  };
+
+  assert.equal(
+    decisionCandidateAction(
+      goodCandidate,
+      DECISION_MODELS
+        .long_term,
+      riskBalanced
+    ).action,
+    'BUY_NOW'
+  );
+
+  assert.equal(
+    decisionCandidateAction(
+      {
+        ...goodCandidate,
+        dataQuality: {
+          score: 40
+        }
+      },
+      DECISION_MODELS
+        .long_term,
+      riskBalanced
+    ).action,
+    'WAIT_DATA'
+  );
+
+  const allocation =
+    allocateDecisionCandidates(
+      [
+        {
+          symbol: 'TESTA',
+          companyName: 'Synthetic A',
+          sector: 'A',
+          action: 'BUY_NOW',
+          price: 100,
+          overallScore: 85,
+          dataQuality: {
+            score: 90
+          }
+        },
+        {
+          symbol: 'TESTB',
+          companyName: 'Synthetic B',
+          sector: 'B',
+          action: 'BUY_NOW',
+          price: 50,
+          overallScore: 80,
+          dataQuality: {
+            score: 90
+          }
+        }
+      ],
+      5000,
+      riskBalanced
+    );
+
+  assert.ok(
+    allocation.amountInvestedPkr <=
+      5000,
+    'allocation must not exceed budget'
+  );
+
+  assert.ok(
+    allocation.allocations.every(
+      item =>
+        Number.isInteger(
+          item.shares
+        ) &&
+        item.shares > 0
+    ),
+    'allocations must use positive whole shares'
+  );
+
+  assert.ok(
+    DECISION_RISK_POLICIES
+      .conservative
+      .maxStockPct <
+      DECISION_RISK_POLICIES
+        .aggressive
+        .maxStockPct,
+    'conservative position cap must be tighter than aggressive'
+  );
+
+  console.log(
+    'NOMAD Decision Engine self-tests passed.'
+  );
+}
+
+
+/* =========================================================
+   CONTINUOUS INTELLIGENCE SCANNER - BUILD 0.8.3
 ========================================================= */
 
 function scannerSecretConfigured() {
@@ -16068,8 +19278,20 @@ async function handler(
               PYPSX_API_SECRET_KEY
             ),
 
+          decisionEngine:
+            'SHADOW_DECISION_LAB_V0.1',
+
+          decisionModels: {
+            longTerm:
+              DECISION_MODELS.long_term.id,
+            shortTerm:
+              DECISION_MODELS.short_term.id,
+            realMoneyEligible:
+              false
+          },
+
           predictionEngine:
-            'NOT_IMPLEMENTED',
+            'SHADOW_UNVALIDATED',
 
           brokerConnection:
             false,
@@ -16234,6 +19456,25 @@ async function handler(
           url.searchParams.get(
             'symbol'
           )
+        )
+      );
+    }
+
+    if (
+      request.method ===
+        'POST' &&
+      action ===
+        'decision-lab'
+    ) {
+      const body =
+        await readJsonRequestBody(
+          request
+        );
+
+      return sendJSON(
+        response,
+        await runDecisionLab(
+          body
         )
       );
     }
@@ -17906,7 +21147,7 @@ body > main > header {
 
 
 /* =========================================================
-   TRADING WORKSPACE + DECISION UI - BUILD 0.8.2
+   TRADING WORKSPACE + DECISION UI - BUILD 0.8.3
 ========================================================= */
 
 :root {
@@ -18312,6 +21553,129 @@ tbody tr:hover {
   border-radius: 6px;
   font-size: 12px;
   line-height: 1.45;
+}
+
+.decisionShadowBanner {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 9px;
+  padding: 5px 8px;
+  border: 1px solid #66552a;
+  border-radius: 4px;
+  background: #261f0f;
+  color: #e4c86d;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: .06em;
+}
+
+.decisionOutcome {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  padding-bottom: 9px;
+  border-bottom: 1px solid #23344a;
+}
+
+.decisionOutcome strong {
+  color: #eef5fb;
+  font-size: 15px;
+}
+
+.decisionOutcome span {
+  color: #8ea2b9;
+}
+
+.decisionMoneyLine {
+  display: grid;
+  grid-template-columns: repeat(3,minmax(0,1fr));
+  gap: 7px;
+  margin-top: 9px;
+}
+
+.decisionMoneyLine div {
+  padding: 8px;
+  border: 1px solid #24364c;
+  border-radius: 5px;
+  background: #0a1421;
+}
+
+.decisionMoneyLine span {
+  display: block;
+  color: #70869d;
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+}
+
+.decisionMoneyLine strong {
+  display: block;
+  margin-top: 2px;
+  color: #e8f0f8;
+  font-size: 12px;
+}
+
+.decisionAllocationRow,
+.decisionCandidateRow {
+  display: grid;
+  grid-template-columns: 72px minmax(0,1fr) auto;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 0;
+  border-bottom: 1px solid #1f3044;
+}
+
+.decisionAllocationRow:last-child,
+.decisionCandidateRow:last-child {
+  border-bottom: 0;
+}
+
+.decisionSymbol {
+  color: #f0f5fa;
+  font-weight: 800;
+}
+
+.decisionMinor {
+  color: #8195aa;
+  font-size: 10px;
+}
+
+.decisionActionTag {
+  padding: 3px 6px;
+  border-radius: 4px;
+  background: #13283a;
+  color: #7fbedf;
+  font-size: 9px;
+  font-weight: 800;
+}
+
+.decisionActionTag.buy_now {
+  background: #103124;
+  color: #75d5a4;
+}
+
+.decisionActionTag.staged_buy {
+  background: #302811;
+  color: #e6c867;
+}
+
+.decisionActionTag.avoid {
+  background: #321a22;
+  color: #ee8a98;
+}
+
+.decisionMetaLine {
+  margin-top: 8px;
+  color: #667d94;
+  font-size: 10px;
+}
+
+@media (max-width: 700px) {
+  .decisionMoneyLine {
+    grid-template-columns: 1fr;
+  }
 }
 
 .compactFeed .attentionItem {
@@ -18720,7 +22084,7 @@ Build ${VERSION}
 Market, company metadata, fundamentals, symbol normalization,
 canonical universe identity, metadata, fundamentals and deterministic technical analysis are connected.
 
-Persistent intelligence memory and the market-change scanner are connected. Recommendations remain disabled until scoring and validation are complete.
+Persistent intelligence memory and the market scanner are connected. Build 0.8.3 adds the first shadow decision engine; its outputs are recorded for validation but are not real-money eligible yet.
 
 </p>
 
@@ -18785,7 +22149,7 @@ Checking connection...
 <div><label>Risk</label><select id="decisionRisk"><option value="balanced">Balanced</option><option value="conservative">Conservative</option><option value="aggressive">Aggressive</option></select></div>
 </div>
 <button id="findBestOption" class="primaryWide">Find my best option</button>
-<div id="decisionResult" class="decisionResult">NOMAD will not guess. Validated scoring and allocation are the next decision layer being activated.</div>
+<div id="decisionResult" class="decisionResult">Build 0.8.3 runs an experimental shadow decision across the eligible PSX universe. It is deliberately not real-money eligible until the model earns validation.</div>
 </div>
 
 <div class="terminalCard attentionCardNew">
@@ -19910,7 +23274,7 @@ async function apiPost(
 
 
 /* =========================================================
-   APP NAVIGATION + DECISION CENTER - BUILD 0.8.2
+   APP NAVIGATION + DECISION CENTER - BUILD 0.8.3
 ========================================================= */
 
 function openAppPage(
@@ -20223,7 +23587,7 @@ function renderPortfolioSnapshot(
 
   if (!result?.configured) {
     target.innerHTML =
-      '<div class="terminalEmpty">Portfolio storage is not set up yet. Run the Build 0.8.2 portfolio SQL migration in Supabase.</div>';
+      '<div class="terminalEmpty">Portfolio storage is not set up yet. Run the portfolio foundation SQL migration in Supabase.</div>';
     return;
   }
 
@@ -28557,10 +31921,273 @@ if ($('portfolioCsvInput')) {
       };
 }
 
+
+function decisionActionLabel(
+  action
+) {
+  const labels = {
+    BUY_NOW: 'BUY NOW',
+    STAGED_BUY: 'STAGED BUY',
+    WAIT: 'WAIT',
+    WAIT_DATA: 'WAIT / DATA',
+    AVOID: 'AVOID',
+    INVEST: 'INVEST',
+    PARTIAL_INVEST: 'PARTIAL INVEST'
+  };
+
+  return labels[action] ||
+    String(
+      action ||
+      'WAIT'
+    ).replace(
+      /_/g,
+      ' '
+    );
+}
+
+function renderShadowDecision(
+  result
+) {
+  const target =
+    $('decisionResult');
+
+  if (!target) {
+    return;
+  }
+
+  if (!result?.decision) {
+    target.innerHTML =
+      '<strong>Decision engine returned no result.</strong>';
+    return;
+  }
+
+  const decision =
+    result.decision;
+
+  const allocations =
+    Array.isArray(
+      result.allocations
+    )
+      ? result.allocations
+      : [];
+
+  const candidates =
+    Array.isArray(
+      result.candidates
+    )
+      ? result.candidates
+      : [];
+
+  let html =
+    '<div class="decisionShadowBanner">SHADOW MODEL · NOT REAL-MONEY ELIGIBLE</div>' +
+    '<div class="decisionOutcome">' +
+    '<div><strong>' +
+    escapeHtml(
+      decisionActionLabel(
+        decision.action
+      )
+    ) +
+    '</strong><div class="decisionMinor">' +
+    escapeHtml(
+      decision.headline ||
+      ''
+    ) +
+    '</div></div>' +
+    '<span>Evidence ' +
+    formatNumber(
+      decision.evidenceStrength ||
+      0,
+      0
+    ) +
+    '/100</span>' +
+    '</div>' +
+    '<div class="decisionMoneyLine">' +
+    '<div><span>Requested</span><strong>PKR ' +
+    formatNumber(
+      result.input?.amount ||
+      0,
+      0
+    ) +
+    '</strong></div>' +
+    '<div><span>Shadow allocation</span><strong>PKR ' +
+    formatNumber(
+      decision.amountInvestedPkr ||
+      0,
+      0
+    ) +
+    '</strong></div>' +
+    '<div><span>Cash kept</span><strong>PKR ' +
+    formatNumber(
+      decision.cashRemainingPkr ||
+      0,
+      0
+    ) +
+    '</strong></div>' +
+    '</div>';
+
+  if (allocations.length) {
+    html +=
+      '<div class="decisionMetaLine">Experimental allocation</div>';
+
+    html +=
+      allocations
+        .map(
+          item =>
+            '<div class="decisionAllocationRow">' +
+            '<div class="decisionSymbol">' +
+            escapeHtml(
+              item.symbol
+            ) +
+            '</div>' +
+            '<div><strong>' +
+            formatNumber(
+              item.shares,
+              0
+            ) +
+            ' share' +
+            (
+              Number(
+                item.shares
+              ) === 1
+                ? ''
+                : 's'
+            ) +
+            ' · PKR ' +
+            formatNumber(
+              item.principalPkr,
+              0
+            ) +
+            '</strong><div class="decisionMinor">' +
+            escapeHtml(
+              item.companyName ||
+              ''
+            ) +
+            ' · score ' +
+            formatNumber(
+              item.overallScore,
+              0
+            ) +
+            '</div></div>' +
+            '<div class="decisionActionTag ' +
+            escapeHtml(
+              String(
+                item.action ||
+                ''
+              ).toLowerCase()
+            ) +
+            '">' +
+            escapeHtml(
+              decisionActionLabel(
+                item.action
+              )
+            ) +
+            '</div>' +
+            '</div>'
+        )
+        .join('');
+  }
+
+  if (candidates.length) {
+    html +=
+      '<div class="decisionMetaLine">Top candidates checked deeply</div>';
+
+    html +=
+      candidates
+        .slice(0, 4)
+        .map(
+          candidate => {
+            const firstPositive =
+              candidate.narrative
+                ?.positives?.[0] ||
+              candidate.actionReason ||
+              '';
+
+            const firstRisk =
+              candidate.narrative
+                ?.risks?.[0] ||
+              '';
+
+            return (
+              '<div class="decisionCandidateRow">' +
+              '<div class="decisionSymbol">' +
+              escapeHtml(
+                candidate.symbol
+              ) +
+              '</div>' +
+              '<div><strong>Score ' +
+              formatNumber(
+                candidate.overallScore,
+                0
+              ) +
+              '</strong><div class="decisionMinor">' +
+              escapeHtml(
+                firstPositive
+              ) +
+              (
+                firstRisk
+                  ? ' Risk: ' +
+                    escapeHtml(
+                      firstRisk
+                    )
+                  : ''
+              ) +
+              '</div></div>' +
+              '<div class="decisionActionTag ' +
+              escapeHtml(
+                String(
+                  candidate.action ||
+                  ''
+                ).toLowerCase()
+              ) +
+              '">' +
+              escapeHtml(
+                decisionActionLabel(
+                  candidate.action
+                )
+              ) +
+              '</div>' +
+              '</div>'
+            );
+          }
+        )
+        .join('');
+  }
+
+  html +=
+    '<div class="decisionMetaLine">Model ' +
+    escapeHtml(
+      result.model?.id ||
+      'N/A'
+    ) +
+    ' · ' +
+    escapeHtml(
+      result.riskPolicy?.id ||
+      ''
+    ) +
+    ' · ' +
+    (
+      result.recording?.recorded
+        ? 'recorded for accountability'
+        : 'not recorded: ' +
+          escapeHtml(
+            result.recording?.reason ||
+            'decision tables unavailable'
+          )
+    ) +
+    '</div>' +
+    '<div class="decisionMetaLine">Execution costs are not included yet. Do not use this shadow output as a trade instruction.</div>';
+
+  target.innerHTML =
+    html;
+}
+
 if ($('findBestOption')) {
   $('findBestOption')
     .onclick =
-      () => {
+      async () => {
+        const button =
+          $('findBestOption');
+
         const amount =
           Number(
             String(
@@ -28594,29 +32221,47 @@ if ($('findBestOption')) {
           )
         );
 
+        const originalText =
+          button.textContent;
+
+        button.disabled =
+          true;
+
+        button.textContent =
+          'Analyzing PSX...';
+
         $('decisionResult')
           .innerHTML =
-            '<strong>Decision request saved: PKR ' +
-            formatNumber(
-              context.amount,
-              0
-            ) +
-            ' · ' +
-            escapeHtml(
-              context.horizon ===
-                'long_term'
-                ? 'Long-term'
-                : 'Short-term'
-            ) +
-            ' · ' +
-            escapeHtml(
-              context.risk
-                .charAt(0)
-                .toUpperCase() +
-              context.risk
-                .slice(1)
-            ) +
-            '.</strong><br>NOMAD will not invent a “best” stock before validated fundamental scoring and allocation are active. Your amount and preferences are preserved for that engine.';
+            '<div class="decisionShadowBanner">SHADOW MODEL</div>' +
+            '<strong>NOMAD is screening the eligible universe.</strong><br>' +
+            'It is checking affordability, liquidity, historical conditions, fundamentals, entry timing and risk. This can take a few seconds.';
+
+        try {
+          const result =
+            await apiPost(
+              'decision-lab',
+              context
+            );
+
+          renderShadowDecision(
+            result
+          );
+        } catch (error) {
+          $('decisionResult')
+            .innerHTML =
+              '<strong>Decision engine unavailable.</strong><br>' +
+              escapeHtml(
+                error.message ||
+                'The decision request failed.'
+              ) +
+              '<br>NOMAD did not substitute a guess.';
+        } finally {
+          button.disabled =
+            false;
+
+          button.textContent =
+            originalText;
+        }
       };
 }
 
@@ -28789,25 +32434,48 @@ api(
 module.exports =
   handler;
 
-if (require.main === module) {
-  const port =
-    Number(
-      process.env.PORT ||
-      3000
-    );
+module.exports.decisionEngine = {
+  models:
+    DECISION_MODELS,
+  riskPolicies:
+    DECISION_RISK_POLICIES,
+  scoreEntry:
+    scoreDecisionEntry,
+  scoreFundamentals:
+    scoreDecisionFundamentals,
+  allocate:
+    allocateDecisionCandidates,
+  candidateAction:
+    decisionCandidateAction
+};
 
-  http
-    .createServer(
-      handler
+if (require.main === module) {
+  if (
+    process.argv.includes(
+      '--test-decision'
     )
-    .listen(
-      port,
-      '127.0.0.1',
-      () => {
-        console.log(
-          'NOMAD Invest running at http://127.0.0.1:' +
-          port
-        );
-      }
-    );
+  ) {
+    runDecisionEngineSelfTests();
+  } else {
+    const port =
+      Number(
+        process.env.PORT ||
+        3000
+      );
+
+    http
+      .createServer(
+        handler
+      )
+      .listen(
+        port,
+        '127.0.0.1',
+        () => {
+          console.log(
+            'NOMAD Invest running at http://127.0.0.1:' +
+            port
+          );
+        }
+      );
+  }
 }
