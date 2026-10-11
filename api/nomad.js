@@ -3,8 +3,13 @@
 const http = require('node:http');
 const crypto = require('node:crypto');
 const zlib = require('node:zlib');
+const PSX_UNIVERSE_MASTER = require('../data/psx-universe.json');
 
-const VERSION = '0.6.8';
+const PSX_UNIVERSE_BY_SYMBOL = new Map(
+  (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
+);
+
+const VERSION = '0.7.0';
 
 const PSX_API_BASE =
   process.env.PSX_API_BASE ||
@@ -3262,6 +3267,176 @@ async function loadRawScreener() {
 }
 
 /* =========================================================
+   CANONICAL PSX UNIVERSE MASTER - BUILD 0.7.0
+========================================================= */
+
+function getUniverseMasterEntry(symbol) {
+  return PSX_UNIVERSE_BY_SYMBOL.get(
+    normalizeSymbol(symbol)
+  ) || null;
+}
+
+function universeSecurityLabel(type) {
+  const labels = {
+    ORDINARY_EQUITY: 'Ordinary equity',
+    RIGHTS_ENTITLEMENT: 'Rights / entitlement',
+    MODARABA_CERTIFICATE: 'Modaraba certificate',
+    REIT_UNIT: 'REIT unit',
+    FUND_UNIT: 'Fund unit',
+    PREFERENCE_CLASS: 'Preference / special class',
+    SPAC_EQUITY: 'SPAC equity'
+  };
+
+  return labels[type] || String(type || 'Unknown').replace(/_/g, ' ');
+}
+
+function universeIssuerLabel(type) {
+  const labels = {
+    COMPANY: 'Company',
+    MODARABA: 'Modaraba',
+    REIT: 'REIT',
+    FUND: 'Fund',
+    SPAC: 'SPAC'
+  };
+
+  return labels[type] || String(type || 'Unknown').replace(/_/g, ' ');
+}
+
+function loadMasterCompanyMap() {
+  const map = new Map();
+
+  for (const entry of (PSX_UNIVERSE_MASTER.entries || [])) {
+    const symbol = normalizeSymbol(entry.symbol);
+    if (!symbol) continue;
+
+    mergeCompanyMetadata(
+      map,
+      symbol,
+      {
+        name: entry.companyName || symbol,
+        sector: entry.sector && entry.sector !== 'Unknown' ? entry.sector : '',
+        source: 'NOMAD universe master',
+        sources: ['NOMAD universe master'],
+        evidence: {
+          universeMaster: true,
+          masterCurrentVerified: entry.currentVerified === true
+        },
+        isCanonical: true
+      }
+    );
+  }
+
+  return map;
+}
+
+function masterRowForClient(entry) {
+  const nameResolved = Boolean(
+    entry.companyName &&
+    entry.companyName !== entry.symbol &&
+    String(entry.companyName).toUpperCase() !== 'UNRESOLVED'
+  );
+
+  const sectorResolved = Boolean(
+    entry.sector &&
+    String(entry.sector).toUpperCase() !== 'UNKNOWN'
+  );
+
+  const isSpecialSecurity =
+    entry.universeClass === 'ALTERNATIVE_CURRENT' ||
+    entry.securityType !== 'ORDINARY_EQUITY';
+
+  const universeLabels = {
+    CORE_EQUITY: 'Core equity',
+    GEM_EQUITY: 'GEM equity',
+    ALTERNATIVE_CURRENT: 'Alternative / special current',
+    REVIEW_REQUIRED: 'Review required'
+  };
+
+  const eligibility =
+    entry.universeClass === 'CORE_EQUITY'
+      ? 'CORE_EQUITY_CANDIDATE'
+      : entry.universeClass === 'GEM_EQUITY'
+        ? 'GEM_EQUITY_CANDIDATE'
+        : entry.universeClass === 'ALTERNATIVE_CURRENT'
+          ? 'ALTERNATIVE_LISTED_SECURITY'
+          : 'REVIEW_REQUIRED';
+
+  return {
+    symbol: entry.symbol,
+    marketSymbol: entry.symbol,
+    rawSymbol: entry.symbol,
+    companyName: entry.companyName || entry.symbol,
+    sector: entry.sector || 'Unknown',
+    listedIn: entry.listedIn || '',
+    statusCodes: [],
+    normalizedStatus: false,
+    nameResolved,
+    sectorResolved,
+    issuerType: entry.issuerType || 'UNKNOWN',
+    issuerLabel: universeIssuerLabel(entry.issuerType),
+    securityType: entry.securityType || 'UNKNOWN',
+    securityLabel: universeSecurityLabel(entry.securityType),
+    parentSymbol: entry.parentSymbol || null,
+    classificationReason: entry.recommendationNote || '',
+    classificationConfidence: entry.identityConfidence === 'VERIFIED_CURRENT' ? 'high' : 'review',
+    instrumentType: entry.securityType || 'UNKNOWN',
+    instrumentLabel: universeSecurityLabel(entry.securityType),
+    isSpecialSecurity,
+    tradingStatus: entry.masterStatus || 'REVIEW_REQUIRED',
+    tradingStatusLabel: entry.currentVerified ? 'Current - canonical universe master' : 'Review required - quarantined',
+    boardType: entry.board || null,
+    boardLabel: entry.board === 'GEM' ? 'GEM Board' : entry.board === 'MAIN' ? 'Main Board' : null,
+    successorName: null,
+    successorSymbol: null,
+    companyPageUrl: null,
+    companyPageQuoteAsOf: null,
+    hasOfficialPageEvidence: false,
+    universeClass: entry.universeClass,
+    universeLabel: universeLabels[entry.universeClass] || entry.universeClass,
+    universeReason: entry.recommendationNote || '',
+    metadataSources: entry.metadataSources || [],
+    officialEvidenceSources: entry.officialEvidenceSources || [],
+    supplementalEvidenceSources: [],
+    hasOfficialCurrentEvidence: entry.currentVerified === true,
+    eligibility,
+    eligibilityLabel:
+      eligibility === 'CORE_EQUITY_CANDIDATE'
+        ? 'Core equity candidate'
+        : eligibility === 'GEM_EQUITY_CANDIDATE'
+          ? 'GEM equity candidate'
+          : eligibility === 'ALTERNATIVE_LISTED_SECURITY'
+            ? 'Alternative listed security'
+            : 'Review required',
+    eligibilityReason: entry.recommendationNote || '',
+    recommendationEligible: entry.recommendationEligible === true,
+    masterVersion: PSX_UNIVERSE_MASTER.masterVersion,
+    issueType:
+      !entry.currentVerified
+        ? 'REVIEW_REQUIRED'
+        : !nameResolved && !sectorResolved
+          ? 'MISSING_NAME_AND_SECTOR'
+          : !nameResolved
+            ? 'MISSING_NAME'
+            : !sectorResolved
+              ? 'MISSING_SECTOR'
+              : null,
+    issueLabel:
+      !entry.currentVerified
+        ? 'Universe review required'
+        : !nameResolved && !sectorResolved
+          ? 'Name + sector missing'
+          : !nameResolved
+            ? 'Company name missing'
+            : !sectorResolved
+              ? 'Sector missing'
+              : null,
+    bucket: !entry.currentVerified ? 'UNIVERSE_REVIEW_REQUIRED' : null,
+    bucketLabel: !entry.currentVerified ? 'Universe review required' : null,
+    auditReason: entry.recommendationNote || ''
+  };
+}
+
+/* =========================================================
    COMPANY METADATA
 ========================================================= */
 
@@ -4065,8 +4240,30 @@ async function loadCompanyMap() {
     return companyCache.data;
   }
 
+  // Build 0.7.0 starts from the frozen canonical identity master.
+  // Runtime sources may enrich missing fields, but they no longer define
+  // whether a symbol is eligible for NOMAD's recommendation universe.
   const map =
-    await loadOfficialSymbolsMap();
+    loadMasterCompanyMap();
+
+  try {
+    const officialMap =
+      await loadOfficialSymbolsMap();
+
+    for (
+      const [
+        symbol,
+        metadata
+      ]
+      of officialMap.entries()
+    ) {
+      mergeCompanyMetadata(
+        map,
+        symbol,
+        metadata
+      );
+    }
+  } catch {}
 
   await enrichFromEligibleScrips(
     map
@@ -4088,8 +4285,6 @@ async function loadCompanyMap() {
     map
   );
 
-  // One official bulk market snapshot provides current-security evidence
-  // without requiring hundreds of company-page requests.
   await enrichFromMarketWatch(
     map
   );
@@ -6420,6 +6615,11 @@ function normalizeScreenerRow(
       row.pe_ratio
     );
 
+  const master =
+    getUniverseMasterEntry(
+      symbol
+    );
+
   return {
     symbol,
 
@@ -6437,6 +6637,33 @@ function normalizeScreenerRow(
 
     normalizedSymbol:
       identity.normalized,
+
+    universeMasterVersion:
+      PSX_UNIVERSE_MASTER.masterVersion,
+
+    masterStatus:
+      master?.masterStatus ||
+      'UNMAPPED_FEED',
+
+    universeClass:
+      master?.universeClass ||
+      'UNMAPPED_FEED',
+
+    recommendationEligible:
+      master?.recommendationEligible ===
+      true,
+
+    universeBoard:
+      master?.board ||
+      null,
+
+    securityType:
+      master?.securityType ||
+      null,
+
+    issuerType:
+      master?.issuerType ||
+      null,
 
     metadataSources:
       Array.isArray(
@@ -6717,6 +6944,44 @@ async function loadPSXMarket() {
 
     totalStocks:
       stocks.length,
+
+    universeMasterVersion:
+      PSX_UNIVERSE_MASTER.masterVersion,
+
+    coreEquityCount:
+      stocks.filter(
+        stock =>
+          stock.universeClass ===
+          'CORE_EQUITY'
+      ).length,
+
+    gemEquityCount:
+      stocks.filter(
+        stock =>
+          stock.universeClass ===
+          'GEM_EQUITY'
+      ).length,
+
+    alternativeCurrentCount:
+      stocks.filter(
+        stock =>
+          stock.universeClass ===
+          'ALTERNATIVE_CURRENT'
+      ).length,
+
+    reviewRequiredCount:
+      stocks.filter(
+        stock =>
+          stock.universeClass ===
+          'REVIEW_REQUIRED'
+      ).length,
+
+    unmappedFeedCount:
+      stocks.filter(
+        stock =>
+          stock.universeClass ===
+          'UNMAPPED_FEED'
+      ).length,
 
     stocks
   };
@@ -8842,16 +9107,16 @@ async function getMetadataAudit() {
     return metadataAuditCache.data;
   }
 
-  const [
-    market,
-    bulkStatus
-  ] =
-    await Promise.all([
-      loadPSXMarket(),
-      loadPSXBulkStatusEvidence()
-    ]);
+  const market =
+    await loadPSXMarket();
 
-  const knownSymbols =
+  const rows =
+    (PSX_UNIVERSE_MASTER.entries || [])
+      .map(
+        masterRowForClient
+      );
+
+  const liveSymbols =
     new Set(
       market.stocks.map(
         stock =>
@@ -8861,172 +9126,37 @@ async function getMetadataAudit() {
       )
     );
 
-  const fastClassified =
-    market.stocks.map(
+  const feedUnmapped =
+    market.stocks.filter(
       stock =>
-        classifyInstrumentForAudit(
-          stock,
-          knownSymbols
+        !PSX_UNIVERSE_BY_SYMBOL.has(
+          normalizeSymbol(
+            stock.symbol
+          )
         )
     );
 
-  const classified =
-    fastClassified.map(
+  const masterMissingFromFeed =
+    rows.filter(
       row =>
-        applyBulkStatusEvidenceToRow(
-          row,
-          bulkStatus
+        !liveSymbols.has(
+          normalizeSymbol(
+            row.symbol
+          )
         )
     );
 
   const issues =
-    classified.filter(
+    rows.filter(
       row =>
         Boolean(
           row.issueType
         )
     );
 
-  const specialInstruments =
-    classified.filter(
-      row =>
-        row.isSpecialSecurity
-    );
-
-  const namesResolved =
-    classified.filter(
-      row =>
-        row.nameResolved
-    ).length;
-
-  const sectorsResolved =
-    classified.filter(
-      row =>
-        row.sectorResolved
-    ).length;
-
-  const universeClasses =
-    countBy(
-      classified,
-      'universeClass'
-    );
-
-  const tradingStatusCounts =
-    countBy(
-      classified,
-      'tradingStatus'
-    );
-
-  const eligibilityCounts =
-    countBy(
-      classified,
-      'eligibility'
-    );
-
-  const officialEvidenceCoverage = {
-    verifiedByAnyOfficialSource:
-      classified.filter(
-        row =>
-          row.hasOfficialCurrentEvidence
-      ).length,
-
-    psxSymbols:
-      classified.filter(
-        row =>
-          row.officialEvidenceSources.includes(
-            'PSX symbols'
-          )
-      ).length,
-
-    eligibleScrips:
-      classified.filter(
-        row =>
-          row.officialEvidenceSources.includes(
-            'PSX eligible scrips'
-          )
-      ).length,
-
-    allShare:
-      classified.filter(
-        row =>
-          row.officialEvidenceSources.includes(
-            'PSX ALLSHR'
-          )
-      ).length,
-
-    marketWatch:
-      classified.filter(
-        row =>
-          row.officialEvidenceSources.includes(
-            'PSX market watch'
-          )
-      ).length,
-
-    companyPage:
-      0,
-
-    bulkStatusMatched:
-      classified.filter(
-        row =>
-          Boolean(
-            row.bulkStatusReportKey
-          )
-      ).length
-  };
-
-  const bulkStatusDiagnostics = {
-    loadedReports:
-      bulkStatus.loadedReports ||
-      0,
-
-    failedReports:
-      bulkStatus.failedReports ||
-      0,
-
-    reports:
-      (
-        bulkStatus.reports ||
-        []
-      ).map(
-        report => ({
-          key:
-            report.key,
-          loaded:
-            report.loaded,
-          url:
-            report.url,
-          reportDate:
-            report.reportDate,
-          textLength:
-            report.textLength,
-          error:
-            report.error
-        })
-      ),
-
-    matchesByReport:
-      (
-        bulkStatus.reports ||
-        []
-      ).reduce(
-        (
-          output,
-          report
-        ) => {
-          output[
-            report.key
-          ] =
-            classified.filter(
-              row =>
-                row.bulkStatusReportKey ===
-                report.key
-            ).length;
-
-          return output;
-        },
-        {}
-      )
-  };
+  const summary =
+    PSX_UNIVERSE_MASTER.summary ||
+    {};
 
   const data = {
     version:
@@ -9040,116 +9170,152 @@ async function getMetadataAudit() {
       market.asOf,
 
     mode:
-      'READ_ONLY_SECURITY_UNIVERSE_QA_WITH_BULK_STATUS_REPORTS',
+      'CANONICAL_UNIVERSE_MASTER',
 
-    deepStatusResolution:
-      'OFFICIAL_PSX_BULK_REPORTS_NO_MASS_COMPANY_PAGE_SCRAPING',
+    masterVersion:
+      PSX_UNIVERSE_MASTER.masterVersion,
+
+    masterGeneratedAt:
+      PSX_UNIVERSE_MASTER.generatedAt,
+
+    policy:
+      PSX_UNIVERSE_MASTER.policy,
 
     summary: {
       totalCanonicalSecurities:
-        classified.length,
+        summary.total ||
+        rows.length,
 
-      namesResolved,
+      namesResolved:
+        rows.filter(
+          row =>
+            row.nameResolved
+        ).length,
 
       namesMissing:
-        classified.length -
-        namesResolved,
+        rows.filter(
+          row =>
+            !row.nameResolved
+        ).length,
 
-      sectorsResolved,
+      sectorsResolved:
+        rows.filter(
+          row =>
+            row.sectorResolved
+        ).length,
 
       sectorsMissing:
-        classified.length -
-        sectorsResolved,
+        rows.filter(
+          row =>
+            !row.sectorResolved
+        ).length,
 
       statusSymbolsNormalized:
-        classified.filter(
-          row =>
-            row.normalizedStatus
-        ).length,
+        market.normalizedStatusRows ||
+        0,
 
       totalMetadataIssues:
         issues.length,
 
       totalSpecialInstrumentsDetected:
-        specialInstruments.length,
+        rows.filter(
+          row =>
+            row.isSpecialSecurity
+        ).length,
 
       verifiedCurrentSecurities:
-        universeClasses.VERIFIED_CURRENT ||
-        0,
+        (
+          summary.coreEquity ||
+          0
+        ) +
+        (
+          summary.gemEquity ||
+          0
+        ),
 
       specialInstrumentSecurities:
-        universeClasses.SPECIAL_INSTRUMENT ||
+        summary.alternativeCurrent ||
         0,
 
       legacyStaleCandidates:
-        universeClasses.LEGACY_STALE_CANDIDATE ||
         0,
 
       historicalOrInactive:
-        universeClasses.HISTORICAL_OR_INACTIVE ||
         0,
 
       suspendedSecurities:
-        tradingStatusCounts.SUSPENDED ||
         0,
 
       delistedSecurities:
-        tradingStatusCounts.DELISTED ||
         0,
 
       changedOrMigratedSymbols:
-        (
-          tradingStatusCounts.CHANGED ||
-          0
-        ) +
-        (
-          tradingStatusCounts.MERGED ||
-          0
-        ) +
-        (
-          tradingStatusCounts.MIGRATED_OR_SYMBOL_CHANGED ||
-          0
-        ),
+        0,
 
       statusReviewRequired:
-        (
-          universeClasses.REVIEW_REQUIRED ||
-          0
-        ) +
-        (
-          universeClasses.UNVERIFIED ||
-          0
-        ),
+        summary.reviewRequired ||
+        0,
 
       coreEquityCandidates:
-        eligibilityCounts.CORE_EQUITY_CANDIDATE ||
+        summary.coreEquity ||
         0,
 
       gemEquityCandidates:
-        eligibilityCounts.GEM_EQUITY_CANDIDATE ||
+        summary.gemEquity ||
         0,
 
-      bulkStatusReportsLoaded:
-        bulkStatus.loadedReports ||
+      alternativeCurrent:
+        summary.alternativeCurrent ||
         0,
 
-      bulkStatusReportsFailed:
-        bulkStatus.failedReports ||
+      defaultRecommendationEligible:
+        summary.defaultRecommendationEligible ||
         0,
 
-      bulkStatusMatches:
-        officialEvidenceCoverage.bulkStatusMatched ||
-        0
+      feedUnmapped:
+        feedUnmapped.length,
+
+      masterMissingFromFeed:
+        masterMissingFromFeed.length
     },
 
-    sourceCoverage:
-      officialEvidenceCoverage,
+    sourceCoverage: {
+      canonicalUniverseMaster:
+        rows.length,
+      currentVerified:
+        summary.currentVerified ||
+        0,
+      feedMapped:
+        market.stocks.length -
+        feedUnmapped.length,
+      feedUnmapped:
+        feedUnmapped.length
+    },
 
-    bulkStatusDiagnostics,
+    bulkStatusDiagnostics: {
+      loadedReports: 0,
+      failedReports: 0,
+      reports: [],
+      matchesByReport: {}
+    },
 
-    universeClasses,
-    tradingStatusCounts,
-    eligibilityCounts,
+    universeClasses:
+      countBy(
+        rows,
+        'universeClass'
+      ),
+
+    tradingStatusCounts:
+      countBy(
+        rows,
+        'tradingStatus'
+      ),
+
+    eligibilityCounts:
+      countBy(
+        rows,
+        'eligibility'
+      ),
 
     issueBuckets:
       countBy(
@@ -9165,25 +9331,26 @@ async function getMetadataAudit() {
 
     securityTypes:
       countBy(
-        classified,
+        rows,
         'securityType'
       ),
 
     issuerTypes:
       countBy(
-        classified,
+        rows,
         'issuerType'
       ),
 
     issues,
     universe:
-      classified
+      rows,
+    feedUnmapped,
+    masterMissingFromFeed
   };
 
   metadataAuditCache = {
     fetchedAt:
       Date.now(),
-
     data
   };
 
@@ -12102,17 +12269,23 @@ async function handler(
           version:
             VERSION,
 
+          universeMasterVersion:
+            PSX_UNIVERSE_MASTER.masterVersion,
+
+          universeMasterSummary:
+            PSX_UNIVERSE_MASTER.summary,
+
           marketProvider:
             'psxdata-api',
 
           companyMetadata:
-            'PSX bulk listing metadata + bulk status reports + individual-company research pages + fallbacks',
+            'NOMAD canonical universe master + runtime research sources',
 
           symbolNormalization:
             'VALIDATED_CANONICAL_STATUS_SEPARATION',
 
           metadataAudit:
-            'READ_ONLY_SECURITY_UNIVERSE_QA_WITH_DEEP_STATUS_RESOLVER',
+            'CANONICAL_UNIVERSE_MASTER_LOCKED',
 
           fundamentalsProvider:
             'PSX Data Portal company page',
@@ -12137,6 +12310,25 @@ async function handler(
 
           tradeExecution:
             false
+        }
+      );
+    }
+
+    if (
+      request.method ===
+        'GET' &&
+      action ===
+        'universe-master'
+    ) {
+      return sendJSON(
+        response,
+        {
+          version: VERSION,
+          masterVersion: PSX_UNIVERSE_MASTER.masterVersion,
+          generatedAt: PSX_UNIVERSE_MASTER.generatedAt,
+          summary: PSX_UNIVERSE_MASTER.summary,
+          policy: PSX_UNIVERSE_MASTER.policy,
+          entries: PSX_UNIVERSE_MASTER.entries
         }
       );
     }
@@ -13293,7 +13485,7 @@ Build ${VERSION}
 <p class="notice">
 
 Market, company metadata, fundamentals, symbol normalization,
-metadata/security-universe auditing and deterministic technical analysis are connected.
+canonical universe identity, metadata, fundamentals and deterministic technical analysis are connected.
 
 Predictions and investment recommendations remain disabled
 until their models are built and validated.
@@ -13495,13 +13687,44 @@ Next
 
 </section>
 
+<section class="card" id="universeMasterSection">
+
+<h2>Canonical PSX Universe</h2>
+
+<p class="muted">
+NOMAD now uses a frozen, versioned security master for identity and recommendation eligibility. Market-price feeds can update prices, volumes and live status codes, but they cannot add a security to the recommendation universe.
+</p>
+
+<div class="summaryGrid">
+
+<div class="metric"><div class="metricLabel">Master version</div><div class="metricValue">${PSX_UNIVERSE_MASTER.masterVersion}</div></div>
+
+<div class="metric"><div class="metricLabel">Core equities</div><div class="metricValue">${PSX_UNIVERSE_MASTER.summary.coreEquity}</div><div class="metricSub">Default recommendation universe</div></div>
+
+<div class="metric"><div class="metricLabel">GEM equities</div><div class="metricValue">${PSX_UNIVERSE_MASTER.summary.gemEquity}</div><div class="metricSub">Separate higher-risk universe</div></div>
+
+<div class="metric"><div class="metricLabel">Alternative current</div><div class="metricValue">${PSX_UNIVERSE_MASTER.summary.alternativeCurrent}</div><div class="metricSub">REIT / Modaraba / fund / rights / special</div></div>
+
+<div class="metric"><div class="metricLabel">Review required</div><div class="metricValue">${PSX_UNIVERSE_MASTER.summary.reviewRequired}</div><div class="metricSub">Quarantined from recommendations</div></div>
+
+<div class="metric"><div class="metricLabel">Total identities</div><div class="metricValue">${PSX_UNIVERSE_MASTER.summary.total}</div></div>
+
+</div>
+
+<div class="infoBox">
+<strong>Universe lock:</strong> Core equities may proceed to future scoring and allocation. GEM and alternative securities require separate frameworks. Review-required symbols remain searchable for research but cannot enter recommendations. Universe changes will be handled later through a controlled master refresh/diff, not during normal app use.
+</div>
+
+</section>
+
 <section
   class="card"
   id="metadataAuditSection"
+  style="display:none"
 >
 
 <h2>
-Metadata & Security Universe Audit
+Legacy Universe Audit (retired)
 </h2>
 
 <p class="muted">
@@ -20455,16 +20678,18 @@ $('loadMarket')
         $('coverage')
           .textContent =
             result.totalStocks +
-            ' canonical stocks | Company names matched ' +
-            result.companyNamesMatched +
-            '/' +
-            result.totalStocks +
-            ' | Sectors matched ' +
-            result.sectorsMatched +
-            '/' +
-            result.totalStocks +
-            ' | Status symbols normalized ' +
-            result.normalizedStatusRows +
+            ' feed securities | Universe master ' +
+            result.universeMasterVersion +
+            ' | Core ' +
+            result.coreEquityCount +
+            ' | GEM ' +
+            result.gemEquityCount +
+            ' | Alternative ' +
+            result.alternativeCurrentCount +
+            ' | Review ' +
+            result.reviewRequiredCount +
+            ' | Unmapped feed ' +
+            result.unmappedFeedCount +
             ' | Updated ' +
             result.asOf;
 
@@ -21231,7 +21456,8 @@ api(
           'Market: connected | ' +
           'Company metadata: connected | ' +
           'Symbol normalization: validated canonical mapping | ' +
-          'Security universe audit: read-only | ' +
+          'Universe master: ' +
+          (result.universeMasterVersion || 'loaded') + ' | ' +
           'pyPSX: ' +
           (
             result.pyPSXConfigured
