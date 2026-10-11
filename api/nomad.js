@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.8.1';
+const VERSION = '0.8.2';
 
 
 const SUPABASE_URL =
@@ -113,6 +113,7 @@ let sectorCache = null;
 let companyCache = null;
 let metadataAuditCache = null;
 let bulkStatusCache = null;
+let marketWatchCache = null;
 
 const companyPageCache =
   new Map();
@@ -3924,7 +3925,6 @@ function parseMarketWatchRows(
     const symbol =
       normalizeRawMarketSymbol(
         fields.symbol ||
-        fields['symbol'] ||
         ''
       );
 
@@ -3946,7 +3946,50 @@ function parseMarketWatchRows(
           fields.listed ||
           fields['listed in'] ||
           ''
-        ).trim()
+        ).trim(),
+
+      ldcp:
+        safeNumber(
+          fields.ldcp
+        ),
+
+      open:
+        safeNumber(
+          fields.open
+        ),
+
+      high:
+        safeNumber(
+          fields.high
+        ),
+
+      low:
+        safeNumber(
+          fields.low
+        ),
+
+      current:
+        safeNumber(
+          fields.close ??
+          fields.current
+        ),
+
+      change:
+        safeNumber(
+          fields.change
+        ),
+
+      changePct:
+        safeNumber(
+          fields.percentchange ??
+          fields['change (%)'] ??
+          fields['change%']
+        ),
+
+      volume:
+        safeNumber(
+          fields.volume
+        )
     });
   }
 
@@ -4020,6 +4063,163 @@ async function enrichFromMarketWatch(
       );
     }
   } catch {}
+}
+
+async function loadMarketWatchSnapshot(
+  companyMap
+) {
+  if (
+    marketWatchCache &&
+    Date.now() -
+      marketWatchCache.fetchedAt <
+      30000
+  ) {
+    return marketWatchCache.data;
+  }
+
+  const html =
+    await fetchText(
+      PSX_MARKET_WATCH_URL,
+      30000,
+      {
+        Referer:
+          `${PSX_DPS_BASE}/`,
+
+        'X-Requested-With':
+          'XMLHttpRequest'
+      }
+    );
+
+  const rawRows =
+    parseMarketWatchRows(
+      html
+    );
+
+  const canonicalRows =
+    new Map();
+
+  for (
+    const row
+    of rawRows
+  ) {
+    const identity =
+      resolveSymbolIdentity(
+        row.symbol,
+        companyMap
+      );
+
+    const symbol =
+      identity.canonicalSymbol ||
+      primaryMarketToken(
+        row.symbol
+      );
+
+    if (!symbol) {
+      continue;
+    }
+
+    const master =
+      getUniverseMasterEntry(
+        symbol
+      );
+
+    const company =
+      companyMap.get(
+        symbol
+      ) ||
+      {};
+
+    const normalized = {
+      symbol,
+      tradingSymbol:
+        identity.tradingSymbol ||
+        row.symbol,
+      rawSymbol:
+        identity.rawSymbol ||
+        row.symbol,
+      statusCodes:
+        identity.statusCodes ||
+        [],
+      companyName:
+        company.name ||
+        master?.companyName ||
+        symbol,
+      sector:
+        company.sector ||
+        master?.sector ||
+        row.sector ||
+        'Unknown',
+      listedIn:
+        row.listedIn ||
+        master?.listedIn ||
+        '',
+      universeClass:
+        master?.universeClass ||
+        'UNMAPPED_FEED',
+      recommendationEligible:
+        master?.recommendationEligible ===
+        true,
+      ldcp:
+        row.ldcp,
+      open:
+        row.open,
+      high:
+        row.high,
+      low:
+        row.low,
+      current:
+        row.current,
+      change:
+        row.change,
+      changePct:
+        row.changePct,
+      volume:
+        row.volume
+    };
+
+    const previous =
+      canonicalRows.get(
+        symbol
+      );
+
+    if (
+      !previous ||
+      (
+        normalized.volume ||
+        0
+      ) >
+      (
+        previous.volume ||
+        0
+      )
+    ) {
+      canonicalRows.set(
+        symbol,
+        normalized
+      );
+    }
+  }
+
+  const rows =
+    [...canonicalRows.values()];
+
+  const result = {
+    asOf:
+      new Date()
+        .toISOString(),
+    total:
+      rows.length,
+    rows
+  };
+
+  marketWatchCache = {
+    fetchedAt:
+      Date.now(),
+    data:
+      result
+  };
+
+  return result;
 }
 
 async function enrichFromPyPSX(
@@ -6922,6 +7122,99 @@ async function loadPSXMarket() {
           )
       );
 
+  let marketWatch =
+    null;
+
+  try {
+    marketWatch =
+      await loadMarketWatchSnapshot(
+        companyMap
+      );
+
+    const watchMap =
+      new Map(
+        (
+          marketWatch.rows ||
+          []
+        ).map(
+          row => [
+            normalizeSymbol(
+              row.symbol
+            ),
+            row
+          ]
+        )
+      );
+
+    for (
+      const stock
+      of stocks
+    ) {
+      const watch =
+        watchMap.get(
+          normalizeSymbol(
+            stock.symbol
+          )
+        );
+
+      if (!watch) {
+        continue;
+      }
+
+      if (
+        safeNumber(
+          watch.current
+        ) !== null &&
+        safeNumber(
+          watch.current
+        ) > 0
+      ) {
+        stock.price =
+          safeNumber(
+            watch.current
+          );
+      }
+
+      stock.previousClose =
+        safeNumber(
+          watch.ldcp
+        );
+
+      stock.dayChange =
+        safeNumber(
+          watch.change
+        );
+
+      stock.dayChangePct =
+        safeNumber(
+          watch.changePct
+        );
+
+      stock.sessionOpen =
+        safeNumber(
+          watch.open
+        );
+
+      stock.sessionHigh =
+        safeNumber(
+          watch.high
+        );
+
+      stock.sessionLow =
+        safeNumber(
+          watch.low
+        );
+
+      stock.sessionVolume =
+        safeNumber(
+          watch.volume
+        );
+
+      stock.marketWatchAsOf =
+        marketWatch.asOf;
+    }
+  } catch {}
+
   if (
     !stocks.length
   ) {
@@ -6970,6 +7263,10 @@ async function loadPSXMarket() {
 
     asOf:
       screener.timestamp,
+
+    marketWatchAsOf:
+      marketWatch?.asOf ||
+      null,
 
     totalStocks:
       stocks.length,
@@ -12149,7 +12446,7 @@ async function supabaseRest(
       'application/json',
 
     'User-Agent':
-      'NOMAD-Invest-Server/0.8.1'
+      'NOMAD-Invest-Server/0.8.2'
   };
 
   if (
@@ -13006,7 +13303,1179 @@ async function runContinuousMemoryTest(
 
 
 /* =========================================================
-   CONTINUOUS INTELLIGENCE SCANNER - BUILD 0.8.1
+   PORTFOLIO + HISTORICAL SITUATION CONTEXT - BUILD 0.8.2
+========================================================= */
+
+function sessionReturn(
+  rows,
+  sessions,
+  currentPrice = null
+) {
+  if (!Array.isArray(rows) || !rows.length) {
+    return null;
+  }
+
+  const latest =
+    safeNumber(currentPrice) ??
+    safeNumber(
+      rows[rows.length - 1]?.close
+    );
+
+  const index =
+    Math.max(
+      0,
+      rows.length - 1 - sessions
+    );
+
+  const base =
+    safeNumber(
+      rows[index]?.close
+    );
+
+  if (
+    latest === null ||
+    base === null ||
+    base === 0
+  ) {
+    return null;
+  }
+
+  return (
+    (
+      latest -
+      base
+    ) /
+    Math.abs(base)
+  ) * 100;
+}
+
+function simpleAverageClose(
+  rows,
+  sessions
+) {
+  if (
+    !Array.isArray(rows) ||
+    rows.length < sessions
+  ) {
+    return null;
+  }
+
+  const values =
+    rows
+      .slice(-sessions)
+      .map(
+        row =>
+          safeNumber(
+            row.close
+          )
+      )
+      .filter(
+        value =>
+          value !== null
+      );
+
+  if (values.length < sessions) {
+    return null;
+  }
+
+  return values.reduce(
+    (
+      sum,
+      value
+    ) =>
+      sum + value,
+    0
+  ) / values.length;
+}
+
+function historicalConditionLabel(
+  return1m,
+  trend
+) {
+  const oneMonth =
+    safeNumber(
+      return1m
+    );
+
+  if (
+    oneMonth !== null &&
+    oneMonth <= -8
+  ) {
+    return 'Weak';
+  }
+
+  if (
+    oneMonth !== null &&
+    oneMonth >= 8
+  ) {
+    return 'Strong';
+  }
+
+  if (
+    trend === 'Downtrend'
+  ) {
+    return 'Soft';
+  }
+
+  if (
+    trend === 'Uptrend'
+  ) {
+    return 'Positive';
+  }
+
+  return 'Mixed';
+}
+
+function buildHistoricalContext(
+  symbol,
+  rows,
+  currentPrice
+) {
+  if (
+    !Array.isArray(rows) ||
+    rows.length < 10
+  ) {
+    return {
+      symbol,
+      available: false,
+      reason:
+        'Insufficient valid historical sessions.'
+    };
+  }
+
+  const price =
+    safeNumber(currentPrice) ??
+    safeNumber(
+      rows[rows.length - 1]?.close
+    );
+
+  const sma20 =
+    simpleAverageClose(
+      rows,
+      20
+    );
+
+  const sma50 =
+    simpleAverageClose(
+      rows,
+      50
+    );
+
+  const sma200 =
+    simpleAverageClose(
+      rows,
+      200
+    );
+
+  let trend =
+    'Mixed';
+
+  if (
+    price !== null &&
+    sma20 !== null &&
+    sma50 !== null
+  ) {
+    if (
+      price > sma20 &&
+      price > sma50
+    ) {
+      trend =
+        'Uptrend';
+    } else if (
+      price < sma20 &&
+      price < sma50
+    ) {
+      trend =
+        'Downtrend';
+    }
+  }
+
+  const last252 =
+    rows.slice(-252);
+
+  const high52 =
+    last252.length
+      ? Math.max(
+          ...last252.map(
+            row =>
+              safeNumber(
+                row.high
+              ) ??
+              safeNumber(
+                row.close
+              ) ??
+              0
+          )
+        )
+      : null;
+
+  const lows =
+    last252
+      .map(
+        row =>
+          safeNumber(
+            row.low
+          ) ??
+          safeNumber(
+            row.close
+          )
+      )
+      .filter(
+        value =>
+          value !== null
+      );
+
+  const low52 =
+    lows.length
+      ? Math.min(
+          ...lows
+        )
+      : null;
+
+  const return5d =
+    sessionReturn(
+      rows,
+      5,
+      price
+    );
+
+  const return1m =
+    sessionReturn(
+      rows,
+      21,
+      price
+    );
+
+  const return3m =
+    sessionReturn(
+      rows,
+      63,
+      price
+    );
+
+  const return6m =
+    sessionReturn(
+      rows,
+      126,
+      price
+    );
+
+  const return1y =
+    sessionReturn(
+      rows,
+      Math.min(
+        252,
+        Math.max(
+          1,
+          rows.length - 1
+        )
+      ),
+      price
+    );
+
+  const flags = [];
+
+  if (
+    return1m !== null &&
+    return1m <= -5
+  ) {
+    flags.push(
+      'Weak 1-month performance'
+    );
+  }
+
+  if (
+    return1m !== null &&
+    return1m >= 5
+  ) {
+    flags.push(
+      'Strong 1-month performance'
+    );
+  }
+
+  if (
+    trend === 'Downtrend'
+  ) {
+    flags.push(
+      'Price below short/medium moving averages'
+    );
+  }
+
+  if (
+    trend === 'Uptrend'
+  ) {
+    flags.push(
+      'Price above short/medium moving averages'
+    );
+  }
+
+  const distanceFromHighPct =
+    price !== null &&
+    high52 !== null &&
+    high52 !== 0
+      ? (
+          (
+            price -
+            high52
+          ) /
+          high52
+        ) * 100
+      : null;
+
+  const distanceFromLowPct =
+    price !== null &&
+    low52 !== null &&
+    low52 !== 0
+      ? (
+          (
+            price -
+            low52
+          ) /
+          low52
+        ) * 100
+      : null;
+
+  if (
+    distanceFromHighPct !== null &&
+    distanceFromHighPct <= -20
+  ) {
+    flags.push(
+      'Well below 52-week high'
+    );
+  }
+
+  if (
+    distanceFromLowPct !== null &&
+    distanceFromLowPct <= 8
+  ) {
+    flags.push(
+      'Near 52-week low'
+    );
+  }
+
+  return {
+    symbol,
+    available: true,
+    asOf:
+      rows[rows.length - 1]?.date ||
+      null,
+    validSessions:
+      rows.length,
+    price:
+      roundMemoryNumber(
+        price,
+        4
+      ),
+    returns: {
+      d5:
+        roundMemoryNumber(
+          return5d,
+          2
+        ),
+      m1:
+        roundMemoryNumber(
+          return1m,
+          2
+        ),
+      m3:
+        roundMemoryNumber(
+          return3m,
+          2
+        ),
+      m6:
+        roundMemoryNumber(
+          return6m,
+          2
+        ),
+      y1:
+        roundMemoryNumber(
+          return1y,
+          2
+        )
+    },
+    movingAverages: {
+      sma20:
+        roundMemoryNumber(
+          sma20,
+          2
+        ),
+      sma50:
+        roundMemoryNumber(
+          sma50,
+          2
+        ),
+      sma200:
+        roundMemoryNumber(
+          sma200,
+          2
+        )
+    },
+    trend,
+    condition:
+      historicalConditionLabel(
+        return1m,
+        trend
+      ),
+    range52: {
+      high:
+        roundMemoryNumber(
+          high52,
+          2
+        ),
+      low:
+        roundMemoryNumber(
+          low52,
+          2
+        ),
+      distanceFromHighPct:
+        roundMemoryNumber(
+          distanceFromHighPct,
+          2
+        ),
+      distanceFromLowPct:
+        roundMemoryNumber(
+          distanceFromLowPct,
+          2
+        )
+    },
+    flags,
+    interpretation:
+      flags.length
+        ? flags.join('. ') + '.'
+        : 'No strong historical-condition flag is active from price history alone.',
+    source:
+      'psxdata-api daily history'
+  };
+}
+
+async function getHistoricalSituation(
+  stockSymbol,
+  suppliedPrice = null
+) {
+  const context =
+    await resolveSymbolContext(
+      stockSymbol
+    );
+
+  const symbol =
+    context.canonicalSymbol;
+
+  const end =
+    new Date()
+      .toISOString()
+      .slice(
+        0,
+        10
+      );
+
+  const start =
+    new Date(
+      Date.now() -
+      430 *
+      24 *
+      60 *
+      60 *
+      1000
+    )
+      .toISOString()
+      .slice(
+        0,
+        10
+      );
+
+  const result =
+    await fetchCanonicalHistory(
+      symbol,
+      start,
+      end
+    );
+
+  const normalized =
+    normalizeHistoricalRows(
+      result?.data ||
+      []
+    );
+
+  const currentPrice =
+    safeNumber(
+      suppliedPrice
+    ) ??
+    safeNumber(
+      normalized.cleaned[
+        normalized.cleaned.length - 1
+      ]?.close
+    );
+
+  return buildHistoricalContext(
+    symbol,
+    normalized.cleaned,
+    currentPrice
+  );
+}
+
+async function readPortfolioHoldings() {
+  try {
+    const rows =
+      await supabaseRest(
+        'portfolio_holdings?select=*&order=created_at.asc'
+      );
+
+    return {
+      configured: true,
+      rows:
+        Array.isArray(rows)
+          ? rows
+          : []
+    };
+  } catch (error) {
+    if (
+      String(
+        error.message ||
+        ''
+      )
+        .toLowerCase()
+        .includes(
+          'portfolio_holdings'
+        )
+    ) {
+      return {
+        configured: false,
+        rows: []
+      };
+    }
+
+    throw error;
+  }
+}
+
+async function savePortfolioHolding(
+  input
+) {
+  const symbol =
+    normalizeSymbol(
+      input?.symbol
+    );
+
+  const quantity =
+    safeNumber(
+      input?.quantity
+    );
+
+  const averageCost =
+    safeNumber(
+      input?.average_cost ??
+      input?.averageCost
+    );
+
+  const fees =
+    safeNumber(
+      input?.fees
+    ) ??
+    0;
+
+  if (!symbol) {
+    bad(
+      'Enter a PSX symbol.'
+    );
+  }
+
+  const master =
+    getUniverseMasterEntry(
+      symbol
+    );
+
+  if (!master) {
+    bad(
+      'Symbol is not present in the canonical NOMAD universe.',
+      404
+    );
+  }
+
+  if (
+    quantity === null ||
+    quantity <= 0
+  ) {
+    bad(
+      'Quantity must be greater than zero.'
+    );
+  }
+
+  if (
+    averageCost === null ||
+    averageCost < 0
+  ) {
+    bad(
+      'Average cost must be zero or greater.'
+    );
+  }
+
+  const rows =
+    await supabaseRest(
+      'portfolio_holdings?on_conflict=symbol&select=*',
+      {
+        method: 'POST',
+        prefer:
+          'resolution=merge-duplicates,return=representation',
+        body: {
+          symbol,
+          quantity,
+          average_cost:
+            averageCost,
+          purchase_date:
+            input?.purchase_date ||
+            input?.purchaseDate ||
+            null,
+          fees,
+          notes:
+            String(
+              input?.notes ||
+              ''
+            ).trim() ||
+            null
+        }
+      }
+    );
+
+  return Array.isArray(rows)
+    ? rows[0] || null
+    : null;
+}
+
+async function deletePortfolioHolding(
+  symbol
+) {
+  const normalized =
+    normalizeSymbol(
+      symbol
+    );
+
+  if (!normalized) {
+    bad(
+      'Enter a symbol to remove.'
+    );
+  }
+
+  await supabaseRest(
+    'portfolio_holdings?symbol=eq.' +
+    encodeURIComponent(
+      normalized
+    ),
+    {
+      method: 'DELETE',
+      prefer: 'return=minimal'
+    }
+  );
+
+  return {
+    status: 'OK',
+    symbol: normalized
+  };
+}
+
+async function saveHistoricalSituationToMemory(
+  symbol,
+  historicalContext,
+  marketRow = null,
+  runId = null
+) {
+  if (
+    !historicalContext?.available
+  ) {
+    return null;
+  }
+
+  const previous =
+    await readSecurityMemory(
+      symbol
+    );
+
+  const master =
+    getUniverseMasterEntry(
+      symbol
+    );
+
+  const marketState = {
+    ...(
+      previous?.market_state ||
+      {}
+    ),
+    historicalContext
+  };
+
+  const rows =
+    await supabaseRest(
+      'security_state?on_conflict=symbol&select=symbol,market_state,evaluated_at',
+      {
+        method: 'POST',
+        prefer:
+          'resolution=merge-duplicates,return=representation',
+        body: {
+          symbol,
+          company_name:
+            previous?.company_name ||
+            master?.companyName ||
+            marketRow?.companyName ||
+            symbol,
+          sector:
+            previous?.sector ||
+            master?.sector ||
+            marketRow?.sector ||
+            null,
+          universe_class:
+            previous?.universe_class ||
+            master?.universeClass ||
+            marketRow?.universeClass ||
+            null,
+          eligibility:
+            previous?.eligibility ||
+            (
+              master?.recommendationEligible ===
+              true
+                ? 'RECOMMENDATION_ELIGIBLE'
+                : 'NOT_RECOMMENDATION_ELIGIBLE'
+            ),
+          market_price:
+            safeNumber(
+              marketRow?.price
+            ) ??
+            previous?.market_price ??
+            historicalContext.price ??
+            null,
+          market_state:
+            marketState,
+          last_run_id:
+            runId ||
+            previous?.last_run_id ||
+            null,
+          evaluated_at:
+            new Date()
+              .toISOString()
+        }
+      }
+    );
+
+  return Array.isArray(rows)
+    ? rows[0] || null
+    : null;
+}
+
+async function refreshHistoricalSituation(
+  symbol,
+  marketRow = null,
+  runId = null
+) {
+  const context =
+    await getHistoricalSituation(
+      symbol,
+      marketRow?.price ??
+      null
+    );
+
+  await saveHistoricalSituationToMemory(
+    normalizeSymbol(
+      symbol
+    ),
+    context,
+    marketRow,
+    runId
+  );
+
+  return context;
+}
+
+async function getPortfolioSnapshot() {
+  const holdingsResult =
+    await readPortfolioHoldings();
+
+  if (!holdingsResult.configured) {
+    return {
+      configured: false,
+      holdings: [],
+      summary: null
+    };
+  }
+
+  const holdings =
+    holdingsResult.rows;
+
+  if (!holdings.length) {
+    return {
+      configured: true,
+      holdings: [],
+      summary: {
+        holdings: 0,
+        currentValue: 0,
+        investedCost: 0,
+        totalPnl: 0,
+        totalPnlPct: null,
+        dayPnl: 0,
+        dayPnlPct: null
+      }
+    };
+  }
+
+  const [market, memoryRows] =
+    await Promise.all([
+      loadPSXMarket(),
+      readAllSecurityMemory()
+    ]);
+
+  const marketMap =
+    new Map(
+      market.stocks.map(
+        row => [
+          normalizeSymbol(
+            row.symbol
+          ),
+          row
+        ]
+      )
+    );
+
+  const memoryMap =
+    new Map(
+      memoryRows.map(
+        row => [
+          normalizeSymbol(
+            row.symbol
+          ),
+          row
+        ]
+      )
+    );
+
+  const enriched = [];
+
+  for (
+    const holding
+    of holdings
+  ) {
+    const symbol =
+      normalizeSymbol(
+        holding.symbol
+      );
+
+    const marketRow =
+      marketMap.get(
+        symbol
+      ) ||
+      null;
+
+    let memory =
+      memoryMap.get(
+        symbol
+      ) ||
+      null;
+
+    let historicalContext =
+      memory?.market_state
+        ?.historicalContext ||
+      null;
+
+    const contextAge =
+      Date.parse(
+        memory?.evaluated_at ||
+        ''
+      );
+
+    const contextStale =
+      !historicalContext ||
+      !Number.isFinite(
+        contextAge
+      ) ||
+      Date.now() -
+        contextAge >
+        12 *
+        60 *
+        60 *
+        1000;
+
+    if (contextStale) {
+      try {
+        historicalContext =
+          await refreshHistoricalSituation(
+            symbol,
+            marketRow
+          );
+
+        memory =
+          await readSecurityMemory(
+            symbol
+          );
+      } catch {}
+    }
+
+    const quantity =
+      safeNumber(
+        holding.quantity
+      ) ||
+      0;
+
+    const averageCost =
+      safeNumber(
+        holding.average_cost
+      ) ||
+      0;
+
+    const fees =
+      safeNumber(
+        holding.fees
+      ) ||
+      0;
+
+    const currentPrice =
+      safeNumber(
+        marketRow?.price
+      );
+
+    const currentValue =
+      currentPrice !== null
+        ? quantity *
+          currentPrice
+        : null;
+
+    const investedCost =
+      quantity *
+      averageCost +
+      fees;
+
+    const totalPnl =
+      currentValue !== null
+        ? currentValue -
+          investedCost
+        : null;
+
+    const totalPnlPct =
+      totalPnl !== null &&
+      investedCost > 0
+        ? totalPnl /
+          investedCost *
+          100
+        : null;
+
+    const previousClose =
+      safeNumber(
+        marketRow?.previousClose
+      );
+
+    const dayPnl =
+      currentPrice !== null &&
+      previousClose !== null
+        ? (
+            currentPrice -
+            previousClose
+          ) *
+          quantity
+        : null;
+
+    enriched.push({
+      id:
+        holding.id,
+      symbol,
+      companyName:
+        marketRow?.companyName ||
+        getUniverseMasterEntry(
+          symbol
+        )?.companyName ||
+        symbol,
+      sector:
+        marketRow?.sector ||
+        getUniverseMasterEntry(
+          symbol
+        )?.sector ||
+        'Unknown',
+      quantity,
+      averageCost,
+      fees,
+      purchaseDate:
+        holding.purchase_date ||
+        null,
+      currentPrice,
+      dayChangePct:
+        roundMemoryNumber(
+          marketRow?.dayChangePct,
+          2
+        ),
+      investedCost:
+        roundMemoryNumber(
+          investedCost,
+          2
+        ),
+      currentValue:
+        roundMemoryNumber(
+          currentValue,
+          2
+        ),
+      totalPnl:
+        roundMemoryNumber(
+          totalPnl,
+          2
+        ),
+      totalPnlPct:
+        roundMemoryNumber(
+          totalPnlPct,
+          2
+        ),
+      dayPnl:
+        roundMemoryNumber(
+          dayPnl,
+          2
+        ),
+      historicalContext:
+        historicalContext ||
+        null,
+      currentView:
+        memory?.current_view ||
+        null
+    });
+  }
+
+  const summary =
+    enriched.reduce(
+      (
+        output,
+        item
+      ) => {
+        output.investedCost +=
+          safeNumber(
+            item.investedCost
+          ) ||
+          0;
+
+        output.currentValue +=
+          safeNumber(
+            item.currentValue
+          ) ||
+          0;
+
+        output.totalPnl +=
+          safeNumber(
+            item.totalPnl
+          ) ||
+          0;
+
+        output.dayPnl +=
+          safeNumber(
+            item.dayPnl
+          ) ||
+          0;
+
+        return output;
+      },
+      {
+        holdings:
+          enriched.length,
+        investedCost: 0,
+        currentValue: 0,
+        totalPnl: 0,
+        dayPnl: 0
+      }
+    );
+
+  summary.totalPnlPct =
+    summary.investedCost > 0
+      ? summary.totalPnl /
+        summary.investedCost *
+        100
+      : null;
+
+  const previousValue =
+    summary.currentValue -
+    summary.dayPnl;
+
+  summary.dayPnlPct =
+    previousValue > 0
+      ? summary.dayPnl /
+        previousValue *
+        100
+      : null;
+
+  for (
+    const key
+    of [
+      'investedCost',
+      'currentValue',
+      'totalPnl',
+      'dayPnl',
+      'totalPnlPct',
+      'dayPnlPct'
+    ]
+  ) {
+    summary[key] =
+      roundMemoryNumber(
+        summary[key],
+        2
+      );
+  }
+
+  return {
+    configured: true,
+    asOf:
+      market.marketWatchAsOf ||
+      market.asOf,
+    summary,
+    holdings:
+      enriched
+  };
+}
+
+async function readJsonRequestBody(
+  request
+) {
+  const chunks = [];
+  let total = 0;
+
+  for await (
+    const chunk
+    of request
+  ) {
+    total +=
+      chunk.length;
+
+    if (
+      total >
+      1024 * 1024
+    ) {
+      bad(
+        'Request body is too large.',
+        413
+      );
+    }
+
+    chunks.push(
+      chunk
+    );
+  }
+
+  if (!chunks.length) {
+    return {};
+  }
+
+  const text =
+    Buffer.concat(
+      chunks
+    )
+      .toString(
+        'utf8'
+      );
+
+  if (!text.trim()) {
+    return {};
+  }
+
+  try {
+    return JSON.parse(
+      text
+    );
+  } catch {
+    bad(
+      'Invalid JSON request body.'
+    );
+  }
+}
+
+/* =========================================================
+   CONTINUOUS INTELLIGENCE SCANNER - BUILD 0.8.2
 ========================================================= */
 
 function scannerSecretConfigured() {
@@ -13208,6 +14677,36 @@ function buildScannerSecurityState(
         marketRow.change1yPct,
         2
       ),
+    dayChangePct:
+      roundMemoryNumber(
+        marketRow.dayChangePct,
+        2
+      ),
+    previousClose:
+      roundMemoryNumber(
+        marketRow.previousClose,
+        4
+      ),
+    sessionOpen:
+      roundMemoryNumber(
+        marketRow.sessionOpen,
+        4
+      ),
+    sessionHigh:
+      roundMemoryNumber(
+        marketRow.sessionHigh,
+        4
+      ),
+    sessionLow:
+      roundMemoryNumber(
+        marketRow.sessionLow,
+        4
+      ),
+    sessionVolume:
+      roundMemoryNumber(
+        marketRow.sessionVolume,
+        2
+      ),
     statusCodes:
       normalizeStatusArray(
         marketRow.statusCodes
@@ -13244,15 +14743,37 @@ function buildScannerSecurityState(
       ),
     market_change_pct:
       roundMemoryNumber(
-        scanChangePct,
+        marketRow.dayChangePct,
         4
       ),
     volume:
+      roundMemoryNumber(
+        marketRow.sessionVolume,
+        2
+      ) ??
       previous?.volume ??
       null,
     volume_ratio_20d:
-      previous?.volume_ratio_20d ??
-      null,
+      safeNumber(
+        marketRow.sessionVolume
+      ) !== null &&
+      safeNumber(
+        marketRow.averageVolume30d
+      ) !== null &&
+      safeNumber(
+        marketRow.averageVolume30d
+      ) > 0
+        ? roundMemoryNumber(
+            safeNumber(
+              marketRow.sessionVolume
+            ) /
+            safeNumber(
+              marketRow.averageVolume30d
+            ),
+            2
+          )
+        : previous?.volume_ratio_20d ??
+          null,
     technical_score:
       previous?.technical_score ??
       null,
@@ -13660,6 +15181,176 @@ async function runMarketSnapshotScan(
       );
     }
 
+    const holdingsResult =
+      await readPortfolioHoldings()
+        .catch(
+          () => ({
+            configured: false,
+            rows: []
+          })
+        );
+
+    const prioritySymbols =
+      uniqueStrings(
+        (
+          holdingsResult.rows ||
+          []
+        ).map(
+          row =>
+            normalizeSymbol(
+              row.symbol
+            )
+        )
+      );
+
+    const contextBatchSize =
+      8;
+
+    const rotationStart =
+      coreRows.length
+        ? (
+            Math.floor(
+              Date.now() /
+              (15 * 60 * 1000)
+            ) *
+            contextBatchSize
+          ) %
+          coreRows.length
+        : 0;
+
+    const rotationSymbols = [];
+
+    for (
+      let offset = 0;
+      offset < contextBatchSize &&
+      offset < coreRows.length;
+      offset++
+    ) {
+      rotationSymbols.push(
+        coreRows[
+          (
+            rotationStart +
+            offset
+          ) %
+          coreRows.length
+        ]?.symbol
+      );
+    }
+
+    const contextSymbols =
+      uniqueStrings([
+        ...prioritySymbols,
+        ...rotationSymbols
+      ])
+        .slice(
+          0,
+          16
+        );
+
+    const marketRowMap =
+      new Map(
+        coreRows.map(
+          row => [
+            normalizeSymbol(
+              row.symbol
+            ),
+            row
+          ]
+        )
+      );
+
+    const stateMap =
+      new Map(
+        states.map(
+          state => [
+            normalizeSymbol(
+              state.symbol
+            ),
+            state
+          ]
+        )
+      );
+
+    let historicalContextsUpdated =
+      0;
+
+    const contextResults =
+      await mapWithConcurrency(
+        contextSymbols,
+        2,
+        async symbol => {
+          const row =
+            marketRowMap.get(
+              normalizeSymbol(
+                symbol
+              )
+            );
+
+          if (!row) {
+            return null;
+          }
+
+          try {
+            const context =
+              await getHistoricalSituation(
+                symbol,
+                row.price
+              );
+
+            return {
+              symbol:
+                normalizeSymbol(
+                  symbol
+                ),
+              context
+            };
+          } catch {
+            return null;
+          }
+        }
+      );
+
+    for (
+      const item
+      of contextResults
+    ) {
+      if (
+        !item?.context?.available
+      ) {
+        continue;
+      }
+
+      const state =
+        stateMap.get(
+          item.symbol
+        );
+
+      if (!state) {
+        continue;
+      }
+
+      state.market_state = {
+        ...(
+          state.market_state ||
+          {}
+        ),
+        historicalContext:
+          item.context
+      };
+
+      state.state_hash =
+        scannerStateHash(
+          state.market_state,
+          previousMap.get(
+            item.symbol
+          ) ||
+          null
+        );
+
+      historicalContextsUpdated +=
+        1;
+    }
+
     await upsertSecurityStatesBulk(
       states
     );
@@ -13692,7 +15383,9 @@ async function runMarketSnapshotScan(
             VERSION,
           marketAsOf:
             market.asOf,
-          firstBaselines
+          firstBaselines,
+          historicalContextsUpdated,
+          contextSymbols
         }
       }
     );
@@ -13730,6 +15423,8 @@ async function runMarketSnapshotScan(
       securitiesProcessed:
         states.length,
       firstBaselines,
+      historicalContextsUpdated,
+      contextSymbols,
       changesDetected:
         changes.length,
       meaningfulChanges:
@@ -13766,38 +15461,69 @@ async function runMarketSnapshotScan(
 async function getIntelligenceFeed() {
   if (!continuousMemoryConfigured()) {
     return {
-      configured:
-        false,
-      latestRun:
-        null,
-      stateCoverage:
-        0,
+      configured: false,
+      latestRun: null,
+      stateCoverage: 0,
+      historicalContextCoverage: 0,
       coreUniverse:
         PSX_UNIVERSE_MASTER.summary
           .coreEquity,
-      attention:
-        []
+      attention: [],
+      marketPulse: null,
+      portfolioConfigured: false
     };
   }
 
   const [
     runs,
     states,
-    changes
+    changes,
+    holdingsResult,
+    market,
+    marketStatus
   ] =
     await Promise.all([
       supabaseRest(
         'intelligence_runs?select=id,run_type,status,started_at,completed_at,securities_processed,changes_detected,error_message,metadata&order=started_at.desc&limit=5'
       ),
       supabaseRest(
-        'security_state?select=symbol,market_price,current_view,evaluated_at&eligibility=eq.RECOMMENDATION_ELIGIBLE'
+        'security_state?select=symbol,market_price,market_change_pct,current_view,evaluated_at,market_state&eligibility=eq.RECOMMENDATION_ELIGIBLE'
       ),
       supabaseRest(
-        'state_changes?select=id,symbol,change_category,field_name,old_value,new_value,percentage_change,significance,summary,detected_at&order=detected_at.desc&limit=60'
-      )
+        'state_changes?select=id,symbol,change_category,field_name,old_value,new_value,percentage_change,significance,summary,detected_at&order=detected_at.desc&limit=80'
+      ),
+      readPortfolioHoldings()
+        .catch(
+          () => ({
+            configured: false,
+            rows: []
+          })
+        ),
+      loadPSXMarket()
+        .catch(
+          () => null
+        ),
+      getPyPSXMarketStatus()
+        .catch(
+          () => null
+        )
     ]);
 
-  const meaningful =
+  const stateRows =
+    Array.isArray(states)
+      ? states
+      : [];
+
+  const historicalContextCoverage =
+    stateRows.filter(
+      row =>
+        row?.market_state
+          ?.historicalContext
+          ?.available ===
+        true
+    ).length;
+
+  const recentChanges =
     (
       Array.isArray(changes)
         ? changes
@@ -13813,11 +15539,268 @@ async function getIntelligenceFeed() {
             item.significance
           )
       )
-      .slice(0, 12);
+      .slice(0, 20);
+
+  const stateMap =
+    new Map(
+      stateRows.map(
+        row => [
+          normalizeSymbol(
+            row.symbol
+          ),
+          row
+        ]
+      )
+    );
+
+  const conditionAttention = [];
+
+  for (
+    const holding
+    of holdingsResult.rows || []
+  ) {
+    const symbol =
+      normalizeSymbol(
+        holding.symbol
+      );
+
+    const state =
+      stateMap.get(
+        symbol
+      );
+
+    const context =
+      state?.market_state
+        ?.historicalContext;
+
+    if (!context?.available) {
+      continue;
+    }
+
+    const month =
+      safeNumber(
+        context.returns?.m1
+      );
+
+    if (
+      month !== null &&
+      month <= -5
+    ) {
+      conditionAttention.push({
+        id:
+          'condition-' +
+          symbol,
+        symbol,
+        change_category:
+          'existing_condition',
+        field_name:
+          'historical_context',
+        percentage_change:
+          month,
+        significance:
+          month <= -10
+            ? 'high'
+            : 'medium',
+        summary:
+          symbol +
+          ' is down ' +
+          Math.abs(
+            roundMemoryNumber(
+              month,
+              2
+            )
+          ) +
+          '% over roughly 1 month' +
+          (
+            context.trend
+              ? ' and is in a ' +
+                String(
+                  context.trend
+                ).toLowerCase()
+              : ''
+          ) +
+          '.',
+        detected_at:
+          state.evaluated_at ||
+          new Date()
+            .toISOString(),
+        condition:
+          context.condition,
+        kind:
+          'existing_condition'
+      });
+    }
+  }
+
+  const attention = [];
+  const attentionKeys =
+    new Set();
+
+  for (
+    const item
+    of [
+      ...conditionAttention,
+      ...recentChanges
+    ]
+  ) {
+    const key =
+      String(
+        item.symbol ||
+        ''
+      ) +
+      '|' +
+      String(
+        item.field_name ||
+        item.kind ||
+        ''
+      );
+
+    if (
+      attentionKeys.has(
+        key
+      )
+    ) {
+      continue;
+    }
+
+    attentionKeys.add(
+      key
+    );
+
+    attention.push(
+      item
+    );
+
+    if (
+      attention.length >=
+      12
+    ) {
+      break;
+    }
+  }
+
+  let marketPulse =
+    null;
+
+  if (market) {
+    const eligible =
+      market.stocks.filter(
+        row =>
+          row.recommendationEligible ===
+            true &&
+          safeNumber(
+            row.dayChangePct
+          ) !== null
+      );
+
+    const moverShape =
+      row => ({
+        symbol:
+          row.symbol,
+        companyName:
+          row.companyName,
+        price:
+          row.price,
+        changePct:
+          roundMemoryNumber(
+            row.dayChangePct,
+            2
+          ),
+        volume:
+          row.sessionVolume,
+        sector:
+          row.sector
+      });
+
+    const gainers =
+      [...eligible]
+        .filter(
+          row =>
+            safeNumber(
+              row.dayChangePct
+            ) > 0
+        )
+        .sort(
+          (
+            a,
+            b
+          ) =>
+            safeNumber(
+              b.dayChangePct
+            ) -
+            safeNumber(
+              a.dayChangePct
+            )
+        )
+        .slice(0, 5)
+        .map(
+          moverShape
+        );
+
+    const losers =
+      [...eligible]
+        .filter(
+          row =>
+            safeNumber(
+              row.dayChangePct
+            ) < 0
+        )
+        .sort(
+          (
+            a,
+            b
+          ) =>
+            safeNumber(
+              a.dayChangePct
+            ) -
+            safeNumber(
+              b.dayChangePct
+            )
+        )
+        .slice(0, 5)
+        .map(
+          moverShape
+        );
+
+    const breadth = {
+      advancers:
+        eligible.filter(
+          row =>
+            safeNumber(
+              row.dayChangePct
+            ) > 0
+        ).length,
+      decliners:
+        eligible.filter(
+          row =>
+            safeNumber(
+              row.dayChangePct
+            ) < 0
+        ).length,
+      unchanged:
+        eligible.filter(
+          row =>
+            safeNumber(
+              row.dayChangePct
+            ) === 0
+        ).length
+    };
+
+    marketPulse = {
+      asOf:
+        market.marketWatchAsOf ||
+        market.asOf,
+      gainers,
+      losers,
+      breadth,
+      marketStatus:
+        marketStatus ||
+        null
+    };
+  }
 
   return {
-    configured:
-      true,
+    configured: true,
     scannerSecretConfigured:
       scannerSecretConfigured(),
     latestRun:
@@ -13830,14 +15813,18 @@ async function getIntelligenceFeed() {
         ? runs
         : [],
     stateCoverage:
-      Array.isArray(states)
-        ? states.length
-        : 0,
+      stateRows.length,
+    historicalContextCoverage,
     coreUniverse:
       PSX_UNIVERSE_MASTER.summary
         .coreEquity,
-    attention:
-      meaningful
+    attention,
+    marketPulse,
+    portfolioConfigured:
+      holdingsResult.configured,
+    portfolioHoldingCount:
+      holdingsResult.rows?.length ||
+      0
   };
 }
 
@@ -14067,7 +16054,7 @@ async function handler(
               : 'NOT_CONFIGURED',
 
           intelligenceScanner:
-            'MARKET_SNAPSHOT_IMPLEMENTED',
+            'MARKET_SNAPSHOT_PLUS_ROTATING_HISTORICAL_CONTEXT',
 
           scannerSecretConfigured:
             scannerSecretConfigured(),
@@ -14141,6 +16128,112 @@ async function handler(
             'symbol'
           ) ||
           'HBL'
+        )
+      );
+    }
+
+    if (
+      request.method ===
+        'GET' &&
+      action ===
+        'situation'
+    ) {
+      return sendJSON(
+        response,
+        await getHistoricalSituation(
+          url.searchParams.get(
+            'symbol'
+          )
+        )
+      );
+    }
+
+    if (
+      request.method ===
+        'GET' &&
+      action ===
+        'portfolio'
+    ) {
+      return sendJSON(
+        response,
+        await getPortfolioSnapshot()
+      );
+    }
+
+    if (
+      request.method ===
+        'POST' &&
+      action ===
+        'portfolio-holding'
+    ) {
+      const body =
+        await readJsonRequestBody(
+          request
+        );
+
+      const saved =
+        await savePortfolioHolding(
+          body
+        );
+
+      try {
+        const market =
+          await loadPSXMarket();
+
+        const marketRow =
+          market.stocks.find(
+            row =>
+              normalizeSymbol(
+                row.symbol
+              ) ===
+              normalizeSymbol(
+                saved?.symbol ||
+                body.symbol
+              )
+          ) ||
+          null;
+
+        await refreshHistoricalSituation(
+          saved?.symbol ||
+          body.symbol,
+          marketRow
+        );
+      } catch {}
+
+      return sendJSON(
+        response,
+        {
+          status: 'OK',
+          holding: saved
+        }
+      );
+    }
+
+    if (
+      (
+        request.method ===
+          'POST' ||
+        request.method ===
+          'DELETE'
+      ) &&
+      action ===
+        'portfolio-delete'
+    ) {
+      const body =
+        request.method ===
+          'POST'
+          ? await readJsonRequestBody(
+              request
+            )
+          : {};
+
+      return sendJSON(
+        response,
+        await deletePortfolioHolding(
+          body.symbol ||
+          url.searchParams.get(
+            'symbol'
+          )
         )
       );
     }
@@ -15810,6 +17903,755 @@ body > main > header {
   }
 }
 
+
+
+/* =========================================================
+   TRADING WORKSPACE + DECISION UI - BUILD 0.8.2
+========================================================= */
+
+:root {
+  --trade-bg: #09111d;
+  --trade-panel: #101b2a;
+  --trade-panel-2: #142235;
+  --trade-panel-3: #18283d;
+  --trade-border: #263750;
+  --trade-text: #edf3f9;
+  --trade-muted: #8fa1b7;
+  --trade-accent: #3b82f6;
+  --trade-positive: #33d69f;
+  --trade-negative: #ff6b75;
+  --trade-warning: #f4c15d;
+}
+
+body {
+  background: var(--trade-bg);
+  color: var(--trade-text);
+}
+
+.sidebar {
+  width: 222px;
+  background: #07101d;
+  border-right: 1px solid #1c2a3d;
+  padding: 18px 12px 14px;
+}
+
+.appMain {
+  width: calc(100% - 222px);
+  margin-left: 222px;
+  padding: 0 24px 42px;
+  background:
+    radial-gradient(circle at 90% 0%, rgba(33,84,130,.16), transparent 28%),
+    var(--trade-bg);
+}
+
+.brandMark {
+  background: #eaf2fb;
+  color: #07101d;
+  border-radius: 7px;
+}
+
+.brandName {
+  letter-spacing: -.01em;
+}
+
+.navButton {
+  color: #a9b8ca;
+  border-radius: 6px;
+  padding: 10px 11px;
+}
+
+.navButton:hover,
+.navButton.active {
+  background: #16253a;
+  color: #fff;
+}
+
+.topBar {
+  min-height: 64px;
+  background: rgba(9,17,29,.94);
+  border-bottom: 1px solid #1f2d40;
+}
+
+.topSearch {
+  background: #0f1a29;
+  border-color: #27384f;
+  color: #eef4fa;
+  border-radius: 6px;
+  padding: 11px 14px;
+}
+
+.topSearch::placeholder,
+input::placeholder {
+  color: #6f8299;
+}
+
+.askNomadButton {
+  background: #1d66d6;
+  border-radius: 6px;
+  font-weight: 700;
+}
+
+.appPage {
+  max-width: 1440px;
+}
+
+.card,
+.terminalCard,
+.decisionCard,
+.metric,
+.chartBox,
+.rangeCard,
+.eventItem,
+.dataTable,
+.learnBox,
+.infoBox {
+  background: var(--trade-panel);
+  border-color: var(--trade-border);
+  color: var(--trade-text);
+  box-shadow: none;
+}
+
+.card.appPage {
+  margin-top: 18px;
+}
+
+.sub,
+.muted,
+.metricLabel,
+.metricSub,
+.sourceNote,
+.feedMeta,
+.chartLegend,
+.eventMeta,
+.techExplanation,
+.auditEvidence,
+.auditReason,
+.companyHeader span,
+.decisionTimestamp,
+.rangeHeader,
+.rangeLabels,
+.marketStateMeta,
+.terminalSub {
+  color: var(--trade-muted) !important;
+}
+
+input,
+select {
+  background: #0d1725;
+  color: var(--trade-text);
+  border-color: #2a3b53;
+  border-radius: 6px;
+}
+
+button {
+  background: #1c4e6b;
+  border-radius: 6px;
+}
+
+button:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+th {
+  background: #142235;
+  color: #b7c4d4;
+}
+
+th,
+td {
+  border-bottom-color: #24354a;
+}
+
+tbody tr:hover {
+  background: #132237;
+}
+
+.positive {
+  color: var(--trade-positive) !important;
+}
+
+.negative {
+  color: var(--trade-negative) !important;
+}
+
+.neutral {
+  color: #a7b5c5 !important;
+}
+
+.emptyState,
+.terminalEmpty {
+  background: #0d1827;
+  border: 1px dashed #2b3d55;
+  color: var(--trade-muted);
+}
+
+.infoBox {
+  background: #0e1b2a;
+  color: #a9b9ca;
+}
+
+.learnBox {
+  background: #0e1a29;
+  color: #a9b9ca;
+}
+
+.learnBox strong {
+  color: #e8f1fb;
+}
+
+.warningBox {
+  background: #2b2515;
+  color: #f2d893;
+}
+
+.chartModeToggle,
+.rangeToggle,
+.eventToggle {
+  background: #0d1725;
+  border-color: #2a3b53;
+}
+
+.chartModeButton,
+.rangeButton,
+.eventModeButton {
+  color: #a8b9ca;
+}
+
+.chartModeButton.active,
+.rangeButton.active,
+.eventModeButton.active {
+  background: #244b69;
+}
+
+.chartAxis,
+.volumeSeparator {
+  stroke: #34465e;
+}
+
+.chartLabel {
+  fill: #8396ab;
+}
+
+.chartLine,
+.technicalPrice {
+  stroke: #64a9ff;
+}
+
+.chartArea {
+  fill: rgba(100,169,255,.09);
+}
+
+.terminalHeader {
+  margin: 22px 0 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.terminalHeader h1,
+.pageTitleRow h1 {
+  margin: 3px 0 4px;
+  font-size: 26px;
+  letter-spacing: -.025em;
+}
+
+.terminalSub {
+  font-size: 13px;
+}
+
+.marketStateBox {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 230px;
+  padding: 10px 12px;
+  background: #0f1b2b;
+  border: 1px solid #24364d;
+  border-radius: 7px;
+}
+
+.marketStateValue {
+  font-weight: 750;
+  font-size: 13px;
+}
+
+.marketStateMeta {
+  margin-top: 2px;
+  font-size: 11px;
+}
+
+.marketRibbon {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0,1fr));
+  border: 1px solid #223249;
+  border-radius: 7px;
+  overflow: hidden;
+  margin-bottom: 12px;
+  background: #0d1725;
+}
+
+.ribbonMetric {
+  padding: 10px 13px;
+  border-right: 1px solid #223249;
+}
+
+.ribbonMetric:last-child {
+  border-right: 0;
+}
+
+.ribbonMetric span {
+  display: block;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  color: #73869c;
+  margin-bottom: 4px;
+}
+
+.ribbonMetric strong {
+  font-size: 13px;
+  color: #eaf2fb;
+}
+
+.terminalGrid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.65fr) minmax(320px, .85fr);
+  gap: 12px;
+}
+
+.terminalCard {
+  border: 1px solid var(--trade-border);
+  border-radius: 8px;
+  padding: 16px;
+}
+
+.terminalCard h2 {
+  margin: 3px 0 10px;
+  font-size: 18px;
+  letter-spacing: -.01em;
+}
+
+.portfolioHomeCard,
+.attentionCardNew {
+  min-height: 210px;
+}
+
+.panelHeader,
+.pageTitleRow,
+.modalHeader,
+.modalActions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.panelHeader {
+  align-items: flex-start;
+}
+
+.panelActions {
+  display: flex;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+
+.miniButton,
+.iconButton {
+  padding: 7px 10px;
+  font-size: 12px;
+  background: #1c4e6b;
+  color: #eaf2fb;
+  border: 1px solid #2e5e7d;
+}
+
+.miniButton.secondary,
+.iconButton {
+  background: #111d2c;
+  color: #aebed0;
+  border-color: #2a3a50;
+}
+
+.iconButton {
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  font-size: 22px;
+}
+
+.moneyCompact {
+  display: flex;
+  align-items: center;
+  margin: 10px 0 12px;
+  background: #0c1623;
+  border: 1px solid #2a3a50;
+  border-radius: 6px;
+}
+
+.moneyCompact span {
+  padding-left: 12px;
+  color: #8497ad;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.moneyCompact input {
+  margin: 0;
+  border: 0;
+  font-size: 18px;
+  font-weight: 800;
+}
+
+.decisionResult {
+  margin-top: 9px;
+  padding: 10px 11px;
+  border: 1px solid #27394f;
+  background: #0c1725;
+  color: #8fa1b7;
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.compactFeed .attentionItem {
+  grid-template-columns: 70px minmax(0,1fr) auto;
+  padding: 11px 0;
+  border-color: #26364b;
+}
+
+.attentionFeed {
+  border-color: #26364b;
+}
+
+.attentionSummary {
+  color: #dfe8f2;
+  font-size: 13px;
+}
+
+.attentionTime {
+  color: #71859b;
+}
+
+.severityPill {
+  background: #152337;
+  color: #8ea3bb;
+}
+
+.severityPill.medium {
+  background: #332b17;
+  color: #f0c768;
+}
+
+.severityPill.high,
+.severityPill.critical {
+  background: #351b24;
+  color: #ff7e8a;
+}
+
+.breadthBody {
+  margin-top: 12px;
+}
+
+.breadthCounts {
+  display: grid;
+  grid-template-columns: repeat(3,1fr);
+  gap: 8px;
+}
+
+.breadthStat {
+  padding: 10px;
+  border: 1px solid #26364b;
+  border-radius: 6px;
+  background: #0d1725;
+}
+
+.breadthStat strong {
+  display: block;
+  font-size: 20px;
+  margin-top: 3px;
+}
+
+.breadthStat span {
+  font-size: 10px;
+  text-transform: uppercase;
+  color: #72869c;
+}
+
+.moversGrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.moverList {
+  display: grid;
+  gap: 0;
+}
+
+.moverRow {
+  display: grid;
+  grid-template-columns: 62px minmax(0,1fr) 90px 72px;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 0;
+  border-bottom: 1px solid #23344a;
+  cursor: pointer;
+}
+
+.moverRow:last-child {
+  border-bottom: 0;
+}
+
+.moverRow:hover {
+  background: rgba(255,255,255,.018);
+}
+
+.moverSymbol {
+  font-weight: 800;
+}
+
+.moverName {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #9dafc2;
+  font-size: 12px;
+}
+
+.moverPrice,
+.moverChange {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.portfolioHome {
+  margin-top: 8px;
+}
+
+.portfolioSummaryStrip {
+  display: grid;
+  grid-template-columns: repeat(4,minmax(0,1fr));
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.portfolioMetric {
+  padding: 10px;
+  border: 1px solid #26364b;
+  border-radius: 6px;
+  background: #0d1725;
+}
+
+.portfolioMetric span {
+  display: block;
+  color: #71869c;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+}
+
+.portfolioMetric strong {
+  display: block;
+  margin-top: 4px;
+  font-size: 16px;
+}
+
+.portfolioRows {
+  display: grid;
+}
+
+.portfolioRow {
+  display: grid;
+  grid-template-columns: 62px minmax(0,1fr) 95px 90px 82px;
+  gap: 8px;
+  align-items: center;
+  padding: 9px 0;
+  border-top: 1px solid #23344a;
+}
+
+.portfolioRow.fullRow {
+  grid-template-columns: 62px minmax(0,1fr) 95px 90px 82px 72px;
+}
+
+.portfolioRow .symbolName {
+  font-weight: 800;
+}
+
+.portfolioRow .companyMini {
+  color: #7f93aa;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.conditionTag {
+  display: inline-block;
+  margin-top: 3px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: #18263a;
+  color: #9db0c5;
+  font-size: 10px;
+}
+
+.conditionTag.weak,
+.conditionTag.soft {
+  background: #351b24;
+  color: #ff8b96;
+}
+
+.conditionTag.strong,
+.conditionTag.positive {
+  background: #123328;
+  color: #5de2ad;
+}
+
+.pageTitleRow {
+  margin: 22px 0 12px;
+  align-items: flex-end;
+}
+
+.modalBackdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: grid;
+  place-items: center;
+  background: rgba(2,7,14,.72);
+  backdrop-filter: blur(4px);
+}
+
+.modalBackdrop[hidden] {
+  display: none;
+}
+
+.modalCard {
+  width: min(620px, calc(100vw - 32px));
+  background: #101b2a;
+  border: 1px solid #2b3d55;
+  border-radius: 9px;
+  padding: 18px;
+  box-shadow: 0 22px 70px rgba(0,0,0,.38);
+}
+
+.formGrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 11px;
+  margin: 14px 0;
+}
+
+.formGrid label,
+.contextRow label {
+  color: #8093aa;
+  font-size: 11px;
+}
+
+.modalActions {
+  justify-content: flex-end;
+}
+
+.terminalEmpty {
+  padding: 28px 12px;
+  border-radius: 6px;
+  text-align: center;
+  font-size: 12px;
+}
+
+.terminalEmpty.small {
+  padding: 16px 10px;
+}
+
+.statusPill,
+.auditPill,
+.pill {
+  background: #16263b;
+  color: #a8b9cb;
+  border-color: #2a3d55;
+}
+
+pre {
+  background: #07111c;
+  color: #b9c7d6;
+}
+
+@media (max-width: 1050px) {
+  .terminalGrid,
+  .moversGrid {
+    grid-template-columns: 1fr;
+  }
+
+  .marketRibbon {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .ribbonMetric:nth-child(2) {
+    border-right: 0;
+  }
+
+  .ribbonMetric:nth-child(-n+2) {
+    border-bottom: 1px solid #223249;
+  }
+}
+
+@media (max-width: 900px) {
+  .sidebar {
+    width: 100%;
+  }
+
+  .appMain {
+    width: 100%;
+    margin: 0;
+    padding: 0 12px 30px;
+  }
+
+  .terminalHeader {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .marketStateBox {
+    width: 100%;
+    box-sizing: border-box;
+  }
+
+  .portfolioSummaryStrip {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .portfolioRow {
+    grid-template-columns: 55px minmax(0,1fr) 80px;
+  }
+
+  .portfolioRow .hideMobile {
+    display: none;
+  }
+}
+
+@media (max-width: 620px) {
+  .marketRibbon,
+  .formGrid,
+  .contextRow {
+    grid-template-columns: 1fr;
+  }
+
+  .ribbonMetric {
+    border-right: 0;
+    border-bottom: 1px solid #223249;
+  }
+
+  .moverRow {
+    grid-template-columns: 54px minmax(0,1fr) 68px;
+  }
+
+  .moverPrice {
+    display: none;
+  }
+}
+
 </style>
 
 </head>
@@ -15830,6 +18672,7 @@ body > main > header {
 
 <nav class="sideNav">
 <button class="navButton active" data-nav="home"><span>⌂</span>Home</button>
+<button class="navButton" data-nav="portfolio"><span>▤</span>Portfolio</button>
 <button class="navButton" data-nav="research"><span>⌕</span>Research</button>
 <button class="navButton" data-nav="explore"><span>↗</span>Explore PSX</button>
 <button class="navButton" data-nav="universe"><span>◎</span>Universe</button>
@@ -15893,83 +18736,100 @@ Checking connection...
   id="homePage"
 >
 
-<div class="decisionHero">
+<div class="terminalHeader">
 <div>
 <div class="eyebrow">DECISION CENTER</div>
-<h1>What matters now?</h1>
-<p>NOMAD watches the market so you can focus on decisions — what changed, why it matters, and where your money could work best.</p>
+<h1>Your market command center</h1>
+<div class="terminalSub">NOMAD prioritizes what matters to your money — holdings, meaningful changes, market leaders and decisions.</div>
 </div>
-<div class="heroStatus">
+<div class="marketStateBox">
 <div class="statusDot"></div>
 <div>
-<div class="metricLabel">Continuous intelligence</div>
-<div id="homeEngineStatus" class="heroStatusValue">Checking...</div>
+<div id="homeMarketState" class="marketStateValue">Checking market...</div>
+<div id="homeMarketAsOf" class="marketStateMeta">Latest available PSX snapshot</div>
 </div>
 </div>
 </div>
 
-<div class="decisionGrid">
+<div class="marketRibbon">
+<div class="ribbonMetric"><span>Core monitored</span><strong id="homeStateCoverage">0 / ${PSX_UNIVERSE_MASTER.summary.coreEquity}</strong></div>
+<div class="ribbonMetric"><span>Historical context</span><strong id="homeHistoryCoverage">0 / ${PSX_UNIVERSE_MASTER.summary.coreEquity}</strong></div>
+<div class="ribbonMetric"><span>Last scan</span><strong id="homeLastScan">Waiting</strong></div>
+<div class="ribbonMetric"><span>Portfolio</span><strong id="homePortfolioCount">Not added</strong></div>
+</div>
 
-<div class="decisionCard attentionCard">
-<div class="cardTopline">
+<div class="terminalGrid">
+
+<div class="terminalCard portfolioHomeCard">
+<div class="panelHeader">
+<div>
+<div class="eyebrow">YOUR MONEY</div>
+<h2>Portfolio</h2>
+</div>
+<div class="panelActions">
+<button class="miniButton" id="homeAddHolding">+ Add holding</button>
+<button class="miniButton secondary" id="homeImportPortfolio">Import CSV</button>
+</div>
+</div>
+<div id="portfolioHome" class="portfolioHome">
+<div class="terminalEmpty">Loading portfolio...</div>
+</div>
+</div>
+
+<div class="terminalCard plannerCardNew">
+<div class="eyebrow">NEW MONEY</div>
+<h2>What should I do with it?</h2>
+<div class="moneyCompact"><span>PKR</span><input id="decisionAmount" inputmode="numeric" value="5000"></div>
+<div class="contextRow">
+<div><label>Horizon</label><select id="decisionHorizon"><option value="long_term">Long-term</option><option value="short_term">Short-term</option></select></div>
+<div><label>Risk</label><select id="decisionRisk"><option value="balanced">Balanced</option><option value="conservative">Conservative</option><option value="aggressive">Aggressive</option></select></div>
+</div>
+<button id="findBestOption" class="primaryWide">Find my best option</button>
+<div id="decisionResult" class="decisionResult">NOMAD will not guess. Validated scoring and allocation are the next decision layer being activated.</div>
+</div>
+
+<div class="terminalCard attentionCardNew">
+<div class="panelHeader">
 <div>
 <div class="eyebrow">NEEDS YOUR ATTENTION</div>
-<h2>Meaningful changes</h2>
+<h2>What changed or is already weak?</h2>
 </div>
-<button id="refreshIntelligenceFeed" class="ghostButton">Refresh</button>
+<button id="refreshIntelligenceFeed" class="miniButton secondary">Refresh</button>
 </div>
-<div id="attentionFeed" class="attentionFeed">
-<div class="emptyState">Loading NOMAD's latest observations...</div>
+<div id="attentionFeed" class="attentionFeed compactFeed">
+<div class="terminalEmpty">Loading latest intelligence...</div>
 </div>
 </div>
 
-<div class="decisionCard contextCard">
-<div class="eyebrow">YOUR NEXT DECISION</div>
-<h2>Put money to work</h2>
-<p class="muted">Set the amount and decision horizon now. NOMAD's allocation engine will use this context once validated scoring is active.</p>
-<label>Investment amount</label>
-<div class="moneyInputWrap"><span>PKR</span><input id="decisionAmount" inputmode="numeric" value="5000"></div>
-<div class="contextRow">
-<div>
-<label>Horizon</label>
-<select id="decisionHorizon"><option value="long_term">Long-term</option><option value="short_term">Short-term opportunity</option></select>
+<div class="terminalCard breadthCard">
+<div class="eyebrow">MARKET BREADTH</div>
+<h2>Session snapshot</h2>
+<div id="marketBreadth" class="breadthBody">
+<div class="terminalEmpty small">Loading...</div>
 </div>
-<div>
-<label>Risk</label>
-<select id="decisionRisk"><option value="balanced">Balanced</option><option value="conservative">Conservative</option><option value="aggressive">Aggressive</option></select>
-</div>
-</div>
-<button id="saveDecisionContext" class="primaryWide">Set decision context</button>
-<div id="decisionContextStatus" class="smallStatus"></div>
-</div>
-
-<div class="decisionCard compactCard">
-<div class="eyebrow">INTELLIGENCE COVERAGE</div>
-<div class="bigMetric"><span id="homeStateCoverage">0</span><small> / ${PSX_UNIVERSE_MASTER.summary.coreEquity}</small></div>
-<div class="muted">Core equities with persistent state</div>
-<div class="progressTrack"><div id="homeCoverageBar" class="progressFill"></div></div>
-</div>
-
-<div class="decisionCard compactCard">
-<div class="eyebrow">LAST SCAN</div>
-<div id="homeLastScan" class="scanHeadline">No scan yet</div>
-<div id="homeLastScanMeta" class="muted">NOMAD will build a market baseline first.</div>
-<button id="homeRunScan" class="ghostButton fullButton">Run intelligence scan</button>
-</div>
-
-<div class="decisionCard compactCard quickCard">
-<div class="eyebrow">QUICK ACTIONS</div>
-<button class="quickAction" data-open-page="research">Research a stock <span>→</span></button>
-<button class="quickAction" data-open-page="explore">Explore PSX <span>→</span></button>
-<button class="quickAction" data-open-page="universe">View investable universe <span>→</span></button>
 </div>
 
 </div>
 
-<div class="principleStrip">
-<strong>NOMAD principle:</strong> Important information comes to you. Advanced information waits until you ask for it.
+<div class="moversGrid">
+<div class="terminalCard moverCard">
+<div class="panelHeader"><div><div class="eyebrow">LEADERS</div><h2 id="gainersTitle">Top 5 gainers</h2></div></div>
+<div id="topGainers" class="moverList"><div class="terminalEmpty small">Loading...</div></div>
+</div>
+<div class="terminalCard moverCard">
+<div class="panelHeader"><div><div class="eyebrow">LAGGARDS</div><h2 id="losersTitle">Top 5 losers</h2></div></div>
+<div id="topLosers" class="moverList"><div class="terminalEmpty small">Loading...</div></div>
+</div>
 </div>
 
+</section>
+
+<section class="appPage" id="portfolioPage" data-page="portfolio">
+<div class="pageTitleRow">
+<div><div class="eyebrow">PERSONAL INTELLIGENCE</div><h1>Portfolio</h1><p class="muted">Your holdings receive priority monitoring for performance, historical weakness, risk and meaningful changes.</p></div>
+<div class="panelActions"><button id="portfolioAddHolding" class="miniButton">+ Add holding</button><button id="portfolioImportCsv" class="miniButton secondary">Import CSV</button></div>
+</div>
+<div id="portfolioFull"><div class="terminalCard"><div class="terminalEmpty">Loading portfolio...</div></div></div>
 </section>
 
 <section
@@ -16194,16 +19054,16 @@ NOMAD now uses a frozen, versioned security master for identity and recommendati
 <section class="card appPage" id="scannerSystemSection" data-page="system">
 
 <h2>Intelligence Scanner</h2>
-<p class="muted">The scanner builds a persistent market baseline across the core universe and detects material changes between observations. This is descriptive intelligence, not a Buy/Sell engine.</p>
+<p class="muted">The scanner keeps a fast market baseline across the core universe and also rotates through historical context so NOMAD can distinguish new changes from conditions that were already weak or strong. Portfolio holdings receive priority context checks.</p>
 
 <div class="summaryGrid">
 <div class="metric"><div class="metricLabel">Core universe</div><div class="metricValue">${PSX_UNIVERSE_MASTER.summary.coreEquity}</div></div>
-<div class="metric"><div class="metricLabel">Scanner</div><div id="scannerSystemState" class="metricValue">Ready</div><div class="metricSub">Market snapshot layer</div></div>
+<div class="metric"><div class="metricLabel">Scanner</div><div id="scannerSystemState" class="metricValue">Ready</div><div class="metricSub">Market + rotating historical context</div></div>
 <div class="metric"><div class="metricLabel">Autonomous schedule</div><div id="scannerScheduleState" class="metricValue">Pending</div><div class="metricSub">Configured separately after scan verification</div></div>
 </div>
 
-<div class="actions"><button id="runIntelligenceScan">Run intelligence scan now</button></div>
-<div id="scanSystemResult" class="infoBox">Run once to establish or refresh the core-equity market baseline.</div>
+<div class="actions"><button id="runIntelligenceScan">Refresh market + context now</button></div>
+<div id="scanSystemResult" class="infoBox">Developer control: refresh the fast market baseline and a rotating batch of historical situations.</div>
 
 </section>
 
@@ -16567,6 +19427,22 @@ Next
 </div>
 
 </section>
+
+<div id="portfolioModal" class="modalBackdrop" hidden>
+<div class="modalCard">
+<div class="modalHeader"><div><div class="eyebrow">PORTFOLIO</div><h2>Add or update holding</h2></div><button id="closePortfolioModal" class="iconButton">×</button></div>
+<div class="formGrid">
+<div><label>PSX symbol</label><input id="holdingSymbol" placeholder="HBL"></div>
+<div><label>Quantity</label><input id="holdingQuantity" inputmode="decimal" placeholder="10"></div>
+<div><label>Average cost / share</label><input id="holdingAverageCost" inputmode="decimal" placeholder="295.00"></div>
+<div><label>Purchase date</label><input id="holdingPurchaseDate" type="date"></div>
+<div><label>Fees (optional)</label><input id="holdingFees" inputmode="decimal" value="0"></div>
+</div>
+<div id="holdingFormStatus" class="smallStatus"></div>
+<div class="modalActions"><button id="saveHoldingButton">Save holding</button><button id="cancelHoldingButton" class="miniButton secondary">Cancel</button></div>
+</div>
+</div>
+<input id="portfolioCsvInput" type="file" accept=".csv,text/csv" hidden>
 
 </main>
 
@@ -16966,10 +19842,75 @@ async function api(
   return result;
 }
 
+async function apiPost(
+  action,
+  body = {},
+  params = {}
+) {
+  const url =
+    new URL(
+      location.href
+    );
+
+  url.searchParams.set(
+    'action',
+    action
+  );
+
+  for (
+    const [
+      key,
+      value
+    ]
+    of Object.entries(
+      params
+    )
+  ) {
+    if (
+      value !== null &&
+      value !== undefined &&
+      value !== ''
+    ) {
+      url.searchParams.set(
+        key,
+        value
+      );
+    }
+  }
+
+  const response =
+    await fetch(
+      url,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type':
+            'application/json'
+        },
+        body:
+          JSON.stringify(
+            body
+          )
+      }
+    );
+
+  const result =
+    await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      result.message ||
+      'Request failed.'
+    );
+  }
+
+  return result;
+}
+
 
 
 /* =========================================================
-   APP NAVIGATION + DECISION CENTER - BUILD 0.8.1
+   APP NAVIGATION + DECISION CENTER - BUILD 0.8.2
 ========================================================= */
 
 function openAppPage(
@@ -17118,6 +20059,510 @@ function renderAttentionFeed(
       .join('');
 }
 
+function renderMoverList(
+  targetId,
+  rows
+) {
+  const target =
+    $(targetId);
+
+  if (!target) {
+    return;
+  }
+
+  if (
+    !Array.isArray(rows) ||
+    !rows.length
+  ) {
+    target.innerHTML =
+      '<div class="terminalEmpty small">No mover data available from the latest PSX market snapshot.</div>';
+    return;
+  }
+
+  target.innerHTML =
+    rows
+      .map(
+        item =>
+          '<div class="moverRow" data-research-symbol="' +
+          escapeHtml(
+            item.symbol
+          ) +
+          '">' +
+          '<div class="moverSymbol">' +
+          escapeHtml(
+            item.symbol
+          ) +
+          '</div>' +
+          '<div class="moverName">' +
+          escapeHtml(
+            item.companyName ||
+            item.symbol
+          ) +
+          '</div>' +
+          '<div class="moverPrice">PKR ' +
+          formatNumber(
+            item.price,
+            2
+          ) +
+          '</div>' +
+          '<div class="moverChange ' +
+          percentClass(
+            item.changePct
+          ) +
+          '">' +
+          (
+            Number(
+              item.changePct
+            ) > 0
+              ? '+'
+              : ''
+          ) +
+          formatNumber(
+            item.changePct,
+            2
+          ) +
+          '%</div>' +
+          '</div>'
+      )
+      .join('');
+
+  target
+    .querySelectorAll(
+      '[data-research-symbol]'
+    )
+    .forEach(
+      row => {
+        row.onclick =
+          () => {
+            $('stockSymbol')
+              .value =
+                row.dataset
+                  .researchSymbol;
+
+            openAppPage(
+              'research'
+            );
+
+            $('loadQuote')
+              .click();
+          };
+      }
+    );
+}
+
+function renderMarketBreadth(
+  pulse
+) {
+  const target =
+    $('marketBreadth');
+
+  if (!target) {
+    return;
+  }
+
+  const breadth =
+    pulse?.breadth;
+
+  if (!breadth) {
+    target.innerHTML =
+      '<div class="terminalEmpty small">Breadth unavailable.</div>';
+    return;
+  }
+
+  target.innerHTML =
+    '<div class="breadthCounts">' +
+    '<div class="breadthStat"><span>Advancers</span><strong class="positive">' +
+    formatNumber(
+      breadth.advancers || 0,
+      0
+    ) +
+    '</strong></div>' +
+    '<div class="breadthStat"><span>Decliners</span><strong class="negative">' +
+    formatNumber(
+      breadth.decliners || 0,
+      0
+    ) +
+    '</strong></div>' +
+    '<div class="breadthStat"><span>Flat</span><strong>' +
+    formatNumber(
+      breadth.unchanged || 0,
+      0
+    ) +
+    '</strong></div>' +
+    '</div>';
+}
+
+function portfolioMoney(
+  value
+) {
+  const number =
+    Number(value);
+
+  if (!Number.isFinite(number)) {
+    return 'N/A';
+  }
+
+  return 'PKR ' +
+    formatNumber(
+      number,
+      0
+    );
+}
+
+function renderPortfolioSnapshot(
+  result,
+  targetId = 'portfolioHome',
+  full = false
+) {
+  const target =
+    $(targetId);
+
+  if (!target) {
+    return;
+  }
+
+  if (!result?.configured) {
+    target.innerHTML =
+      '<div class="terminalEmpty">Portfolio storage is not set up yet. Run the Build 0.8.2 portfolio SQL migration in Supabase.</div>';
+    return;
+  }
+
+  const holdings =
+    Array.isArray(
+      result.holdings
+    )
+      ? result.holdings
+      : [];
+
+  if (!holdings.length) {
+    target.innerHTML =
+      '<div class="terminalEmpty">' +
+      '<strong>No holdings added yet.</strong><br>' +
+      'Add the shares you already own and NOMAD will prioritize them for performance, historical weakness and future event monitoring.' +
+      '</div>';
+    return;
+  }
+
+  const summary =
+    result.summary ||
+    {};
+
+  const totalClass =
+    percentClass(
+      summary.totalPnlPct
+    );
+
+  const dayClass =
+    percentClass(
+      summary.dayPnlPct
+    );
+
+  let html =
+    '<div class="portfolioSummaryStrip">' +
+    '<div class="portfolioMetric"><span>Value</span><strong>' +
+    portfolioMoney(
+      summary.currentValue
+    ) +
+    '</strong></div>' +
+    '<div class="portfolioMetric"><span>Today / session</span><strong class="' +
+    dayClass +
+    '">' +
+    portfolioMoney(
+      summary.dayPnl
+    ) +
+    ' · ' +
+    (
+      Number(
+        summary.dayPnlPct
+      ) > 0
+        ? '+'
+        : ''
+    ) +
+    formatNumber(
+      summary.dayPnlPct,
+      2
+    ) +
+    '%</strong></div>' +
+    '<div class="portfolioMetric"><span>Total P&amp;L</span><strong class="' +
+    totalClass +
+    '">' +
+    portfolioMoney(
+      summary.totalPnl
+    ) +
+    ' · ' +
+    (
+      Number(
+        summary.totalPnlPct
+      ) > 0
+        ? '+'
+        : ''
+    ) +
+    formatNumber(
+      summary.totalPnlPct,
+      2
+    ) +
+    '%</strong></div>' +
+    '<div class="portfolioMetric"><span>Holdings</span><strong>' +
+    formatNumber(
+      summary.holdings,
+      0
+    ) +
+    '</strong></div>' +
+    '</div>' +
+    '<div class="portfolioRows">';
+
+  const rows =
+    full
+      ? holdings
+      : holdings.slice(0, 5);
+
+  html +=
+    rows
+      .map(
+        item => {
+          const context =
+            item.historicalContext ||
+            {};
+
+          const condition =
+            String(
+              context.condition ||
+              'Context pending'
+            );
+
+          return (
+            '<div class="portfolioRow ' +
+            (
+              full
+                ? 'fullRow'
+                : ''
+            ) +
+            '">' +
+            '<div><div class="symbolName">' +
+            escapeHtml(
+              item.symbol
+            ) +
+            '</div></div>' +
+            '<div><div class="companyMini">' +
+            escapeHtml(
+              item.companyName ||
+              item.symbol
+            ) +
+            '</div><span class="conditionTag ' +
+            escapeHtml(
+              condition.toLowerCase()
+            ) +
+            '">' +
+            escapeHtml(
+              condition
+            ) +
+            (
+              context.returns?.m1 !==
+                null &&
+              context.returns?.m1 !==
+                undefined
+                ? ' · 1M ' +
+                  (
+                    Number(
+                      context.returns.m1
+                    ) > 0
+                      ? '+'
+                      : ''
+                  ) +
+                  formatNumber(
+                    context.returns.m1,
+                    1
+                  ) +
+                  '%'
+                : ''
+            ) +
+            '</span></div>' +
+            '<div class="hideMobile">' +
+            formatNumber(
+              item.quantity,
+              2
+            ) +
+            ' sh</div>' +
+            '<div class="hideMobile">PKR ' +
+            formatNumber(
+              item.currentPrice,
+              2
+            ) +
+            '</div>' +
+            '<div class="' +
+            percentClass(
+              item.totalPnlPct
+            ) +
+            '">' +
+            (
+              Number(
+                item.totalPnlPct
+              ) > 0
+                ? '+'
+                : ''
+            ) +
+            formatNumber(
+              item.totalPnlPct,
+              1
+            ) +
+            '%</div>' +
+            (
+              full
+                ? (
+                    '<button class="miniButton secondary removeHolding" data-remove-holding="' +
+                    escapeHtml(
+                      item.symbol
+                    ) +
+                    '">Remove</button>'
+                  )
+                : ''
+            ) +
+            '</div>'
+          );
+        }
+      )
+      .join('');
+
+  html +=
+    '</div>';
+
+  if (!full) {
+    html +=
+      '<button class="quickAction" data-open-page="portfolio">Open full portfolio <span>→</span></button>';
+  } else {
+    html +=
+      '<div class="sourceNote">Portfolio values use the latest available PSX market snapshot. Historical condition uses daily price history; it is not a Buy/Sell recommendation.</div>';
+  }
+
+  target.innerHTML =
+    html;
+
+  target
+    .querySelectorAll(
+      '[data-open-page]'
+    )
+    .forEach(
+      button => {
+        button.onclick =
+          () =>
+            openAppPage(
+              button.dataset.openPage
+            );
+      }
+    );
+
+  target
+    .querySelectorAll(
+      '[data-remove-holding]'
+    )
+    .forEach(
+      button => {
+        button.onclick =
+          async () => {
+            const symbol =
+              button.dataset
+                .removeHolding;
+
+            if (!symbol) {
+              return;
+            }
+
+            if (
+              !confirm(
+                'Remove ' +
+                symbol +
+                ' from your NOMAD portfolio?'
+              )
+            ) {
+              return;
+            }
+
+            button.disabled =
+              true;
+
+            try {
+              await apiPost(
+                'portfolio-delete',
+                { symbol }
+              );
+
+              await loadDecisionCenter();
+            } catch (error) {
+              alert(
+                error.message
+              );
+            } finally {
+              button.disabled =
+                false;
+            }
+          };
+      }
+    );
+}
+
+async function loadPortfolioViews() {
+  try {
+    const result =
+      await api(
+        'portfolio'
+      );
+
+    renderPortfolioSnapshot(
+      result,
+      'portfolioHome',
+      false
+    );
+
+    renderPortfolioSnapshot(
+      result,
+      'portfolioFull',
+      true
+    );
+
+    if ($('homePortfolioCount')) {
+      const count =
+        result?.summary?.holdings ||
+        0;
+
+      $('homePortfolioCount')
+        .textContent =
+          count
+            ? count +
+              (
+                count === 1
+                  ? ' holding'
+                  : ' holdings'
+              )
+            : 'Not added';
+    }
+
+    return result;
+  } catch (error) {
+    const message =
+      escapeHtml(
+        error.message
+      );
+
+    if ($('portfolioHome')) {
+      $('portfolioHome')
+        .innerHTML =
+          '<div class="terminalEmpty">' +
+          message +
+          '</div>';
+    }
+
+    if ($('portfolioFull')) {
+      $('portfolioFull')
+        .innerHTML =
+          '<div class="terminalCard"><div class="terminalEmpty">' +
+          message +
+          '</div></div>';
+    }
+
+    return null;
+  }
+}
+
 async function loadDecisionCenter() {
   try {
     const result =
@@ -17125,15 +20570,15 @@ async function loadDecisionCenter() {
         'intelligence-feed'
       );
 
-    $('homeEngineStatus')
-      .textContent =
-        result.configured
-          ? 'Memory online'
-          : 'Not configured';
-
     const coverage =
       Number(
         result.stateCoverage || 0
+      );
+
+    const historicalCoverage =
+      Number(
+        result.historicalContextCoverage ||
+        0
       );
 
     const total =
@@ -17141,67 +20586,140 @@ async function loadDecisionCenter() {
         result.coreUniverse || 0
       );
 
-    $('homeStateCoverage')
-      .textContent =
-        formatNumber(
-          coverage,
-          0
-        );
+    if ($('homeStateCoverage')) {
+      $('homeStateCoverage')
+        .textContent =
+          formatNumber(
+            coverage,
+            0
+          ) +
+          ' / ' +
+          formatNumber(
+            total,
+            0
+          );
+    }
 
-    $('homeCoverageBar')
-      .style.width =
-        total > 0
-          ? Math.min(
-              100,
-              (
-                coverage /
-                total
-              ) * 100
-            ) + '%'
-          : '0%';
+    if ($('homeHistoryCoverage')) {
+      $('homeHistoryCoverage')
+        .textContent =
+          formatNumber(
+            historicalCoverage,
+            0
+          ) +
+          ' / ' +
+          formatNumber(
+            total,
+            0
+          );
+    }
 
     if (result.latestRun) {
       const run =
         result.latestRun;
 
-      $('homeLastScan')
-        .textContent =
-          run.status === 'completed'
-            ? 'Completed ' +
-              relativeTime(
-                run.completed_at ||
-                run.started_at
-              )
-            : String(
-                run.status ||
-                'Unknown'
-              );
+      if ($('homeLastScan')) {
+        $('homeLastScan')
+          .textContent =
+            run.status ===
+              'completed'
+              ? relativeTime(
+                  run.completed_at ||
+                  run.started_at
+                )
+              : String(
+                  run.status ||
+                  'Unknown'
+                );
+      }
 
-      $('homeLastScanMeta')
-        .textContent =
-          formatNumber(
-            run.securities_processed || 0,
-            0
-          ) +
-          ' securities checked · ' +
-          formatNumber(
-            run.changes_detected || 0,
-            0
-          ) +
-          ' changes recorded';
-    } else {
-      $('homeLastScan')
-        .textContent =
-          'No scan yet';
-
-      $('homeLastScanMeta')
-        .textContent =
-          'Run the first intelligence scan to establish the market baseline.';
+      if ($('homeLastScanMeta')) {
+        $('homeLastScanMeta')
+          .textContent =
+            formatNumber(
+              run.securities_processed || 0,
+              0
+            ) +
+            ' securities checked · ' +
+            formatNumber(
+              run.changes_detected || 0,
+              0
+            ) +
+            ' changes recorded';
+      }
     }
 
     renderAttentionFeed(
       result.attention || []
     );
+
+    const pulse =
+      result.marketPulse ||
+      null;
+
+    renderMoverList(
+      'topGainers',
+      pulse?.gainers || []
+    );
+
+    renderMoverList(
+      'topLosers',
+      pulse?.losers || []
+    );
+
+    renderMarketBreadth(
+      pulse
+    );
+
+    if ($('homeMarketState')) {
+      const status =
+        pulse?.marketStatus;
+
+      $('homeMarketState')
+        .textContent =
+          status?.known
+            ? (
+                status.isOpen
+                  ? 'PSX market open'
+                  : 'PSX market closed'
+              )
+            : 'Latest PSX session snapshot';
+    }
+
+    if ($('homeMarketAsOf')) {
+      $('homeMarketAsOf')
+        .textContent =
+          pulse?.asOf
+            ? 'Updated ' +
+              relativeTime(
+                pulse.asOf
+              )
+            : 'Latest available PSX snapshot';
+    }
+
+    const sessionLabel =
+      pulse?.marketStatus?.known &&
+      pulse.marketStatus.isOpen
+        ? 'Top 5 today'
+        : 'Top 5 last session';
+
+    if ($('gainersTitle')) {
+      $('gainersTitle')
+        .textContent =
+          sessionLabel.replace(
+            'Top 5',
+            'Top 5 gainers'
+          );
+    }
+
+    if ($('losersTitle')) {
+      $('losersTitle')
+        .textContent =
+          sessionLabel.replace(
+            'Top 5',
+            'Top 5 losers'
+          );
+    }
 
     if ($('scannerScheduleState')) {
       $('scannerScheduleState')
@@ -17211,20 +20729,18 @@ async function loadDecisionCenter() {
             : 'Secret not configured';
     }
   } catch (error) {
-    $('homeEngineStatus')
-      .textContent =
-        'Unavailable';
-
     if ($('attentionFeed')) {
       $('attentionFeed')
         .innerHTML =
-          '<div class="emptyState">' +
+          '<div class="terminalEmpty">' +
           escapeHtml(
             error.message
           ) +
           '</div>';
     }
   }
+
+  await loadPortfolioViews();
 }
 
 async function runDecisionScanner(
@@ -17261,7 +20777,12 @@ async function runDecisionScanner(
           result.changesDetected,
           0
         ) +
-        ' material changes recorded.';
+        ' material changes recorded; ' +
+        formatNumber(
+          result.historicalContextsUpdated || 0,
+          0
+        ) +
+        ' historical situations refreshed.';
     }
 
     await loadDecisionCenter();
@@ -23494,6 +27015,93 @@ function renderEvents(
   bindEventModeButtons();
 }
 
+function buildSituationPanel(
+  situation
+) {
+  if (!situation?.available) {
+    return '';
+  }
+
+  const returns =
+    situation.returns ||
+    {};
+
+  const condition =
+    situation.condition ||
+    'Mixed';
+
+  const returnCell =
+    (
+      label,
+      value
+    ) =>
+      '<div class="portfolioMetric"><span>' +
+      escapeHtml(
+        label
+      ) +
+      '</span><strong class="' +
+      percentClass(
+        value
+      ) +
+      '">' +
+      (
+        Number(value) > 0
+          ? '+'
+          : ''
+      ) +
+      formatNumber(
+        value,
+        2
+      ) +
+      '%</strong></div>';
+
+  return (
+    '<div class="terminalCard" style="margin-bottom:14px">' +
+    '<div class="panelHeader"><div><div class="eyebrow">BEFORE YOU ACT</div><h2>What has already been happening?</h2></div>' +
+    '<span class="conditionTag ' +
+    escapeHtml(
+      String(condition)
+        .toLowerCase()
+    ) +
+    '">' +
+    escapeHtml(
+      condition
+    ) +
+    '</span></div>' +
+    '<div class="portfolioSummaryStrip">' +
+    returnCell(
+      '5 sessions',
+      returns.d5
+    ) +
+    returnCell(
+      '1 month',
+      returns.m1
+    ) +
+    returnCell(
+      '3 months',
+      returns.m3
+    ) +
+    returnCell(
+      '1 year',
+      returns.y1
+    ) +
+    '</div>' +
+    '<div class="infoBox"><strong>Price structure:</strong> ' +
+    escapeHtml(
+      situation.trend ||
+      'Mixed'
+    ) +
+    '. ' +
+    escapeHtml(
+      situation.interpretation ||
+      ''
+    ) +
+    '</div>' +
+    '<div class="sourceNote">Historical situation describes existing price conditions even if NOMAD only started monitoring today. It is not a recommendation by itself.</div>' +
+    '</div>'
+  );
+}
+
 /* =========================================================
    MARKET BUTTON
 ========================================================= */
@@ -23897,14 +27505,28 @@ $('loadQuote')
           '</p>';
 
       try {
-        const result =
-          await api(
-            'quote',
-            {
-              symbol:
-                inputSymbol
-            }
-          );
+        const [
+          result,
+          situation
+        ] =
+          await Promise.all([
+            api(
+              'quote',
+              {
+                symbol:
+                  inputSymbol
+              }
+            ),
+            api(
+              'situation',
+              {
+                symbol:
+                  inputSymbol
+              }
+            ).catch(
+              () => null
+            )
+          ]);
 
         $('stockSymbol')
           .value =
@@ -23920,6 +27542,16 @@ $('loadQuote')
         renderDecisionOverview(
           result
         );
+
+        if (situation?.available) {
+          $('research')
+            .insertAdjacentHTML(
+              'afterbegin',
+              buildSituationPanel(
+                situation
+              )
+            );
+        }
 
         startLiveOverview(
           result.symbol,
@@ -24420,6 +28052,326 @@ $('runMemoryTest')
     };
 
 
+function openPortfolioModal(
+  preset = {}
+) {
+  if (!$('portfolioModal')) {
+    return;
+  }
+
+  $('holdingSymbol').value =
+    preset.symbol ||
+    '';
+
+  $('holdingQuantity').value =
+    preset.quantity ||
+    '';
+
+  $('holdingAverageCost').value =
+    preset.averageCost ||
+    '';
+
+  $('holdingPurchaseDate').value =
+    preset.purchaseDate ||
+    '';
+
+  $('holdingFees').value =
+    preset.fees ??
+    0;
+
+  $('holdingFormStatus')
+    .textContent =
+      '';
+
+  $('portfolioModal').hidden =
+    false;
+
+  setTimeout(
+    () =>
+      $('holdingSymbol')
+        .focus(),
+    0
+  );
+}
+
+function closePortfolioModal() {
+  if ($('portfolioModal')) {
+    $('portfolioModal').hidden =
+      true;
+  }
+}
+
+function parseCsvLine(
+  line
+) {
+  const output = [];
+  let current = '';
+  let quoted = false;
+
+  for (
+    let index = 0;
+    index < line.length;
+    index++
+  ) {
+    const char =
+      line[index];
+
+    if (char === '"') {
+      if (
+        quoted &&
+        line[index + 1] === '"'
+      ) {
+        current += '"';
+        index += 1;
+      } else {
+        quoted =
+          !quoted;
+      }
+
+      continue;
+    }
+
+    if (
+      char === ',' &&
+      !quoted
+    ) {
+      output.push(
+        current.trim()
+      );
+      current = '';
+      continue;
+    }
+
+    current +=
+      char;
+  }
+
+  output.push(
+    current.trim()
+  );
+
+  return output;
+}
+
+function normalizeCsvHeader(
+  value
+) {
+  return String(
+    value ||
+    ''
+  )
+    .trim()
+    .toLowerCase()
+    .replace(
+      /[^a-z0-9]+/g,
+      '_'
+    )
+    .replace(
+      /^_+|_+$/g,
+      ''
+    );
+}
+
+function csvValue(
+  row,
+  keys
+) {
+  for (
+    const key
+    of keys
+  ) {
+    if (
+      row[key] !==
+        undefined &&
+      row[key] !==
+        null &&
+      row[key] !==
+        ''
+    ) {
+      return row[key];
+    }
+  }
+
+  return '';
+}
+
+async function importPortfolioCsv(
+  file
+) {
+  const text =
+    await file.text();
+
+  const lines =
+    text
+      .split(/\\r?\\n/)
+      .filter(
+        line =>
+          line.trim()
+      );
+
+  if (lines.length < 2) {
+    throw new Error(
+      'CSV needs a header row and at least one holding.'
+    );
+  }
+
+  const headers =
+    parseCsvLine(
+      lines[0]
+    ).map(
+      normalizeCsvHeader
+    );
+
+  let imported = 0;
+  const errors = [];
+
+  for (
+    let index = 1;
+    index < lines.length;
+    index++
+  ) {
+    const values =
+      parseCsvLine(
+        lines[index]
+      );
+
+    const row = {};
+
+    headers.forEach(
+      (
+        header,
+        column
+      ) => {
+        row[header] =
+          values[column] ||
+          '';
+      }
+    );
+
+    const payload = {
+      symbol:
+        csvValue(
+          row,
+          [
+            'symbol',
+            'ticker',
+            'stock'
+          ]
+        ),
+      quantity:
+        csvValue(
+          row,
+          [
+            'quantity',
+            'qty',
+            'shares'
+          ]
+        ),
+      average_cost:
+        csvValue(
+          row,
+          [
+            'average_cost',
+            'avg_cost',
+            'cost',
+            'buy_price',
+            'purchase_price'
+          ]
+        ),
+      purchase_date:
+        csvValue(
+          row,
+          [
+            'purchase_date',
+            'buy_date',
+            'date'
+          ]
+        ) ||
+        null,
+      fees:
+        csvValue(
+          row,
+          [
+            'fees',
+            'fee'
+          ]
+        ) ||
+        0
+    };
+
+    try {
+      await apiPost(
+        'portfolio-holding',
+        payload
+      );
+
+      imported +=
+        1;
+    } catch (error) {
+      errors.push(
+        'Row ' +
+        (index + 1) +
+        ': ' +
+        error.message
+      );
+    }
+  }
+
+  await loadDecisionCenter();
+
+  return {
+    imported,
+    errors
+  };
+}
+
+async function saveHoldingFromForm() {
+  const button =
+    $('saveHoldingButton');
+
+  button.disabled =
+    true;
+
+  $('holdingFormStatus')
+    .textContent =
+      'Saving holding and checking its recent history...';
+
+  try {
+    await apiPost(
+      'portfolio-holding',
+      {
+        symbol:
+          $('holdingSymbol')
+            .value,
+        quantity:
+          $('holdingQuantity')
+            .value,
+        average_cost:
+          $('holdingAverageCost')
+            .value,
+        purchase_date:
+          $('holdingPurchaseDate')
+            .value ||
+          null,
+        fees:
+          $('holdingFees')
+            .value ||
+          0
+      }
+    );
+
+    closePortfolioModal();
+    await loadDecisionCenter();
+  } catch (error) {
+    $('holdingFormStatus')
+      .textContent =
+        error.message;
+  } finally {
+    button.disabled =
+      false;
+  }
+}
+
 /* =========================================================
    APP SHELL EVENTS
 ========================================================= */
@@ -24501,6 +28453,171 @@ if ($('refreshIntelligenceFeed')) {
     .onclick =
       () =>
         loadDecisionCenter();
+}
+
+[
+  'homeAddHolding',
+  'portfolioAddHolding'
+]
+  .forEach(
+    id => {
+      if ($(id)) {
+        $(id).onclick =
+          () =>
+            openPortfolioModal();
+      }
+    }
+  );
+
+[
+  'homeImportPortfolio',
+  'portfolioImportCsv'
+]
+  .forEach(
+    id => {
+      if ($(id)) {
+        $(id).onclick =
+          () =>
+            $('portfolioCsvInput')
+              .click();
+      }
+    }
+  );
+
+if ($('closePortfolioModal')) {
+  $('closePortfolioModal')
+    .onclick =
+      closePortfolioModal;
+}
+
+if ($('cancelHoldingButton')) {
+  $('cancelHoldingButton')
+    .onclick =
+      closePortfolioModal;
+}
+
+if ($('saveHoldingButton')) {
+  $('saveHoldingButton')
+    .onclick =
+      saveHoldingFromForm;
+}
+
+if ($('portfolioModal')) {
+  $('portfolioModal')
+    .onclick =
+      event => {
+        if (
+          event.target ===
+          $('portfolioModal')
+        ) {
+          closePortfolioModal();
+        }
+      };
+}
+
+if ($('portfolioCsvInput')) {
+  $('portfolioCsvInput')
+    .onchange =
+      async event => {
+        const file =
+          event.target
+            .files?.[0];
+
+        if (!file) {
+          return;
+        }
+
+        try {
+          const result =
+            await importPortfolioCsv(
+              file
+            );
+
+          alert(
+            'Imported ' +
+            result.imported +
+            ' holding(s).' +
+            (
+              result.errors.length
+                ? '\\n' +
+                  result.errors
+                    .slice(0, 5)
+                    .join('\\n')
+                : ''
+            )
+          );
+        } catch (error) {
+          alert(
+            error.message
+          );
+        } finally {
+          event.target.value =
+            '';
+        }
+      };
+}
+
+if ($('findBestOption')) {
+  $('findBestOption')
+    .onclick =
+      () => {
+        const amount =
+          Number(
+            String(
+              $('decisionAmount')
+                .value ||
+              ''
+            ).replace(
+              /,/g,
+              ''
+            )
+          );
+
+        const context = {
+          amount:
+            Number.isFinite(amount) &&
+            amount > 0
+              ? amount
+              : 5000,
+          horizon:
+            $('decisionHorizon')
+              .value,
+          risk:
+            $('decisionRisk')
+              .value
+        };
+
+        localStorage.setItem(
+          'nomadDecisionContext',
+          JSON.stringify(
+            context
+          )
+        );
+
+        $('decisionResult')
+          .innerHTML =
+            '<strong>Decision request saved: PKR ' +
+            formatNumber(
+              context.amount,
+              0
+            ) +
+            ' · ' +
+            escapeHtml(
+              context.horizon ===
+                'long_term'
+                ? 'Long-term'
+                : 'Short-term'
+            ) +
+            ' · ' +
+            escapeHtml(
+              context.risk
+                .charAt(0)
+                .toUpperCase() +
+              context.risk
+                .slice(1)
+            ) +
+            '.</strong><br>NOMAD will not invent a “best” stock before validated fundamental scoring and allocation are active. Your amount and preferences are preserved for that engine.';
+      };
 }
 
 if ($('homeRunScan')) {
