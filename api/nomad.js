@@ -2,8 +2,9 @@
 
 const http = require('node:http');
 const crypto = require('node:crypto');
+const zlib = require('node:zlib');
 
-const VERSION = '0.6.7';
+const VERSION = '0.6.8';
 
 const PSX_API_BASE =
   process.env.PSX_API_BASE ||
@@ -25,6 +26,30 @@ const PSX_ALLSHR_URL =
 
 const PSX_MARKET_WATCH_URL =
   `${PSX_DPS_BASE}/market-watch`;
+
+const PSX_CORPORATE_BASE =
+  process.env.PSX_CORPORATE_BASE ||
+  'https://www.psx.com.pk';
+
+const PSX_ENFORCEMENT_ACTIONS_URL =
+  `${PSX_CORPORATE_BASE}/psx/regulations/enforcement-actions`;
+
+const PSX_LISTED_COMPANIES_DATA_URL =
+  `${PSX_CORPORATE_BASE}/psx/resources-and-tools/listings/listed-companies-data`;
+
+const PSX_BULK_STATUS_FALLBACK_URLS = {
+  suspended:
+    `${PSX_CORPORATE_BASE}/psx/themes/psx/uploads/Suspended-companies-updated-22-6-2026.pdf`,
+
+  delisted:
+    `${PSX_CORPORATE_BASE}/psx/themes/psx/uploads/Delisted-Report-27-07-26.pdf`,
+
+  merged:
+    `${PSX_CORPORATE_BASE}/psx/themes/psx/uploads/Merger-Report-29-06-26.pdf`,
+
+  renamed:
+    `${PSX_CORPORATE_BASE}/psx/themes/psx/uploads/Change-of-Name-20-07-26.pdf`
+};
 
 const PYPSX_API_KEY_ID =
   process.env.PYPSX_API_KEY_ID ||
@@ -53,6 +78,7 @@ let rawScreenerCache = null;
 let sectorCache = null;
 let companyCache = null;
 let metadataAuditCache = null;
+let bulkStatusCache = null;
 
 const companyPageCache =
   new Map();
@@ -1194,6 +1220,1786 @@ async function fetchText(
   }
 
   return response.text();
+}
+
+async function fetchBuffer(
+  url,
+  timeout = 30000,
+  headers = {}
+) {
+  const response =
+    await fetch(
+      url,
+      {
+        headers: {
+          Accept:
+            'application/pdf,text/html,application/xhtml+xml,*/*',
+
+          'User-Agent':
+            `Mozilla/5.0 NOMAD-Invest/${VERSION}`,
+
+          ...headers
+        },
+
+        signal:
+          AbortSignal.timeout(
+            timeout
+          )
+      }
+    );
+
+  if (
+    !response.ok
+  ) {
+    bad(
+      `Data service returned HTTP ${response.status}.`,
+      response.status
+    );
+  }
+
+  const arrayBuffer =
+    await response.arrayBuffer();
+
+  return {
+    buffer:
+      Buffer.from(
+        arrayBuffer
+      ),
+
+    contentType:
+      String(
+        response.headers.get(
+          'content-type'
+        ) ||
+        ''
+      ),
+
+    finalUrl:
+      response.url ||
+      url
+  };
+}
+
+function decodePdfHexUnicode(
+  hex
+) {
+  const cleaned =
+    String(
+      hex ||
+      ''
+    )
+      .replace(
+        /\s+/g,
+        ''
+      )
+      .replace(
+        /[^0-9a-f]/gi,
+        ''
+      );
+
+  if (!cleaned) {
+    return '';
+  }
+
+  const evenHex =
+    cleaned.length % 2
+      ? cleaned + '0'
+      : cleaned;
+
+  const bytes =
+    Buffer.from(
+      evenHex,
+      'hex'
+    );
+
+  if (
+    bytes.length >= 2 &&
+    bytes.length % 2 === 0
+  ) {
+    let output = '';
+
+    for (
+      let index = 0;
+      index < bytes.length;
+      index += 2
+    ) {
+      output +=
+        String.fromCharCode(
+          bytes.readUInt16BE(
+            index
+          )
+        );
+    }
+
+    if (
+      /[\u0020-\u007e\u00a0-\uffff]/
+        .test(
+          output
+        )
+    ) {
+      return output;
+    }
+  }
+
+  return bytes
+    .toString(
+      'latin1'
+    );
+}
+
+function incrementPdfHex(
+  hex,
+  offset
+) {
+  const width =
+    String(
+      hex ||
+      ''
+    ).length;
+
+  try {
+    return (
+      BigInt(
+        '0x' +
+        hex
+      ) +
+      BigInt(
+        offset
+      )
+    )
+      .toString(16)
+      .toUpperCase()
+      .padStart(
+        width,
+        '0'
+      );
+  } catch {
+    return hex;
+  }
+}
+
+function buildPdfUnicodeMap(
+  streamTexts
+) {
+  const map =
+    new Map();
+
+  for (
+    const text
+    of streamTexts
+  ) {
+    const source =
+      String(
+        text ||
+        ''
+      );
+
+    const bfcharRegex =
+      /beginbfchar([\s\S]*?)endbfchar/gi;
+
+    let blockMatch;
+
+    while (
+      (
+        blockMatch =
+          bfcharRegex.exec(
+            source
+          )
+      )
+    ) {
+      const pairRegex =
+        /<([0-9A-F]+)>\s*<([0-9A-F]+)>/gi;
+
+      let pair;
+
+      while (
+        (
+          pair =
+            pairRegex.exec(
+              blockMatch[1]
+            )
+        )
+      ) {
+        map.set(
+          pair[1]
+            .toUpperCase(),
+          decodePdfHexUnicode(
+            pair[2]
+          )
+        );
+      }
+    }
+
+    const bfrangeRegex =
+      /beginbfrange([\s\S]*?)endbfrange/gi;
+
+    while (
+      (
+        blockMatch =
+          bfrangeRegex.exec(
+            source
+          )
+      )
+    ) {
+      const rangeSource =
+        blockMatch[1];
+
+      const simpleRangeRegex =
+        /<([0-9A-F]+)>\s*<([0-9A-F]+)>\s*<([0-9A-F]+)>/gi;
+
+      let range;
+
+      while (
+        (
+          range =
+            simpleRangeRegex.exec(
+              rangeSource
+            )
+        )
+      ) {
+        try {
+          const start =
+            BigInt(
+              '0x' +
+              range[1]
+            );
+
+          const end =
+            BigInt(
+              '0x' +
+              range[2]
+            );
+
+          const count =
+            Number(
+              end -
+              start
+            );
+
+          if (
+            count < 0 ||
+            count > 4096
+          ) {
+            continue;
+          }
+
+          for (
+            let index = 0;
+            index <= count;
+            index++
+          ) {
+            map.set(
+              incrementPdfHex(
+                range[1],
+                index
+              ),
+              decodePdfHexUnicode(
+                incrementPdfHex(
+                  range[3],
+                  index
+                )
+              )
+            );
+          }
+        } catch {}
+      }
+
+      const arrayRangeRegex =
+        /<([0-9A-F]+)>\s*<([0-9A-F]+)>\s*\[([\s\S]*?)\]/gi;
+
+      while (
+        (
+          range =
+            arrayRangeRegex.exec(
+              rangeSource
+            )
+        )
+      ) {
+        const destinations =
+          [
+            ...range[3]
+              .matchAll(
+                /<([0-9A-F]+)>/gi
+              )
+          ]
+            .map(
+              match =>
+                match[1]
+            );
+
+        for (
+          let index = 0;
+          index < destinations.length;
+          index++
+        ) {
+          map.set(
+            incrementPdfHex(
+              range[1],
+              index
+            ),
+            decodePdfHexUnicode(
+              destinations[index]
+            )
+          );
+        }
+      }
+    }
+  }
+
+  return map;
+}
+
+function parsePdfLiteralBytes(
+  token
+) {
+  const source =
+    String(
+      token ||
+      ''
+    );
+
+  const output = [];
+
+  for (
+    let index = 1;
+    index < source.length - 1;
+    index++
+  ) {
+    const character =
+      source[index];
+
+    if (
+      character !==
+      '\\'
+    ) {
+      output.push(
+        source.charCodeAt(
+          index
+        ) &
+        255
+      );
+
+      continue;
+    }
+
+    index++;
+
+    if (
+      index >=
+      source.length - 1
+    ) {
+      break;
+    }
+
+    const escaped =
+      source[index];
+
+    const simpleEscapes = {
+      n: 10,
+      r: 13,
+      t: 9,
+      b: 8,
+      f: 12,
+      '(': 40,
+      ')': 41,
+      '\\': 92
+    };
+
+    if (
+      Object.prototype.hasOwnProperty.call(
+        simpleEscapes,
+        escaped
+      )
+    ) {
+      output.push(
+        simpleEscapes[
+          escaped
+        ]
+      );
+
+      continue;
+    }
+
+    if (
+      /[0-7]/
+        .test(
+          escaped
+        )
+    ) {
+      let octal =
+        escaped;
+
+      for (
+        let count = 0;
+        count < 2 &&
+        index + 1 <
+          source.length - 1 &&
+        /[0-7]/
+          .test(
+            source[
+              index + 1
+            ]
+          );
+        count++
+      ) {
+        index++;
+        octal +=
+          source[index];
+      }
+
+      output.push(
+        parseInt(
+          octal,
+          8
+        ) &
+        255
+      );
+
+      continue;
+    }
+
+    if (
+      escaped === '\n' ||
+      escaped === '\r'
+    ) {
+      if (
+        escaped === '\r' &&
+        source[
+          index + 1
+        ] === '\n'
+      ) {
+        index++;
+      }
+
+      continue;
+    }
+
+    output.push(
+      escaped.charCodeAt(
+        0
+      ) &
+      255
+    );
+  }
+
+  return Buffer.from(
+    output
+  );
+}
+
+function decodePdfTextBytes(
+  bytes,
+  unicodeMap
+) {
+  if (
+    !bytes ||
+    !bytes.length
+  ) {
+    return '';
+  }
+
+  if (
+    unicodeMap &&
+    unicodeMap.size
+  ) {
+    const hex =
+      Buffer.from(
+        bytes
+      )
+        .toString(
+          'hex'
+        )
+        .toUpperCase();
+
+    const keyLengths =
+      [
+        ...new Set(
+          [
+            ...unicodeMap.keys()
+          ].map(
+            key =>
+              key.length
+          )
+        )
+      ]
+        .sort(
+          (
+            a,
+            b
+          ) =>
+            b - a
+        );
+
+    let cursor = 0;
+    let decoded = '';
+    let matched = 0;
+
+    while (
+      cursor <
+      hex.length
+    ) {
+      let found = false;
+
+      for (
+        const length
+        of keyLengths
+      ) {
+        const key =
+          hex.slice(
+            cursor,
+            cursor + length
+          );
+
+        if (
+          key.length !==
+            length ||
+          !unicodeMap.has(
+            key
+          )
+        ) {
+          continue;
+        }
+
+        decoded +=
+          unicodeMap.get(
+            key
+          );
+
+        cursor +=
+          length;
+
+        matched++;
+        found = true;
+        break;
+      }
+
+      if (!found) {
+        const byteHex =
+          hex.slice(
+            cursor,
+            cursor + 2
+          );
+
+        if (
+          byteHex.length === 2
+        ) {
+          decoded +=
+            String.fromCharCode(
+              parseInt(
+                byteHex,
+                16
+              )
+            );
+        }
+
+        cursor += 2;
+      }
+    }
+
+    if (
+      matched > 0
+    ) {
+      return decoded;
+    }
+  }
+
+  const buffer =
+    Buffer.from(
+      bytes
+    );
+
+  if (
+    buffer.length >= 2 &&
+    buffer.length % 2 === 0
+  ) {
+    let nullCount = 0;
+
+    for (
+      let index = 0;
+      index < buffer.length;
+      index += 2
+    ) {
+      if (
+        buffer[index] === 0
+      ) {
+        nullCount++;
+      }
+    }
+
+    if (
+      nullCount >=
+      Math.max(
+        2,
+        buffer.length /
+        6
+      )
+    ) {
+      let unicode = '';
+
+      for (
+        let index = 0;
+        index < buffer.length;
+        index += 2
+      ) {
+        unicode +=
+          String.fromCharCode(
+            buffer.readUInt16BE(
+              index
+            )
+          );
+      }
+
+      return unicode;
+    }
+  }
+
+  const utf8 =
+    buffer.toString(
+      'utf8'
+    );
+
+  const replacementCount =
+    (
+      utf8.match(
+        /\uFFFD/g
+      ) ||
+      []
+    ).length;
+
+  return replacementCount <= 1
+    ? utf8
+    : buffer.toString(
+        'latin1'
+      );
+}
+
+function extractPdfTextFromStream(
+  content,
+  unicodeMap
+) {
+  const output = [];
+
+  const pushToken =
+    token => {
+      if (!token) {
+        return;
+      }
+
+      let bytes;
+
+      if (
+        token.startsWith(
+          '('
+        )
+      ) {
+        bytes =
+          parsePdfLiteralBytes(
+            token
+          );
+      } else {
+        const hex =
+          token
+            .slice(
+              1,
+              -1
+            )
+            .replace(
+              /\s+/g,
+              ''
+            );
+
+        if (!hex) {
+          return;
+        }
+
+        bytes =
+          Buffer.from(
+            hex.length % 2
+              ? hex + '0'
+              : hex,
+            'hex'
+          );
+      }
+
+      const text =
+        decodePdfTextBytes(
+          bytes,
+          unicodeMap
+        )
+          .replace(
+            /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g,
+            ' '
+          )
+          .trim();
+
+      if (text) {
+        output.push(
+          text
+        );
+      }
+    };
+
+  const directRegex =
+    /(\((?:\\.|[^\\()])*\)|<[0-9A-F\s]+>)\s*(?:Tj|'|")/gi;
+
+  let match;
+
+  while (
+    (
+      match =
+        directRegex.exec(
+          content
+        )
+    )
+  ) {
+    pushToken(
+      match[1]
+    );
+  }
+
+  const arrayRegex =
+    /\[([\s\S]*?)\]\s*TJ/gi;
+
+  while (
+    (
+      match =
+        arrayRegex.exec(
+          content
+        )
+    )
+  ) {
+    const tokenRegex =
+      /(\((?:\\.|[^\\()])*\)|<[0-9A-F\s]+>)/gi;
+
+    let token;
+
+    while (
+      (
+        token =
+          tokenRegex.exec(
+            match[1]
+          )
+      )
+    ) {
+      pushToken(
+        token[1]
+      );
+    }
+  }
+
+  return output.join(
+    ' '
+  );
+}
+
+function extractPdfText(
+  buffer
+) {
+  const binary =
+    Buffer.from(
+      buffer
+    )
+      .toString(
+        'latin1'
+      );
+
+  const streams = [];
+  let cursor = 0;
+
+  while (
+    cursor <
+    binary.length
+  ) {
+    const streamIndex =
+      binary.indexOf(
+        'stream',
+        cursor
+      );
+
+    if (
+      streamIndex < 0
+    ) {
+      break;
+    }
+
+    let dataStart =
+      streamIndex + 6;
+
+    if (
+      binary[
+        dataStart
+      ] === '\r' &&
+      binary[
+        dataStart + 1
+      ] === '\n'
+    ) {
+      dataStart += 2;
+    } else if (
+      binary[
+        dataStart
+      ] === '\n' ||
+      binary[
+        dataStart
+      ] === '\r'
+    ) {
+      dataStart += 1;
+    }
+
+    const endIndex =
+      binary.indexOf(
+        'endstream',
+        dataStart
+      );
+
+    if (
+      endIndex < 0
+    ) {
+      break;
+    }
+
+    const dictionaryStart =
+      Math.max(
+        0,
+        binary.lastIndexOf(
+          '<<',
+          streamIndex
+        )
+      );
+
+    const dictionary =
+      binary.slice(
+        Math.max(
+          0,
+          dictionaryStart
+        ),
+        streamIndex
+      );
+
+    let data =
+      Buffer.from(
+        buffer
+      ).subarray(
+        dataStart,
+        endIndex
+      );
+
+    try {
+      if (
+        /\/FlateDecode/i
+          .test(
+            dictionary
+          )
+      ) {
+        data =
+          zlib.inflateSync(
+            data
+          );
+      } else if (
+        /\/ASCIIHexDecode/i
+          .test(
+            dictionary
+          )
+      ) {
+        const hex =
+          data
+            .toString(
+              'latin1'
+            )
+            .replace(
+              />[\s\S]*$/,
+              ''
+            )
+            .replace(
+              /\s+/g,
+              ''
+            );
+
+        data =
+          Buffer.from(
+            hex.length % 2
+              ? hex + '0'
+              : hex,
+            'hex'
+          );
+      }
+    } catch {
+      cursor =
+        endIndex + 9;
+
+      continue;
+    }
+
+    streams.push(
+      data.toString(
+        'latin1'
+      )
+    );
+
+    cursor =
+      endIndex + 9;
+  }
+
+  const unicodeMap =
+    buildPdfUnicodeMap(
+      streams
+    );
+
+  const output =
+    streams
+      .map(
+        stream =>
+          extractPdfTextFromStream(
+            stream,
+            unicodeMap
+          )
+      )
+      .filter(Boolean)
+      .join('\n')
+      .replace(
+        /\s+/g,
+        ' '
+      )
+      .trim();
+
+  if (
+    output.length >= 100
+  ) {
+    return output;
+  }
+
+  // Some simple PDFs expose useful literal strings even outside content
+  // streams. This is only a conservative fallback.
+  const fallback = [];
+  const rawStringRegex =
+    /\(([^()]{3,160})\)/g;
+
+  let rawMatch;
+
+  while (
+    (
+      rawMatch =
+        rawStringRegex.exec(
+          binary
+        )
+    )
+  ) {
+    const candidate =
+      rawMatch[1]
+        .replace(
+          /\\[nrtbf]/g,
+          ' '
+        )
+        .replace(
+          /\\([()\\])/g,
+          '$1'
+        )
+        .replace(
+          /[^\x20-\x7E]/g,
+          ' '
+        )
+        .replace(
+          /\s+/g,
+          ' '
+        )
+        .trim();
+
+    if (
+      candidate.length >= 3
+    ) {
+      fallback.push(
+        candidate
+      );
+    }
+  }
+
+  return fallback
+    .join(' ')
+    .replace(
+      /\s+/g,
+      ' '
+    )
+    .trim();
+}
+
+function absoluteCorporateURL(
+  value
+) {
+  const raw =
+    decodeHtml(
+      String(
+        value ||
+        ''
+      )
+    )
+      .trim();
+
+  if (!raw) {
+    return null;
+  }
+
+  try {
+    return new URL(
+      raw,
+      PSX_CORPORATE_BASE
+    ).toString();
+  } catch {
+    return null;
+  }
+}
+
+function extractHTMLLinks(
+  html
+) {
+  const links = [];
+  const regex =
+    /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+
+  let match;
+
+  while (
+    (
+      match =
+        regex.exec(
+          String(
+            html ||
+            ''
+          )
+        )
+    )
+  ) {
+    const url =
+      absoluteCorporateURL(
+        match[1]
+      );
+
+    if (!url) {
+      continue;
+    }
+
+    links.push({
+      url,
+      label:
+        cleanHtmlCell(
+          match[2]
+        )
+    });
+  }
+
+  return links;
+}
+
+function pickLatestPSXReportLink(
+  links,
+  patterns,
+  fallback
+) {
+  const matches =
+    links
+      .filter(
+        link => {
+          const searchable =
+            (
+              link.url +
+              ' ' +
+              link.label
+            )
+              .toLowerCase();
+
+          return patterns.some(
+            pattern =>
+              pattern.test(
+                searchable
+              )
+          );
+        }
+      )
+      .sort(
+        (
+          a,
+          b
+        ) =>
+          b.url.localeCompare(
+            a.url
+          )
+      );
+
+  return matches[0]?.url ||
+    fallback;
+}
+
+async function discoverPSXBulkStatusReports() {
+  let links = [];
+
+  const results =
+    await Promise.allSettled([
+      fetchText(
+        PSX_ENFORCEMENT_ACTIONS_URL,
+        20000
+      ),
+      fetchText(
+        PSX_LISTED_COMPANIES_DATA_URL,
+        20000
+      )
+    ]);
+
+  for (
+    const result
+    of results
+  ) {
+    if (
+      result.status ===
+      'fulfilled'
+    ) {
+      links =
+        links.concat(
+          extractHTMLLinks(
+            result.value
+          )
+        );
+    }
+  }
+
+  return {
+    suspended:
+      pickLatestPSXReportLink(
+        links,
+        [
+          /suspended[-_ ]companies/,
+          /suspended-companies/
+        ],
+        PSX_BULK_STATUS_FALLBACK_URLS.suspended
+      ),
+
+    delisted:
+      pickLatestPSXReportLink(
+        links,
+        [
+          /delisted/
+        ],
+        PSX_BULK_STATUS_FALLBACK_URLS.delisted
+      ),
+
+    merged:
+      pickLatestPSXReportLink(
+        links,
+        [
+          /merger[-_ ]report/,
+          /scheme[-_ ]of[-_ ]arrangement/,
+          /merged[-_ ]companies/
+        ],
+        PSX_BULK_STATUS_FALLBACK_URLS.merged
+      ),
+
+    renamed:
+      pickLatestPSXReportLink(
+        links,
+        [
+          /change[-_ ]of[-_ ]name/,
+          /renamed[-_ ]companies/
+        ],
+        PSX_BULK_STATUS_FALLBACK_URLS.renamed
+      )
+  };
+}
+
+function normalizedReportText(
+  value
+) {
+  return (
+    ' ' +
+    normalizeCompanyIdentityName(
+      value
+    ) +
+    ' '
+  )
+    .replace(
+      /\s+/g,
+      ' '
+    );
+}
+
+function companyStatusNameVariants(
+  companyName
+) {
+  const base =
+    normalizeCompanyIdentityName(
+      companyName
+    );
+
+  if (!base) {
+    return [];
+  }
+
+  const variants =
+    new Set([
+      base,
+      base
+        .replace(
+          /\bLTD\b/g,
+          'LIMITED'
+        ),
+      base
+        .replace(
+          /\bLIMITED\b/g,
+          'LTD'
+        )
+    ]);
+
+  const stripped =
+    base
+      .replace(
+        /\b(?:PRIVATE|PVT|PUBLIC)\b/g,
+        ' '
+      )
+      .replace(
+        /\b(?:LIMITED|LTD)\b$/,
+        ' '
+      )
+      .replace(
+        /\s+/g,
+        ' '
+      )
+      .trim();
+
+  if (
+    stripped.length >= 12 &&
+    stripped.split(' ').length >= 2
+  ) {
+    variants.add(
+      stripped
+    );
+  }
+
+  return [
+    ...variants
+  ]
+    .filter(
+      value =>
+        value.length >= 6
+    );
+}
+
+function reportContainsCompany(
+  reportText,
+  companyName
+) {
+  if (
+    !reportText ||
+    !companyName
+  ) {
+    return false;
+  }
+
+  const normalized =
+    normalizedReportText(
+      reportText
+    );
+
+  return companyStatusNameVariants(
+    companyName
+  )
+    .some(
+      variant =>
+        normalized.includes(
+          ' ' +
+          variant +
+          ' '
+        )
+    );
+}
+
+function reportDateHintFromURL(
+  url
+) {
+  const filename =
+    String(
+      url ||
+      ''
+    )
+      .split('/')
+      .pop() ||
+    '';
+
+  const match =
+    filename.match(
+      /(\d{1,2})[-_](\d{1,2})[-_](\d{2,4})/
+    );
+
+  if (!match) {
+    return null;
+  }
+
+  let year =
+    Number(
+      match[3]
+    );
+
+  if (
+    year < 100
+  ) {
+    year += 2000;
+  }
+
+  const month =
+    String(
+      Number(
+        match[2]
+      )
+    )
+      .padStart(
+        2,
+        '0'
+      );
+
+  const day =
+    String(
+      Number(
+        match[1]
+      )
+    )
+      .padStart(
+        2,
+        '0'
+      );
+
+  return (
+    year +
+    '-' +
+    month +
+    '-' +
+    day
+  );
+}
+
+async function fetchPSXStatusReport(
+  key,
+  url
+) {
+  try {
+    const fetched =
+      await fetchBuffer(
+        url,
+        35000,
+        {
+          Referer:
+            `${PSX_CORPORATE_BASE}/`
+        }
+      );
+
+    let text = '';
+
+    if (
+      fetched.contentType
+        .toLowerCase()
+        .includes(
+          'html'
+        )
+    ) {
+      text =
+        htmlToLines(
+          fetched.buffer
+            .toString(
+              'utf8'
+            )
+        )
+          .join(' ');
+    } else {
+      text =
+        extractPdfText(
+          fetched.buffer
+        );
+    }
+
+    const usable =
+      normalizeCompanyIdentityName(
+        text
+      ).length >= 80;
+
+    return {
+      key,
+      url:
+        fetched.finalUrl ||
+        url,
+      reportDate:
+        reportDateHintFromURL(
+          fetched.finalUrl ||
+          url
+        ),
+      contentType:
+        fetched.contentType,
+      loaded:
+        usable,
+      text:
+        usable
+          ? text
+          : '',
+      textLength:
+        text.length,
+      error:
+        usable
+          ? null
+          : 'Report downloaded but text extraction was insufficient.'
+    };
+  } catch (error) {
+    return {
+      key,
+      url,
+      reportDate:
+        reportDateHintFromURL(
+          url
+        ),
+      contentType:
+        null,
+      loaded:
+        false,
+      text:
+        '',
+      textLength:
+        0,
+      error:
+        error?.message ||
+        'Bulk report request failed.'
+    };
+  }
+}
+
+async function loadPSXBulkStatusEvidence() {
+  if (
+    bulkStatusCache &&
+    Date.now() -
+      bulkStatusCache.fetchedAt <
+      6 *
+      60 *
+      60 *
+      1000
+  ) {
+    return bulkStatusCache.data;
+  }
+
+  const urls =
+    await discoverPSXBulkStatusReports();
+
+  const definitions = [
+    {
+      key:
+        'suspended',
+      status:
+        'SUSPENDED',
+      label:
+        'Suspended',
+      url:
+        urls.suspended
+    },
+    {
+      key:
+        'delisted',
+      status:
+        'DELISTED',
+      label:
+        'Delisted',
+      url:
+        urls.delisted
+    },
+    {
+      key:
+        'merged',
+      status:
+        'MERGED',
+      label:
+        'Merged / amalgamated',
+      url:
+        urls.merged
+    },
+    {
+      key:
+        'renamed',
+      status:
+        'CHANGED',
+      label:
+        'Changed / renamed',
+      url:
+        urls.renamed
+    }
+  ];
+
+  const reports = [];
+
+  // Corporate PSX bulk documents are intentionally fetched with low
+  // concurrency. This replaces the former hundreds of DPS company-page
+  // requests used only for universe QA.
+  for (
+    const definition
+    of definitions
+  ) {
+    reports.push({
+      ...definition,
+      ...(
+        await fetchPSXStatusReport(
+          definition.key,
+          definition.url
+        )
+      )
+    });
+  }
+
+  const data = {
+    resolvedAt:
+      new Date()
+        .toISOString(),
+    urls,
+    reports,
+    loadedReports:
+      reports.filter(
+        report =>
+          report.loaded
+      ).length,
+    failedReports:
+      reports.filter(
+        report =>
+          !report.loaded
+      ).length
+  };
+
+  bulkStatusCache = {
+    fetchedAt:
+      Date.now(),
+    data
+  };
+
+  return data;
+}
+
+function applyBulkStatusEvidenceToRow(
+  row,
+  bulkStatus
+) {
+  if (!row) {
+    return row;
+  }
+
+  const matches =
+    (
+      bulkStatus?.reports ||
+      []
+    )
+      .filter(
+        report =>
+          report.loaded &&
+          reportContainsCompany(
+            report.text,
+            row.companyName
+          )
+      );
+
+  if (
+    !matches.length
+  ) {
+    const base = {
+      ...row
+    };
+
+    // Once bulk historical/suspension sources have been checked, a row
+    // without current evidence is review-required rather than guessed stale.
+    if (
+      !base.hasOfficialCurrentEvidence &&
+      !base.isSpecialSecurity
+    ) {
+      base.universeClass =
+        'REVIEW_REQUIRED';
+      base.universeLabel =
+        'Review required';
+      base.universeReason =
+        'No current official-listing evidence and no matching official bulk status record were found. Keep out of the recommendation universe until verified.';
+      base.tradingStatus =
+        'UNKNOWN';
+      base.tradingStatusLabel =
+        'Current status unresolved after bulk-list checks';
+    }
+
+    const eligibility =
+      deriveEligibility(
+        base
+      );
+
+    const withEligibility = {
+      ...base,
+      ...eligibility
+    };
+
+    return {
+      ...withEligibility,
+      ...deriveIssueState(
+        withEligibility
+      )
+    };
+  }
+
+  const suspended =
+    matches.find(
+      report =>
+        report.key ===
+        'suspended'
+    );
+
+  let selected =
+    suspended ||
+    matches.find(
+      report =>
+        !row.hasOfficialCurrentEvidence &&
+        report.key ===
+          'delisted'
+    ) ||
+    matches.find(
+      report =>
+        !row.hasOfficialCurrentEvidence &&
+        report.key ===
+          'merged'
+    ) ||
+    matches.find(
+      report =>
+        !row.hasOfficialCurrentEvidence &&
+        report.key ===
+          'renamed'
+    ) ||
+    null;
+
+  // Historical reports often include a current successor company in a
+  // second column. Current official listing evidence therefore wins unless
+  // the security is explicitly present on the current Suspended report.
+  if (!selected) {
+    const base = {
+      ...row,
+      bulkStatusMatches:
+        matches.map(
+          report =>
+            report.key
+        )
+    };
+
+    const eligibility =
+      deriveEligibility(
+        base
+      );
+
+    const withEligibility = {
+      ...base,
+      ...eligibility
+    };
+
+    return {
+      ...withEligibility,
+      ...deriveIssueState(
+        withEligibility
+      )
+    };
+  }
+
+  const evidenceLabel =
+    'PSX bulk ' +
+    selected.key +
+    ' report' +
+    (
+      selected.reportDate
+        ? (
+            ' (' +
+            selected.reportDate +
+            ')'
+          )
+        : ''
+    );
+
+  const metadataSources =
+    uniqueTextValues([
+      ...(
+        row.metadataSources ||
+        []
+      ),
+      evidenceLabel
+    ]);
+
+  const officialEvidenceSources =
+    uniqueTextValues([
+      ...(
+        row.officialEvidenceSources ||
+        []
+      ),
+      evidenceLabel
+    ]);
+
+  let universeClass =
+    row.universeClass;
+
+  let universeLabel =
+    row.universeLabel;
+
+  let universeReason =
+    row.universeReason;
+
+  if (
+    selected.status ===
+    'SUSPENDED'
+  ) {
+    universeClass =
+      row.isSpecialSecurity
+        ? 'SPECIAL_INSTRUMENT'
+        : 'SUSPENDED_SECURITY';
+    universeLabel =
+      row.isSpecialSecurity
+        ? 'Special instrument'
+        : 'Suspended security';
+    universeReason =
+      'Official PSX suspended-companies bulk report matches this security identity.';
+  } else {
+    universeClass =
+      'HISTORICAL_OR_INACTIVE';
+    universeLabel =
+      'Historical / inactive';
+    universeReason =
+      'Official PSX bulk historical-status report matches this security identity.';
+  }
+
+  const enriched = {
+    ...row,
+    tradingStatus:
+      selected.status,
+    tradingStatusLabel:
+      selected.label,
+    statusEvidence:
+      evidenceLabel,
+    bulkStatusReportKey:
+      selected.key,
+    bulkStatusReportURL:
+      selected.url,
+    bulkStatusReportDate:
+      selected.reportDate,
+    bulkStatusMatches:
+      matches.map(
+        report =>
+          report.key
+      ),
+    metadataSources,
+    officialEvidenceSources,
+    universeClass,
+    universeLabel,
+    universeReason
+  };
+
+  const eligibility =
+    deriveEligibility(
+      enriched
+    );
+
+  const withEligibility = {
+    ...enriched,
+    ...eligibility
+  };
+
+  return {
+    ...withEligibility,
+    ...deriveIssueState(
+      withEligibility
+    )
+  };
 }
 
 /* =========================================================
@@ -7036,8 +8842,14 @@ async function getMetadataAudit() {
     return metadataAuditCache.data;
   }
 
-  const market =
-    await loadPSXMarket();
+  const [
+    market,
+    bulkStatus
+  ] =
+    await Promise.all([
+      loadPSXMarket(),
+      loadPSXBulkStatusEvidence()
+    ]);
 
   const knownSymbols =
     new Set(
@@ -7049,12 +8861,21 @@ async function getMetadataAudit() {
       )
     );
 
-  const classified =
+  const fastClassified =
     market.stocks.map(
       stock =>
         classifyInstrumentForAudit(
           stock,
           knownSymbols
+        )
+    );
+
+  const classified =
+    fastClassified.map(
+      row =>
+        applyBulkStatusEvidenceToRow(
+          row,
+          bulkStatus
         )
     );
 
@@ -7088,6 +8909,18 @@ async function getMetadataAudit() {
     countBy(
       classified,
       'universeClass'
+    );
+
+  const tradingStatusCounts =
+    countBy(
+      classified,
+      'tradingStatus'
+    );
+
+  const eligibilityCounts =
+    countBy(
+      classified,
+      'eligibility'
     );
 
   const officialEvidenceCoverage = {
@@ -7130,7 +8963,69 @@ async function getMetadataAudit() {
       ).length,
 
     companyPage:
-      0
+      0,
+
+    bulkStatusMatched:
+      classified.filter(
+        row =>
+          Boolean(
+            row.bulkStatusReportKey
+          )
+      ).length
+  };
+
+  const bulkStatusDiagnostics = {
+    loadedReports:
+      bulkStatus.loadedReports ||
+      0,
+
+    failedReports:
+      bulkStatus.failedReports ||
+      0,
+
+    reports:
+      (
+        bulkStatus.reports ||
+        []
+      ).map(
+        report => ({
+          key:
+            report.key,
+          loaded:
+            report.loaded,
+          url:
+            report.url,
+          reportDate:
+            report.reportDate,
+          textLength:
+            report.textLength,
+          error:
+            report.error
+        })
+      ),
+
+    matchesByReport:
+      (
+        bulkStatus.reports ||
+        []
+      ).reduce(
+        (
+          output,
+          report
+        ) => {
+          output[
+            report.key
+          ] =
+            classified.filter(
+              row =>
+                row.bulkStatusReportKey ===
+                report.key
+            ).length;
+
+          return output;
+        },
+        {}
+      )
   };
 
   const data = {
@@ -7145,10 +9040,10 @@ async function getMetadataAudit() {
       market.asOf,
 
     mode:
-      'READ_ONLY_SECURITY_UNIVERSE_QA_WITH_DEEP_STATUS_RESOLVER',
+      'READ_ONLY_SECURITY_UNIVERSE_QA_WITH_BULK_STATUS_REPORTS',
 
     deepStatusResolution:
-      'CLIENT_BATCHED_PSX_COMPANY_PAGES',
+      'OFFICIAL_PSX_BULK_REPORTS_NO_MASS_COMPANY_PAGE_SCRAPING',
 
     summary: {
       totalCanonicalSecurities:
@@ -7190,33 +9085,71 @@ async function getMetadataAudit() {
         universeClasses.LEGACY_STALE_CANDIDATE ||
         0,
 
-      unverifiedCurrentStatus:
+      historicalOrInactive:
+        universeClasses.HISTORICAL_OR_INACTIVE ||
+        0,
+
+      suspendedSecurities:
+        tradingStatusCounts.SUSPENDED ||
+        0,
+
+      delistedSecurities:
+        tradingStatusCounts.DELISTED ||
+        0,
+
+      changedOrMigratedSymbols:
         (
-          universeClasses.UNVERIFIED ||
+          tradingStatusCounts.CHANGED ||
           0
         ) +
         (
+          tradingStatusCounts.MERGED ||
+          0
+        ) +
+        (
+          tradingStatusCounts.MIGRATED_OR_SYMBOL_CHANGED ||
+          0
+        ),
+
+      statusReviewRequired:
+        (
           universeClasses.REVIEW_REQUIRED ||
           0
-        )
+        ) +
+        (
+          universeClasses.UNVERIFIED ||
+          0
+        ),
+
+      coreEquityCandidates:
+        eligibilityCounts.CORE_EQUITY_CANDIDATE ||
+        0,
+
+      gemEquityCandidates:
+        eligibilityCounts.GEM_EQUITY_CANDIDATE ||
+        0,
+
+      bulkStatusReportsLoaded:
+        bulkStatus.loadedReports ||
+        0,
+
+      bulkStatusReportsFailed:
+        bulkStatus.failedReports ||
+        0,
+
+      bulkStatusMatches:
+        officialEvidenceCoverage.bulkStatusMatched ||
+        0
     },
 
     sourceCoverage:
       officialEvidenceCoverage,
 
+    bulkStatusDiagnostics,
+
     universeClasses,
-
-    tradingStatusCounts:
-      countBy(
-        classified,
-        'tradingStatus'
-      ),
-
-    eligibilityCounts:
-      countBy(
-        classified,
-        'eligibility'
-      ),
+    tradingStatusCounts,
+    eligibilityCounts,
 
     issueBuckets:
       countBy(
@@ -7243,7 +9176,6 @@ async function getMetadataAudit() {
       ),
 
     issues,
-
     universe:
       classified
   };
@@ -10174,7 +12106,7 @@ async function handler(
             'psxdata-api',
 
           companyMetadata:
-            'PSX symbols + market-watch + listing metadata + company-page status resolver + fallbacks',
+            'PSX bulk listing metadata + bulk status reports + individual-company research pages + fallbacks',
 
           symbolNormalization:
             'VALIDATED_CANONICAL_STATUS_SEPARATION',
@@ -11573,7 +13505,7 @@ Metadata & Security Universe Audit
 </h2>
 
 <p class="muted">
-Read-only diagnostic. This checks metadata completeness, resolves official PSX company-page trading status in small batches, separates security type from issuer type, and prepares future universe eligibility. It does not remove or modify any security.
+Read-only diagnostic. This checks metadata completeness, uses official PSX bulk listing/status evidence, separates security type from issuer type, and prepares future universe eligibility. It does not remove or modify any security.
 </p>
 
 <div class="actions">
@@ -15490,63 +17422,43 @@ function renderMetadataAuditSummary(
           0,
           0
         ),
-        'One-request current-universe evidence'
+        'Current-universe evidence when available'
       ) +
 
       metricCard(
-        'Company pages resolved',
+        'Bulk status reports loaded',
         formatNumber(
-          sourceCoverage.companyPage ||
+          summary.bulkStatusReportsLoaded ||
           0,
           0
         ),
-        'Deep PSX status checks'
+        'Suspended / delisted / merged / renamed'
       ) +
 
       metricCard(
-        'Deep-status cache hits',
+        'Bulk status matches',
         formatNumber(
-          fetchDiagnostics.cacheHits ||
+          summary.bulkStatusMatches ||
           0,
           0
         ),
-        '24-hour browser cache'
+        'Official PSX historical/status evidence'
       ) +
 
       metricCard(
-        'Bulk-current rows skipped',
+        'Bulk report failures',
         formatNumber(
-          fetchDiagnostics.bulkCurrentSkipped ||
+          summary.bulkStatusReportsFailed ||
           0,
           0
         ),
-        'No company-page request needed'
-      ) +
-
-      metricCard(
-        'Page retries',
-        formatNumber(
-          fetchDiagnostics.retried ||
-          0,
-          0
-        ),
-        'Gentle one-time retry'
-      ) +
-
-      metricCard(
-        'Page fetch failures',
-        formatNumber(
-          fetchDiagnostics.fetchFailed ||
-          0,
-          0
-        ),
-        'Kept review-required, never treated as delisted'
+        'Failed source stays review-required'
       ) +
 
       '</div>' +
 
       '<div class="infoBox">' +
-      'Build 0.6.7 uses official PSX bulk evidence first (/symbols, Eligible Scrips, ALLSHR and Market Watch), then performs slower company-page checks only for unresolved identities. Successful deep-status results are cached in this browser for 24 hours. Failed page requests remain review-required and are never treated as evidence of delisting.' +
+      'Build 0.6.8 removes mass PSX company-page scraping from the universe audit. Current identities come from official bulk listing sources; suspended, delisted, merged and renamed identities come from official PSX bulk status reports. Company pages remain available only when you research an individual stock. Unmatched identities stay review-required rather than being guessed.' +
       '</div>';
 }
 
@@ -18592,7 +20504,7 @@ $('runMetadataAudit')
       $('metadataAuditSummary')
         .innerHTML =
           '<p class="muted">' +
-          'Running fast metadata audit...' +
+          'Loading official PSX bulk listing and status evidence...' +
           '</p>';
 
       try {
@@ -18660,30 +20572,42 @@ $('runMetadataAudit')
 
         renderMetadataAuditTable();
 
-        result =
-          await deepResolveMetadataAudit(
-            result
-          );
+        const bulkDiagnostics =
+          result.bulkStatusDiagnostics ||
+          {};
 
-        lastMetadataAuditResult =
-          result;
+        const matchBreakdown =
+          Object.entries(
+            bulkDiagnostics.matchesByReport ||
+            {}
+          )
+            .map(
+              ([key, value]) =>
+                key + ':' + value
+            )
+            .join(', ');
 
-        metadataAuditRows =
-          result.issues ||
-          [];
-
-        metadataAuditUniverseRows =
-          result.universe ||
-          [];
-
-        metadataAuditPage =
-          1;
-
-        renderMetadataAuditSummary(
-          result
-        );
-
-        renderMetadataAuditTable();
+        $('metadataAuditProgress')
+          .textContent =
+            'Bulk PSX status resolution complete. Reports loaded: ' +
+            Number(
+              bulkDiagnostics.loadedReports ||
+              0
+            ) +
+            '/4; report failures: ' +
+            Number(
+              bulkDiagnostics.failedReports ||
+              0
+            ) +
+            (
+              matchBreakdown
+                ? (
+                    '; matches: ' +
+                    matchBreakdown
+                  )
+                : ''
+            ) +
+            '. No mass company-page requests were made and no securities were removed.';
       } catch (error) {
         $('metadataAuditSummary')
           .innerHTML =
