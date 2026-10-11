@@ -3,7 +3,7 @@
 const http = require('node:http');
 const crypto = require('node:crypto');
 
-const VERSION = '0.6.1';
+const VERSION = '0.6.2';
 
 const PSX_API_BASE =
   process.env.PSX_API_BASE ||
@@ -49,6 +49,7 @@ let marketCache = null;
 let rawScreenerCache = null;
 let sectorCache = null;
 let companyCache = null;
+let metadataAuditCache = null;
 
 const companyPageCache =
   new Map();
@@ -149,17 +150,6 @@ function isSecurityStatusToken(
     normalizeSymbol(
       value
     );
-
-  /*
-    PSX may append temporary two-letter X-statuses
-    such as XD or XB to the trading symbol.
-
-    IMPORTANT:
-    We never remove these just because they match this
-    pattern. Removal only happens if the proposed base
-    symbol is independently validated as a canonical
-    PSX symbol.
-  */
 
   return /^X[A-Z]$/
     .test(
@@ -1097,7 +1087,7 @@ async function fetchText(
             'text/html,application/xhtml+xml',
 
           'User-Agent':
-            'Mozilla/5.0 NOMAD-Invest/0.6.1',
+            'Mozilla/5.0 NOMAD-Invest/0.6.2',
 
           ...headers
         },
@@ -1176,14 +1166,6 @@ function resolveSymbolIdentity(
       primary
     );
 
-  /*
-    If the exact symbol is confirmed by an official
-    canonical source, it wins immediately.
-
-    This protects legitimate symbols that happen to end
-    with letters resembling status markers.
-  */
-
   if (
     isOfficialCanonicalEntry(
       exactMetadata
@@ -1213,17 +1195,6 @@ function resolveSymbolIdentity(
           : 'official-exact'
     };
   }
-
-  /*
-    Try to peel validated X-statuses from the END only.
-
-    Examples:
-      LUCKXD     -> LUCK + XD
-      BPLXD XB   -> BPL + XD + XB
-
-    A suffix is accepted only when the proposed base
-    exists as an officially confirmed canonical symbol.
-  */
 
   let candidate =
     primary;
@@ -1298,12 +1269,6 @@ function resolveSymbolIdentity(
     candidate =
       proposedBase;
   }
-
-  /*
-    If the exact ticker exists from a fallback provider
-    but no canonical base could be independently verified,
-    leave it untouched.
-  */
 
   if (
     exactMetadata
@@ -1495,7 +1460,7 @@ async function loadOfficialSymbolsMap() {
         30000,
         {
           'User-Agent':
-            'Mozilla/5.0 NOMAD-Invest/0.6.1',
+            'Mozilla/5.0 NOMAD-Invest/0.6.2',
 
           Referer:
             `${PSX_DPS_BASE}/`,
@@ -1653,16 +1618,6 @@ async function enrichFromEligibleScrips(
 async function enrichFromAllShareIndex(
   map
 ) {
-  /*
-    ALLSHR is useful because it provides a much broader
-    official symbol -> company-name mapping than the
-    earlier eligible-scrip source alone.
-
-    Some rows can themselves include temporary X-statuses.
-    We first preserve them as raw metadata. Canonicalization
-    is performed later against confirmed base symbols.
-  */
-
   try {
     const html =
       await fetchText(
@@ -1720,11 +1675,6 @@ async function enrichFromAllShareIndex(
         ) {
           continue;
         }
-
-        /*
-          Do not declare these index-row tickers canonical
-          by themselves because they may include XD/XB.
-        */
 
         mergeCompanyMetadata(
           map,
@@ -1894,21 +1844,6 @@ async function enrichFromFallbackMetadata(
 function reconcileStatusMetadata(
   map
 ) {
-  /*
-    Second pass:
-
-    A current-market/status symbol may have a better
-    company name from ALLSHR or another source.
-
-    Example:
-      map may contain LUCK (canonical)
-      and LUCKXD (non-canonical with full name).
-
-    Transfer useful metadata to the canonical entry
-    without converting the status symbol into a canonical
-    company identity.
-  */
-
   const entries =
     [...map.entries()];
 
@@ -3823,6 +3758,636 @@ async function loadPSXMarket() {
   };
 
   return result;
+}
+
+/* =========================================================
+   METADATA AUDIT - BUILD 0.6.2
+========================================================= */
+
+function metadataNameResolved(
+  stock
+) {
+  const name =
+    String(
+      stock?.companyName ||
+      ''
+    ).trim();
+
+  if (!name) {
+    return false;
+  }
+
+  const symbol =
+    normalizeSymbol(
+      stock?.symbol
+    );
+
+  const trading =
+    normalizeSymbol(
+      stock?.tradingSymbol
+    );
+
+  const normalizedName =
+    normalizeSymbol(
+      name
+    );
+
+  if (
+    normalizedName ===
+      symbol ||
+    normalizedName ===
+      trading
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+function metadataSectorResolved(
+  stock
+) {
+  const sector =
+    String(
+      stock?.sector ||
+      ''
+    ).trim();
+
+  return Boolean(
+    sector &&
+    sector.toUpperCase() !==
+      'UNKNOWN'
+  );
+}
+
+function containsAny(
+  text,
+  expressions
+) {
+  return expressions.some(
+    expression =>
+      expression.test(
+        text
+      )
+  );
+}
+
+function classifyInstrumentForAudit(
+  stock
+) {
+  const symbol =
+    normalizeSymbol(
+      stock.symbol
+    );
+
+  const marketSymbol =
+    normalizeSymbol(
+      stock.tradingSymbol
+    );
+
+  const name =
+    String(
+      stock.companyName ||
+      ''
+    ).trim();
+
+  const sector =
+    String(
+      stock.sector ||
+      ''
+    ).trim();
+
+  const listedIn =
+    String(
+      stock.listedIn ||
+      ''
+    ).trim();
+
+  const nameResolved =
+    metadataNameResolved(
+      stock
+    );
+
+  const sectorResolved =
+    metadataSectorResolved(
+      stock
+    );
+
+  const searchable =
+    [
+      symbol,
+      marketSymbol,
+      name,
+      sector,
+      listedIn
+    ]
+      .join(' ')
+      .toUpperCase();
+
+  let instrumentType =
+    'ORDINARY_OR_UNCLASSIFIED';
+
+  let instrumentLabel =
+    'Ordinary / unclassified';
+
+  let classificationReason =
+    'No strong special-security marker was detected.';
+
+  let classificationConfidence =
+    'medium';
+
+  if (
+    containsAny(
+      searchable,
+      [
+        /\bREAL ESTATE INVESTMENT TRUST\b/,
+        /\bREIT\b/
+      ]
+    )
+  ) {
+    instrumentType =
+      'REIT';
+
+    instrumentLabel =
+      'REIT';
+
+    classificationReason =
+      'Name or sector contains a REIT marker.';
+
+    classificationConfidence =
+      'high';
+  } else if (
+    containsAny(
+      searchable,
+      [
+        /\bEXCHANGE TRADED FUND\b/,
+        /\bETF\b/
+      ]
+    )
+  ) {
+    instrumentType =
+      'ETF';
+
+    instrumentLabel =
+      'ETF';
+
+    classificationReason =
+      'Name or sector contains an ETF marker.';
+
+    classificationConfidence =
+      'high';
+  } else if (
+    containsAny(
+      searchable,
+      [
+        /\bMUTUAL FUND\b/,
+        /\bCLOSED END FUND\b/,
+        /\bFUND\b/
+      ]
+    )
+  ) {
+    instrumentType =
+      'FUND';
+
+    instrumentLabel =
+      'Fund';
+
+    classificationReason =
+      'Name or sector contains a fund marker.';
+
+    classificationConfidence =
+      'medium';
+  } else if (
+    containsAny(
+      searchable,
+      [
+        /\bMODARABA\b/
+      ]
+    )
+  ) {
+    instrumentType =
+      'MODARABA';
+
+    instrumentLabel =
+      'Modaraba';
+
+    classificationReason =
+      'Name or sector identifies a Modaraba.';
+
+    classificationConfidence =
+      'high';
+  } else if (
+    containsAny(
+      searchable,
+      [
+        /\bSUKUK\b/,
+        /\bTERM FINANCE CERTIFICATE\b/,
+        /\bTFC\b/,
+        /\bBOND\b/,
+        /\bDEBT\b/
+      ]
+    )
+  ) {
+    instrumentType =
+      'DEBT_OR_SUKUK';
+
+    instrumentLabel =
+      'Debt / Sukuk';
+
+    classificationReason =
+      'Name, sector or listing field contains a debt-security marker.';
+
+    classificationConfidence =
+      'high';
+  } else if (
+    containsAny(
+      searchable,
+      [
+        /\bRIGHT ISSUE\b/,
+        /\bRIGHTS ISSUE\b/,
+        /\bRIGHTS\b/,
+        /\bENTITLEMENT\b/
+      ]
+    )
+  ) {
+    instrumentType =
+      'RIGHTS_OR_ENTITLEMENT';
+
+    instrumentLabel =
+      'Rights / entitlement';
+
+    classificationReason =
+      'Name or listing information contains a rights or entitlement marker.';
+
+    classificationConfidence =
+      'high';
+  } else if (
+    !nameResolved &&
+    /R\d*$/.test(
+      symbol
+    )
+  ) {
+    instrumentType =
+      'POSSIBLE_RIGHTS_OR_ENTITLEMENT';
+
+    instrumentLabel =
+      'Possible rights / entitlement';
+
+    classificationReason =
+      'Unresolved symbol ends in R or R plus digits. This is only a diagnostic hint and is not treated as confirmed.';
+
+    classificationConfidence =
+      'low';
+  } else if (
+    containsAny(
+      searchable,
+      [
+        /\bPREFERENCE\b/,
+        /\bPREFERRED\b/,
+        /\bPREF\b/
+      ]
+    )
+  ) {
+    instrumentType =
+      'PREFERENCE_OR_CLASS';
+
+    instrumentLabel =
+      'Preference / special class';
+
+    classificationReason =
+      'Name or listing information contains a preference-security marker.';
+
+    classificationConfidence =
+      'high';
+  }
+
+  const hasSpecialClassification =
+    instrumentType !==
+    'ORDINARY_OR_UNCLASSIFIED';
+
+  let issueType =
+    null;
+
+  let issueLabel =
+    null;
+
+  if (
+    !nameResolved &&
+    !sectorResolved
+  ) {
+    issueType =
+      'MISSING_NAME_AND_SECTOR';
+
+    issueLabel =
+      'Name + sector missing';
+  } else if (
+    !nameResolved
+  ) {
+    issueType =
+      'MISSING_NAME';
+
+    issueLabel =
+      'Company name missing';
+  } else if (
+    !sectorResolved
+  ) {
+    issueType =
+      'MISSING_SECTOR';
+
+    issueLabel =
+      'Sector missing';
+  }
+
+  let bucket =
+    null;
+
+  let bucketLabel =
+    null;
+
+  let auditReason =
+    '';
+
+  if (
+    issueType
+  ) {
+    if (
+      hasSpecialClassification
+    ) {
+      bucket =
+        'LIKELY_SPECIAL_INSTRUMENT';
+
+      bucketLabel =
+        'Likely special instrument';
+
+      auditReason =
+        issueLabel +
+        '. ' +
+        classificationReason;
+    } else if (
+      nameResolved ||
+      sectorResolved
+    ) {
+      bucket =
+        'LIKELY_NORMAL_COMPANY_MISSING_METADATA';
+
+      bucketLabel =
+        'Likely company metadata gap';
+
+      auditReason =
+        issueLabel +
+        '. Some identity metadata is already resolved, so this is likely a normal listed security with incomplete metadata.';
+    } else {
+      bucket =
+        'UNRESOLVED';
+
+      bucketLabel =
+        'Unresolved';
+
+      auditReason =
+        'Neither company name nor sector is reliably resolved and no strong special-security marker was detected. NOMAD should not guess this identity.';
+    }
+  }
+
+  if (
+    stock.normalizedSymbol &&
+    issueType
+  ) {
+    auditReason +=
+      ' A PSX status symbol was normalized successfully, but metadata is still incomplete.';
+  }
+
+  return {
+    symbol,
+
+    marketSymbol:
+      marketSymbol ||
+      symbol,
+
+    rawSymbol:
+      stock.rawSymbol ||
+      marketSymbol ||
+      symbol,
+
+    companyName:
+      name,
+
+    sector,
+
+    listedIn,
+
+    statusCodes:
+      Array.isArray(
+        stock.statusCodes
+      )
+        ? stock.statusCodes
+        : [],
+
+    normalizedStatus:
+      Boolean(
+        stock.normalizedSymbol
+      ),
+
+    nameResolved,
+
+    sectorResolved,
+
+    instrumentType,
+
+    instrumentLabel,
+
+    classificationReason,
+
+    classificationConfidence,
+
+    issueType,
+
+    issueLabel,
+
+    bucket,
+
+    bucketLabel,
+
+    auditReason
+  };
+}
+
+function countBy(
+  rows,
+  key
+) {
+  const counts = {};
+
+  for (
+    const row
+    of rows
+  ) {
+    const value =
+      row?.[key];
+
+    if (!value) {
+      continue;
+    }
+
+    counts[value] =
+      (
+        counts[value] ||
+        0
+      ) +
+      1;
+  }
+
+  return counts;
+}
+
+async function getMetadataAudit() {
+  if (
+    metadataAuditCache &&
+    Date.now() -
+      metadataAuditCache.fetchedAt <
+      10 *
+      60 *
+      1000
+  ) {
+    return metadataAuditCache.data;
+  }
+
+  const market =
+    await loadPSXMarket();
+
+  const classified =
+    market.stocks.map(
+      classifyInstrumentForAudit
+    );
+
+  const issues =
+    classified.filter(
+      row =>
+        Boolean(
+          row.issueType
+        )
+    );
+
+  const specialInstruments =
+    classified.filter(
+      row =>
+        row.instrumentType !==
+        'ORDINARY_OR_UNCLASSIFIED'
+    );
+
+  const likelyNormalCompanyIssues =
+    issues.filter(
+      row =>
+        row.bucket ===
+        'LIKELY_NORMAL_COMPANY_MISSING_METADATA'
+    );
+
+  const likelySpecialIssues =
+    issues.filter(
+      row =>
+        row.bucket ===
+        'LIKELY_SPECIAL_INSTRUMENT'
+    );
+
+  const unresolvedIssues =
+    issues.filter(
+      row =>
+        row.bucket ===
+        'UNRESOLVED'
+    );
+
+  const namesResolved =
+    classified.filter(
+      row =>
+        row.nameResolved
+    ).length;
+
+  const sectorsResolved =
+    classified.filter(
+      row =>
+        row.sectorResolved
+    ).length;
+
+  const data = {
+    version:
+      VERSION,
+
+    generatedAt:
+      new Date()
+        .toISOString(),
+
+    marketAsOf:
+      market.asOf,
+
+    mode:
+      'READ_ONLY_DIAGNOSTIC',
+
+    summary: {
+      totalCanonicalSecurities:
+        classified.length,
+
+      namesResolved,
+
+      namesMissing:
+        classified.length -
+        namesResolved,
+
+      sectorsResolved,
+
+      sectorsMissing:
+        classified.length -
+        sectorsResolved,
+
+      statusSymbolsNormalized:
+        classified.filter(
+          row =>
+            row.normalizedStatus
+        ).length,
+
+      totalMetadataIssues:
+        issues.length,
+
+      likelyNormalCompaniesMissingMetadata:
+        likelyNormalCompanyIssues.length,
+
+      likelySpecialInstrumentIssues:
+        likelySpecialIssues.length,
+
+      unresolved:
+        unresolvedIssues.length,
+
+      totalSpecialInstrumentsDetected:
+        specialInstruments.length
+    },
+
+    issueBuckets:
+      countBy(
+        issues,
+        'bucket'
+      ),
+
+    issueTypes:
+      countBy(
+        issues,
+        'issueType'
+      ),
+
+    instrumentTypes:
+      countBy(
+        specialInstruments,
+        'instrumentType'
+      ),
+
+    issues
+  };
+
+  metadataAuditCache = {
+    fetchedAt:
+      Date.now(),
+
+    data
+  };
+
+  return data;
 }
 
 /* =========================================================
@@ -6746,6 +7311,9 @@ async function handler(
           symbolNormalization:
             'VALIDATED_CANONICAL_STATUS_SEPARATION',
 
+          metadataAudit:
+            'READ_ONLY_DIAGNOSTIC',
+
           fundamentalsProvider:
             'PSX Data Portal company page',
 
@@ -6770,6 +7338,18 @@ async function handler(
           tradeExecution:
             false
         }
+      );
+    }
+
+    if (
+      request.method ===
+        'GET' &&
+      action ===
+        'metadata-audit'
+    ) {
+      return sendJSON(
+        response,
+        await getMetadataAudit()
       );
     }
 
@@ -7144,6 +7724,15 @@ select {
   margin: 18px 0;
 }
 
+.auditFilters {
+  display: grid;
+  grid-template-columns:
+    minmax(260px,2fr)
+    minmax(240px,1fr);
+  gap: 12px;
+  margin: 18px 0;
+}
+
 table {
   width: 100%;
   border-collapse: collapse;
@@ -7262,6 +7851,38 @@ tbody tr:hover {
   font-size: 11px;
   font-weight: 700;
   border: 1px solid #f0d39e;
+}
+
+.auditPill {
+  display: inline-block;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: #eef3f6;
+  color: #44596b;
+  font-size: 11px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.auditPill.warning {
+  background: #fff0d6;
+  color: #865b12;
+}
+
+.auditPill.danger {
+  background: #fdecec;
+  color: #a72a2a;
+}
+
+.auditPill.info {
+  background: #eaf3f8;
+  color: #28536c;
+}
+
+.auditReason {
+  min-width: 320px;
+  line-height: 1.45;
+  color: #53697b;
 }
 
 .summaryGrid {
@@ -7762,7 +8383,8 @@ pre {
     display: block;
   }
 
-  .filters {
+  .filters,
+  .auditFilters {
     grid-template-columns: 1fr;
   }
 
@@ -7814,8 +8436,8 @@ Build ${VERSION}
 
 <p class="notice">
 
-Market, company metadata, fundamentals, symbol normalization
-and deterministic technical analysis are connected.
+Market, company metadata, fundamentals, symbol normalization,
+metadata auditing and deterministic technical analysis are connected.
 
 Predictions and investment recommendations remain disabled
 until their models are built and validated.
@@ -8017,6 +8639,115 @@ Next
 
 </section>
 
+<section
+  class="card"
+  id="metadataAuditSection"
+>
+
+<h2>
+Metadata Audit
+</h2>
+
+<p class="muted">
+Read-only diagnostic. This checks which PSX securities still have incomplete company-name or sector metadata. It does not modify any market data.
+</p>
+
+<div class="actions">
+
+<button id="runMetadataAudit">
+Run metadata audit
+</button>
+
+</div>
+
+<div id="metadataAuditSummary"></div>
+
+<div
+  id="metadataAuditControls"
+  style="display:none"
+>
+
+<div class="auditFilters">
+
+<div>
+
+<label>
+Search audit
+</label>
+
+<input
+  id="metadataAuditSearch"
+  type="search"
+  placeholder="Symbol, company, sector, market symbol or reason"
+>
+
+</div>
+
+<div>
+
+<label>
+Issue category
+</label>
+
+<select id="metadataAuditCategory">
+
+<option value="">
+All metadata issues
+</option>
+
+<option value="LIKELY_NORMAL_COMPANY_MISSING_METADATA">
+Likely company metadata gaps
+</option>
+
+<option value="LIKELY_SPECIAL_INSTRUMENT">
+Likely special instruments
+</option>
+
+<option value="UNRESOLVED">
+Unresolved
+</option>
+
+</select>
+
+</div>
+
+</div>
+
+<p
+  id="metadataAuditInfo"
+  class="muted"
+></p>
+
+<div
+  id="metadataAuditTable"
+  class="scroll"
+></div>
+
+<div class="pagination">
+
+<div
+  id="metadataAuditPageInfo"
+  class="muted"
+></div>
+
+<div class="paginationControls">
+
+<button id="metadataAuditPrevious">
+Previous
+</button>
+
+<button id="metadataAuditNext">
+Next
+</button>
+
+</div>
+
+</div>
+
+</div>
+
+</section>
+
 </main>
 
 <script>
@@ -8032,6 +8763,13 @@ let marketRows = [];
 let currentPage = 1;
 
 const PAGE_SIZE = 50;
+
+let metadataAuditRows = [];
+
+let metadataAuditPage = 1;
+
+const METADATA_AUDIT_PAGE_SIZE =
+  50;
 
 let liveRefreshTimer = null;
 
@@ -10364,40 +11102,34 @@ function renderLiveChart(
     result
   );
 
-  updateSelectedCompany(
-    {
-      symbol:
-        result.symbol,
+  const selectedStock =
+    marketRows.find(
+      row =>
+        row.symbol ===
+        result.symbol
+    );
 
-      identity:
-        result.identity,
+  if (
+    selectedStock
+  ) {
+    updateSelectedCompany(
+      {
+        symbol:
+          result.symbol,
 
-      company:
-        (
-          marketRows.find(
-            row =>
-              row.symbol ===
-              result.symbol
-          )
-            ? {
-                name:
-                  marketRows.find(
-                    row =>
-                      row.symbol ===
-                      result.symbol
-                  ).companyName,
+        identity:
+          result.identity,
 
-                sector:
-                  marketRows.find(
-                    row =>
-                      row.symbol ===
-                      result.symbol
-                  ).sector
-              }
-            : null
-        )
-    }
-  );
+        company: {
+          name:
+            selectedStock.companyName,
+
+          sector:
+            selectedStock.sector
+        }
+      }
+    );
+  }
 
   const stateNote =
     result.feedState ===
@@ -11085,6 +11817,407 @@ function populateSectors() {
           '</option>'
       )
         .join('');
+}
+
+/* =========================================================
+   METADATA AUDIT UI
+========================================================= */
+
+function auditBucketClass(
+  bucket
+) {
+  if (
+    bucket ===
+    'UNRESOLVED'
+  ) {
+    return 'danger';
+  }
+
+  if (
+    bucket ===
+    'LIKELY_SPECIAL_INSTRUMENT'
+  ) {
+    return 'warning';
+  }
+
+  return 'info';
+}
+
+function renderMetadataAuditSummary(
+  result
+) {
+  const summary =
+    result.summary ||
+    {};
+
+  $('metadataAuditSummary')
+    .innerHTML =
+      '<div class="summaryGrid">' +
+
+      metricCard(
+        'Canonical securities',
+        formatNumber(
+          summary.totalCanonicalSecurities,
+          0
+        )
+      ) +
+
+      metricCard(
+        'Names resolved',
+        formatNumber(
+          summary.namesResolved,
+          0
+        ),
+        formatNumber(
+          summary.namesMissing,
+          0
+        ) +
+        ' missing'
+      ) +
+
+      metricCard(
+        'Sectors resolved',
+        formatNumber(
+          summary.sectorsResolved,
+          0
+        ),
+        formatNumber(
+          summary.sectorsMissing,
+          0
+        ) +
+        ' missing'
+      ) +
+
+      metricCard(
+        'Status symbols normalized',
+        formatNumber(
+          summary.statusSymbolsNormalized,
+          0
+        )
+      ) +
+
+      metricCard(
+        'Likely company gaps',
+        formatNumber(
+          summary.likelyNormalCompaniesMissingMetadata,
+          0
+        )
+      ) +
+
+      metricCard(
+        'Likely special instruments',
+        formatNumber(
+          summary.likelySpecialInstrumentIssues,
+          0
+        )
+      ) +
+
+      metricCard(
+        'Unresolved',
+        '<span class="' +
+        (
+          Number(
+            summary.unresolved
+          ) > 0
+            ? 'negative'
+            : 'positive'
+        ) +
+        '">' +
+        formatNumber(
+          summary.unresolved,
+          0
+        ) +
+        '</span>'
+      ) +
+
+      '</div>' +
+
+      '<div class="infoBox">' +
+      'This audit does not change metadata. Low-confidence classifications are diagnostic hints only. Unresolved securities remain unresolved rather than being guessed.' +
+      '</div>';
+}
+
+function getFilteredMetadataAuditRows() {
+  const query =
+    $('metadataAuditSearch')
+      .value
+      .trim()
+      .toLowerCase();
+
+  const category =
+    $('metadataAuditCategory')
+      .value;
+
+  return metadataAuditRows.filter(
+    row => {
+      const searchable =
+        (
+          row.symbol +
+          ' ' +
+          row.marketSymbol +
+          ' ' +
+          row.rawSymbol +
+          ' ' +
+          row.companyName +
+          ' ' +
+          row.sector +
+          ' ' +
+          row.instrumentLabel +
+          ' ' +
+          row.issueLabel +
+          ' ' +
+          row.auditReason +
+          ' ' +
+          (
+            row.statusCodes ||
+            []
+          ).join(' ')
+        )
+          .toLowerCase();
+
+      return (
+        searchable.includes(
+          query
+        ) &&
+        (
+          !category ||
+          row.bucket ===
+            category
+        )
+      );
+    }
+  );
+}
+
+function renderMetadataAuditTable() {
+  const rows =
+    getFilteredMetadataAuditRows();
+
+  const pageCount =
+    Math.max(
+      1,
+      Math.ceil(
+        rows.length /
+        METADATA_AUDIT_PAGE_SIZE
+      )
+    );
+
+  if (
+    metadataAuditPage >
+    pageCount
+  ) {
+    metadataAuditPage =
+      pageCount;
+  }
+
+  const start =
+    (
+      metadataAuditPage -
+      1
+    ) *
+    METADATA_AUDIT_PAGE_SIZE;
+
+  const pageRows =
+    rows.slice(
+      start,
+      start +
+      METADATA_AUDIT_PAGE_SIZE
+    );
+
+  $('metadataAuditInfo')
+    .textContent =
+      rows.length +
+      ' metadata issues after current filters.';
+
+  if (
+    !pageRows.length
+  ) {
+    $('metadataAuditTable')
+      .innerHTML =
+        '<div class="emptyState">' +
+        'No metadata issues match this filter.' +
+        '</div>';
+
+    $('metadataAuditPageInfo')
+      .textContent =
+        '';
+
+    $('metadataAuditPrevious')
+      .disabled =
+        true;
+
+    $('metadataAuditNext')
+      .disabled =
+        true;
+
+    return;
+  }
+
+  $('metadataAuditTable')
+    .innerHTML =
+      '<table>' +
+
+      '<thead>' +
+
+      '<tr>' +
+
+      '<th>Symbol</th>' +
+      '<th>Market symbol</th>' +
+      '<th>Company</th>' +
+      '<th>Sector</th>' +
+      '<th>Issue</th>' +
+      '<th>Instrument</th>' +
+      '<th>Confidence</th>' +
+      '<th>Why flagged</th>' +
+
+      '</tr>' +
+
+      '</thead>' +
+
+      '<tbody>' +
+
+      pageRows.map(
+        row =>
+          '<tr>' +
+
+          '<td class="symbol">' +
+
+          escapeHtml(
+            row.symbol
+          ) +
+
+          (
+            row.statusCodes?.length
+              ? (
+                  ' ' +
+                  statusPills(
+                    row.statusCodes
+                  )
+                )
+              : ''
+          ) +
+
+          '</td>' +
+
+          '<td>' +
+          escapeHtml(
+            row.marketSymbol ||
+            row.symbol
+          ) +
+          '</td>' +
+
+          '<td>' +
+          (
+            row.nameResolved
+              ? escapeHtml(
+                  row.companyName
+                )
+              : (
+                  '<span class="negative">' +
+                  'Unresolved' +
+                  '</span>'
+                )
+          ) +
+          '</td>' +
+
+          '<td>' +
+          (
+            row.sectorResolved
+              ? escapeHtml(
+                  row.sector
+                )
+              : (
+                  '<span class="negative">' +
+                  'Unknown' +
+                  '</span>'
+                )
+          ) +
+          '</td>' +
+
+          '<td>' +
+
+          '<span class="auditPill ' +
+          auditBucketClass(
+            row.bucket
+          ) +
+          '">' +
+
+          escapeHtml(
+            row.bucketLabel ||
+            row.issueLabel ||
+            'Issue'
+          ) +
+
+          '</span>' +
+
+          '<div class="symbolSub">' +
+
+          escapeHtml(
+            row.issueLabel ||
+            ''
+          ) +
+
+          '</div>' +
+
+          '</td>' +
+
+          '<td>' +
+          escapeHtml(
+            row.instrumentLabel
+          ) +
+          '</td>' +
+
+          '<td>' +
+          escapeHtml(
+            row.classificationConfidence
+          ) +
+          '</td>' +
+
+          '<td class="auditReason">' +
+          escapeHtml(
+            row.auditReason
+          ) +
+          '</td>' +
+
+          '</tr>'
+      )
+        .join('') +
+
+      '</tbody>' +
+
+      '</table>';
+
+  const first =
+    start + 1;
+
+  const last =
+    Math.min(
+      start +
+      METADATA_AUDIT_PAGE_SIZE,
+      rows.length
+    );
+
+  $('metadataAuditPageInfo')
+    .textContent =
+      first +
+      '-' +
+      last +
+      ' of ' +
+      rows.length +
+      ' issues | Page ' +
+      metadataAuditPage +
+      ' of ' +
+      pageCount;
+
+  $('metadataAuditPrevious')
+    .disabled =
+      metadataAuditPage <=
+      1;
+
+  $('metadataAuditNext')
+    .disabled =
+      metadataAuditPage >=
+      pageCount;
 }
 
 /* =========================================================
@@ -12879,6 +14012,124 @@ $('loadMarket')
     };
 
 /* =========================================================
+   METADATA AUDIT BUTTON
+========================================================= */
+
+$('runMetadataAudit')
+  .onclick =
+    async () => {
+      $('error')
+        .textContent =
+          '';
+
+      $('runMetadataAudit')
+        .disabled =
+          true;
+
+      $('metadataAuditSummary')
+        .innerHTML =
+          '<p class="muted">' +
+          'Running read-only metadata audit...' +
+          '</p>';
+
+      try {
+        const result =
+          await api(
+            'metadata-audit'
+          );
+
+        metadataAuditRows =
+          result.issues ||
+          [];
+
+        metadataAuditPage =
+          1;
+
+        renderMetadataAuditSummary(
+          result
+        );
+
+        $('metadataAuditControls')
+          .style
+          .display =
+            'block';
+
+        $('metadataAuditSearch')
+          .value =
+            '';
+
+        $('metadataAuditCategory')
+          .value =
+            '';
+
+        renderMetadataAuditTable();
+      } catch (error) {
+        $('metadataAuditSummary')
+          .innerHTML =
+            '';
+
+        $('error')
+          .textContent =
+            error.message;
+      } finally {
+        $('runMetadataAudit')
+          .disabled =
+            false;
+      }
+    };
+
+$('metadataAuditSearch')
+  .oninput =
+    () => {
+      metadataAuditPage =
+        1;
+
+      renderMetadataAuditTable();
+    };
+
+$('metadataAuditCategory')
+  .onchange =
+    () => {
+      metadataAuditPage =
+        1;
+
+      renderMetadataAuditTable();
+    };
+
+$('metadataAuditPrevious')
+  .onclick =
+    () => {
+      if (
+        metadataAuditPage >
+        1
+      ) {
+        metadataAuditPage--;
+
+        renderMetadataAuditTable();
+      }
+    };
+
+$('metadataAuditNext')
+  .onclick =
+    () => {
+      const pageCount =
+        Math.ceil(
+          getFilteredMetadataAuditRows()
+            .length /
+          METADATA_AUDIT_PAGE_SIZE
+        );
+
+      if (
+        metadataAuditPage <
+        pageCount
+      ) {
+        metadataAuditPage++;
+
+        renderMetadataAuditTable();
+      }
+    };
+
+/* =========================================================
    FILTER EVENTS
 ========================================================= */
 
@@ -13386,6 +14637,7 @@ api(
           'Market: connected | ' +
           'Company metadata: connected | ' +
           'Symbol normalization: validated canonical mapping | ' +
+          'Metadata audit: read-only | ' +
           'pyPSX: ' +
           (
             result.pyPSXConfigured
@@ -13421,11 +14673,24 @@ module.exports =
   handler;
 
 if (require.main === module) {
-  const port = Number(process.env.PORT || 3000);
+  const port =
+    Number(
+      process.env.PORT ||
+      3000
+    );
 
   http
-    .createServer(handler)
-    .listen(port, '127.0.0.1', () => {
-      console.log('NOMAD Invest running at http://127.0.0.1:' + port);
-    });
+    .createServer(
+      handler
+    )
+    .listen(
+      port,
+      '127.0.0.1',
+      () => {
+        console.log(
+          'NOMAD Invest running at http://127.0.0.1:' +
+          port
+        );
+      }
+    );
 }
