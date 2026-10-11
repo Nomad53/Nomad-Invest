@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.8.3';
+const VERSION = '0.8.3.1';
 
 
 const SUPABASE_URL =
@@ -3877,6 +3877,7 @@ function parseMarketWatchRows(
       rowMatch[1];
 
     const fields = {};
+    const cellTexts = [];
 
     const cellRegex =
       /<(?:td|th)\b([^>]*)>([\s\S]*?)<\/(?:td|th)>/gi;
@@ -3894,6 +3895,15 @@ function parseMarketWatchRows(
       const attributes =
         cellMatch[1] ||
         '';
+
+      const text =
+        cleanHtmlCell(
+          cellMatch[2]
+        );
+
+      cellTexts.push(
+        text
+      );
 
       const nameMatch =
         attributes.match(
@@ -3917,9 +3927,38 @@ function parseMarketWatchRows(
       }
 
       fields[key] =
-        cleanHtmlCell(
-          cellMatch[2]
-        );
+        text;
+    }
+
+    // PSX has served both data-name cells and ordinary table cells over time.
+    // If the attributes are absent, fall back to the documented column order.
+    if (
+      !fields.symbol &&
+      cellTexts.length >= 9
+    ) {
+      if (cellTexts.length >= 11) {
+        fields.symbol = cellTexts[0];
+        fields.sector = cellTexts[1];
+        fields['listed in'] = cellTexts[2];
+        fields.ldcp = cellTexts[3];
+        fields.open = cellTexts[4];
+        fields.high = cellTexts[5];
+        fields.low = cellTexts[6];
+        fields.current = cellTexts[7];
+        fields.change = cellTexts[8];
+        fields['change (%)'] = cellTexts[9];
+        fields.volume = cellTexts[10];
+      } else {
+        fields.symbol = cellTexts[0];
+        fields.ldcp = cellTexts[1];
+        fields.open = cellTexts[2];
+        fields.high = cellTexts[3];
+        fields.low = cellTexts[4];
+        fields.current = cellTexts[5];
+        fields.change = cellTexts[6];
+        fields['change (%)'] = cellTexts[7];
+        fields.volume = cellTexts[8];
+      }
     }
 
     const symbol =
@@ -3983,7 +4022,10 @@ function parseMarketWatchRows(
         safeNumber(
           fields.percentchange ??
           fields['change (%)'] ??
-          fields['change%']
+          fields['change%'] ??
+          fields['change pct'] ??
+          fields['change percentage'] ??
+          fields['% change']
         ),
 
       volume:
@@ -6974,6 +7016,17 @@ function normalizeScreenerRow(
     change1yPct:
       safeNumber(
         row.change_1y_pct
+      ),
+
+    // Current-session change is used as a fallback when the official
+    // Market Watch table is temporarily unavailable.
+    dayChangePct:
+      safeNumber(
+        row.change_pct ??
+        row.change_percent ??
+        row.change_percentage ??
+        row['change (%)'] ??
+        row['change%']
       ),
 
     asOf:
@@ -12446,7 +12499,7 @@ async function supabaseRest(
       'application/json',
 
     'User-Agent':
-      'NOMAD-Invest-Server/0.8.3'
+      'NOMAD-Invest-Server/0.8.3.1'
   };
 
   if (
@@ -14797,7 +14850,7 @@ async function readJsonRequestBody(
 }
 
 /* =========================================================
-   DECISION LAB - BUILD 0.8.3
+   DECISION LAB - BUILD 0.8.3.1
    Experimental shadow engine. No automatic trading.
 ========================================================= */
 
@@ -14865,6 +14918,13 @@ const DECISION_RISK_POLICIES = {
     maxAllocations: 4
   }
 };
+
+
+const DECISION_FUNDAMENTAL_CACHE_FRESH_MS =
+  24 * 60 * 60 * 1000;
+
+const DECISION_FUNDAMENTAL_CACHE_FALLBACK_MS =
+  14 * 24 * 60 * 60 * 1000;
 
 function decisionClamp(
   value,
@@ -16078,7 +16138,7 @@ function decisionCandidateAction(
     riskPolicy.minDataQualityScore
   ) {
     return {
-      action: 'WAIT_DATA',
+      action: 'DATA_BLOCKED',
       reason:
         'Critical evidence coverage is below this risk profile\'s threshold.'
     };
@@ -16088,7 +16148,7 @@ function decisionCandidateAction(
     !candidate.fundamental?.available
   ) {
     return {
-      action: 'WAIT_DATA',
+      action: 'DATA_BLOCKED',
       reason:
         'NOMAD will not promote a new-buy candidate without structured company fundamentals.'
     };
@@ -16335,6 +16395,240 @@ async function decisionHistoricalContext(
   return {
     ...context,
     cacheState: 'fresh'
+  };
+}
+
+function decisionFundamentalCache(
+  memory
+) {
+  const cache =
+    memory?.fundamental_state
+      ?.decisionEvidence ||
+    null;
+
+  const cachedAt =
+    Date.parse(
+      cache?.cachedAt ||
+      ''
+    );
+
+  if (
+    !cache?.data?.available ||
+    !Number.isFinite(
+      cachedAt
+    )
+  ) {
+    return null;
+  }
+
+  return {
+    data:
+      cache.data,
+    cachedAt:
+      cache.cachedAt,
+    ageMs:
+      Math.max(
+        0,
+        Date.now() -
+          cachedAt
+      )
+  };
+}
+
+async function saveDecisionFundamentalCache(
+  symbol,
+  fundamentals,
+  memory
+) {
+  if (
+    !continuousMemoryConfigured() ||
+    !memory ||
+    !fundamentals?.available
+  ) {
+    return false;
+  }
+
+  const fundamentalState = {
+    ...(
+      memory.fundamental_state ||
+      {}
+    ),
+    decisionEvidence: {
+      cachedAt:
+        new Date()
+          .toISOString(),
+      source:
+        fundamentals.source ||
+        null,
+      sourceUrl:
+        fundamentals.sourceUrl ||
+        null,
+      data: {
+        symbol:
+          fundamentals.symbol ||
+          normalizeSymbol(
+            symbol
+          ),
+        company:
+          fundamentals.company ||
+          null,
+        source:
+          fundamentals.source ||
+          null,
+        sourceUrl:
+          fundamentals.sourceUrl ||
+          null,
+        fetchedAt:
+          fundamentals.fetchedAt ||
+          new Date()
+            .toISOString(),
+        valuation:
+          fundamentals.valuation ||
+          null,
+        annual:
+          fundamentals.annual ||
+          null,
+        quarterly:
+          fundamentals.quarterly ||
+          null,
+        ratios:
+          fundamentals.ratios ||
+          null,
+        available: true
+      }
+    }
+  };
+
+  try {
+    await supabaseRest(
+      'security_state?symbol=eq.' +
+        encodeURIComponent(
+          normalizeSymbol(
+            symbol
+          )
+        ),
+      {
+        method: 'PATCH',
+        prefer:
+          'return=minimal',
+        body: {
+          fundamental_state:
+            fundamentalState
+        }
+      }
+    );
+
+    memory.fundamental_state =
+      fundamentalState;
+
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function decisionLoadFundamentals(
+  row,
+  memoryMap
+) {
+  const symbol =
+    normalizeSymbol(
+      row.symbol
+    );
+
+  const memory =
+    memoryMap?.get(
+      symbol
+    ) ||
+    null;
+
+  const cache =
+    decisionFundamentalCache(
+      memory
+    );
+
+  if (
+    cache &&
+    cache.ageMs <=
+      DECISION_FUNDAMENTAL_CACHE_FRESH_MS
+  ) {
+    return {
+      fundamentals:
+        cache.data,
+      evidenceState:
+        'CACHE_FRESH',
+      cachedAt:
+        cache.cachedAt,
+      error: null
+    };
+  }
+
+  let fresh = null;
+  let freshError = null;
+
+  try {
+    fresh =
+      await decisionWithTimeout(
+        getFundamentals(
+          symbol
+        ),
+        18000,
+        symbol +
+          ' fundamentals'
+      );
+  } catch (error) {
+    freshError =
+      error.message ||
+      'Fundamental evidence unavailable.';
+  }
+
+  if (fresh?.available) {
+    await saveDecisionFundamentalCache(
+      symbol,
+      fresh,
+      memory
+    );
+
+    return {
+      fundamentals:
+        fresh,
+      evidenceState:
+        'LIVE',
+      cachedAt:
+        fresh.fetchedAt ||
+        new Date()
+          .toISOString(),
+      error: null
+    };
+  }
+
+  if (
+    cache &&
+    cache.ageMs <=
+      DECISION_FUNDAMENTAL_CACHE_FALLBACK_MS
+  ) {
+    return {
+      fundamentals:
+        cache.data,
+      evidenceState:
+        'CACHE_FALLBACK',
+      cachedAt:
+        cache.cachedAt,
+      error:
+        freshError ||
+        'Live fundamentals were unavailable; NOMAD used recent cached company evidence.'
+    };
+  }
+
+  return {
+    fundamentals:
+      fresh,
+    evidenceState:
+      'BLOCKED',
+    cachedAt: null,
+    error:
+      freshError ||
+      'Structured company fundamentals are unavailable.'
   };
 }
 
@@ -17015,7 +17309,7 @@ async function runDecisionLab(
       count + 1
     );
 
-    if (shortList.length >= 8) {
+    if (shortList.length >= 12) {
       break;
     }
   }
@@ -17188,48 +17482,46 @@ async function runDecisionLab(
 
   const deepShortList =
     historyReady
-      .slice(0, 4);
+      .slice(0, 6);
 
   const deepResults =
     await decisionMapWithConcurrency(
       deepShortList,
-      2,
+      3,
       async item => {
-        let fundamentals =
-          null;
+        const fundamentalEvidence =
+          await decisionLoadFundamentals(
+            item.row,
+            memoryMap
+          );
 
-        let fundamentalError =
-          null;
-
-        try {
-          fundamentals =
-            await decisionWithTimeout(
-              getFundamentals(
-                item.row.symbol
-              ),
-              9000,
-              item.row.symbol +
-              ' fundamentals'
-            );
-        } catch (error) {
-          fundamentalError =
-            error.message ||
-            'Fundamental evidence unavailable.';
-        }
+        const fundamentals =
+          fundamentalEvidence
+            .fundamentals;
 
         const fundamental =
           scoreDecisionFundamentals(
             fundamentals
           );
 
-        if (fundamentalError) {
+        fundamental.evidenceState =
+          fundamentalEvidence
+            .evidenceState;
+
+        fundamental.cachedAt =
+          fundamentalEvidence
+            .cachedAt;
+
+        if (
+          fundamentalEvidence.error
+        ) {
           fundamental.risks =
-            uniqueStrings([
+            uniqueTextValues([
               ...(
                 fundamental.risks ||
                 []
               ),
-              fundamentalError
+              fundamentalEvidence.error
             ]);
         }
 
@@ -17279,6 +17571,9 @@ async function runDecisionLab(
           historicalContext:
             item.historicalContext,
           fundamental,
+          fundamentalEvidenceState:
+            fundamentalEvidence
+              .evidenceState,
           valuation:
             item.valuation,
           entry:
@@ -17341,7 +17636,39 @@ async function runDecisionLab(
   let reason =
     'Cash remains a valid decision when the evidence or entry conditions are not strong enough.';
 
-  if (
+  const dataBlockedCount =
+    candidates.filter(
+      candidate =>
+        candidate.action ===
+          'DATA_BLOCKED'
+    ).length;
+
+  const decisionBlocked =
+    allocation.allocations.length === 0 &&
+    (
+      (
+        candidates.length > 0 &&
+        dataBlockedCount ===
+          candidates.length
+      ) ||
+      (
+        deepShortList.length > 0 &&
+        candidates.length === 0
+      ) ||
+      (
+        shortList.length > 0 &&
+        historyReady.length === 0
+      )
+    );
+
+  if (decisionBlocked) {
+    action =
+      'DATA_BLOCKED';
+    headline =
+      'Decision blocked — required evidence could not be completed.';
+    reason =
+      'This is a data/reliability failure, not an investment view. NOMAD did not convert missing evidence into a WAIT recommendation.';
+  } else if (
     allocation.allocations.length &&
     allocation.investedPct >= 75
   ) {
@@ -17463,7 +17790,9 @@ async function runDecisionLab(
       historicalAnalyzed:
         historyReady.length,
       deepAnalyzed:
-        candidates.length
+        candidates.length,
+      dataBlocked:
+        dataBlockedCount
     },
     decision: {
       action,
@@ -17498,7 +17827,18 @@ async function runDecisionLab(
       'SHADOW MODE: this model has not passed historical and forward validation for real-money use.',
       'Allocations are planning principals only. Brokerage, levies, taxes and execution slippage are not yet included.',
       'No order-execution capability exists. The user remains the final decision maker.',
-      'Current scoring rules are versioned experimental hypotheses and must earn promotion through recorded performance.'
+      'Current scoring rules are versioned experimental hypotheses and must earn promotion through recorded performance.',
+      ...(
+        candidates.some(
+          candidate =>
+            candidate.fundamentalEvidenceState ===
+              'CACHE_FALLBACK'
+        )
+          ? [
+              'At least one candidate used recent cached company fundamentals because the live PSX company evidence request was unavailable.'
+            ]
+          : []
+      )
     ]
   };
 
@@ -17515,6 +17855,28 @@ function runDecisionEngineSelfTests() {
     require(
       'node:assert/strict'
     );
+
+  const plainMarketRows =
+    parseMarketWatchRows(
+      '<table><tr><td>ABC</td><td>0801</td><td>ALLSHR</td><td>100</td><td>101</td><td>105</td><td>99</td><td>104</td><td>4</td><td>4.00%</td><td>1,250,000</td></tr></table>'
+    );
+
+  assert.equal(
+    plainMarketRows.length,
+    1
+  );
+
+  assert.equal(
+    plainMarketRows[0]
+      .symbol,
+    'ABC'
+  );
+
+  assert.equal(
+    plainMarketRows[0]
+      .changePct,
+    4
+  );
 
   const riskBalanced =
     DECISION_RISK_POLICIES
@@ -17618,7 +17980,7 @@ function runDecisionEngineSelfTests() {
         .long_term,
       riskBalanced
     ).action,
-    'WAIT_DATA'
+    'DATA_BLOCKED'
   );
 
   const allocation =
@@ -17685,7 +18047,7 @@ function runDecisionEngineSelfTests() {
 
 
 /* =========================================================
-   CONTINUOUS INTELLIGENCE SCANNER - BUILD 0.8.3
+   CONTINUOUS INTELLIGENCE SCANNER - BUILD 0.8.3.1
 ========================================================= */
 
 function scannerSecretConfigured() {
@@ -21147,7 +21509,7 @@ body > main > header {
 
 
 /* =========================================================
-   TRADING WORKSPACE + DECISION UI - BUILD 0.8.3
+   TRADING WORKSPACE + DECISION UI - BUILD 0.8.3.1
 ========================================================= */
 
 :root {
@@ -21666,6 +22028,11 @@ tbody tr:hover {
   color: #ee8a98;
 }
 
+.decisionActionTag.data_blocked {
+  background: #302811;
+  color: #e6c867;
+}
+
 .decisionMetaLine {
   margin-top: 8px;
   color: #667d94;
@@ -22084,7 +22451,7 @@ Build ${VERSION}
 Market, company metadata, fundamentals, symbol normalization,
 canonical universe identity, metadata, fundamentals and deterministic technical analysis are connected.
 
-Persistent intelligence memory and the market scanner are connected. Build 0.8.3 adds the first shadow decision engine; its outputs are recorded for validation but are not real-money eligible yet.
+Persistent intelligence memory and the market scanner are connected. Build 0.8.3.1 hardens the shadow decision engine; its outputs are recorded for validation but are not real-money eligible yet.
 
 </p>
 
@@ -22149,7 +22516,7 @@ Checking connection...
 <div><label>Risk</label><select id="decisionRisk"><option value="balanced">Balanced</option><option value="conservative">Conservative</option><option value="aggressive">Aggressive</option></select></div>
 </div>
 <button id="findBestOption" class="primaryWide">Find my best option</button>
-<div id="decisionResult" class="decisionResult">Build 0.8.3 runs an experimental shadow decision across the eligible PSX universe. It is deliberately not real-money eligible until the model earns validation.</div>
+<div id="decisionResult" class="decisionResult">Build 0.8.3.1 runs the hardened experimental shadow decision across the eligible PSX universe. It is deliberately not real-money eligible until the model earns validation.</div>
 </div>
 
 <div class="terminalCard attentionCardNew">
@@ -23274,7 +23641,7 @@ async function apiPost(
 
 
 /* =========================================================
-   APP NAVIGATION + DECISION CENTER - BUILD 0.8.3
+   APP NAVIGATION + DECISION CENTER - BUILD 0.8.3.1
 ========================================================= */
 
 function openAppPage(
@@ -31930,6 +32297,7 @@ function decisionActionLabel(
     STAGED_BUY: 'STAGED BUY',
     WAIT: 'WAIT',
     WAIT_DATA: 'WAIT / DATA',
+    DATA_BLOCKED: 'DATA BLOCKED',
     AVOID: 'AVOID',
     INVEST: 'INVEST',
     PARTIAL_INVEST: 'PARTIAL INVEST'
@@ -31993,7 +32361,7 @@ function renderShadowDecision(
       ''
     ) +
     '</div></div>' +
-    '<span>Evidence ' +
+    '<span>Evidence coverage ' +
     formatNumber(
       decision.evidenceStrength ||
       0,
@@ -32119,7 +32487,32 @@ function renderShadowDecision(
                 candidate.overallScore,
                 0
               ) +
-              '</strong><div class="decisionMinor">' +
+              '</strong><div class="decisionMinor">F ' +
+              formatNumber(
+                candidate.fundamental?.score,
+                0
+              ) +
+              ' · V ' +
+              formatNumber(
+                candidate.valuation?.score,
+                0
+              ) +
+              ' · Entry ' +
+              formatNumber(
+                candidate.entry?.score,
+                0
+              ) +
+              ' · Risk ' +
+              formatNumber(
+                candidate.risk?.score,
+                0
+              ) +
+              ' · Data ' +
+              formatNumber(
+                candidate.dataQuality?.score,
+                0
+              ) +
+              '</div><div class="decisionMinor">' +
               escapeHtml(
                 firstPositive
               ) +
