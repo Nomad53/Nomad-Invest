@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.8.4A';
+const VERSION = '0.8.4B';
 
 
 const SUPABASE_URL =
@@ -10888,12 +10888,12 @@ async function getHistory(
 ========================================================= */
 
 /* =========================================================
-   FINANCIAL ANALYST CORE - BUILD 0.8.4A
+   FINANCIAL ANALYST CORE - BUILD 0.8.4B
 
    IMPORTANT:
    - This layer normalizes and interprets evidence already returned by PSX.
    - It does not fabricate missing fields.
-   - It does not change BUY / WAIT / AVOID decisions in 0.8.4A.
+   - It now supplies evidence gates to the Decision Center, while the legacy score remains visible for validation.
    - Sector-specific interpretation is deliberately deferred when a generic
      accounting ratio could be misleading (for example, banks / insurers).
 ========================================================= */
@@ -11972,7 +11972,7 @@ function buildFinancialAnalystCore(
 
   return {
     version:
-      'FINANCIAL-ANALYST-0.8.4A',
+      'FINANCIAL-ANALYST-0.8.4B',
     mode:
       'SHADOW_ONLY',
     affectsDecision:
@@ -12041,8 +12041,8 @@ function buildFinancialAnalystCore(
       'This build only interprets financial rows that PSX already exposes through NOMAD\'s current company-page parser.',
       'Missing metrics remain missing; NOMAD does not infer zero values or manufacture financial evidence.',
       'Cash-flow, leverage and earnings-quality conclusions are limited when PSX does not expose matching rows.',
-      'Sector-specific accounting models are not yet implemented in 0.8.4A.',
-      'This shadow analyst output does not alter the existing 0.8.3.2 decision thresholds or allocations.'
+      'Sector-specific accounting models are not yet implemented in 0.8.4B.',
+      'This analyst output now gates Decision Center priority and allocation; the legacy score is retained as supporting evidence only.'
     ]
   };
 }
@@ -13778,7 +13778,7 @@ async function supabaseRest(
       'application/json',
 
     'User-Agent':
-      'NOMAD-Invest-Server/0.8.3.2'
+      'NOMAD-Invest-Server/0.8.4B'
   };
 
   if (
@@ -16129,7 +16129,7 @@ async function readJsonRequestBody(
 }
 
 /* =========================================================
-   DECISION LAB - BUILD 0.8.3.2
+   DECISION LAB + DECISION CENTER - BUILD 0.8.4B
    Experimental shadow engine. No automatic trading.
 ========================================================= */
 
@@ -16204,6 +16204,11 @@ const DECISION_FUNDAMENTAL_CACHE_FRESH_MS =
 
 const DECISION_FUNDAMENTAL_CACHE_FALLBACK_MS =
   14 * 24 * 60 * 60 * 1000;
+
+const DECISION_CENTER_SHORTLIST_LIMIT = 15;
+const DECISION_CENTER_DEEP_LIMIT = 10;
+const DECISION_CENTER_MIN_ANALYST_COVERAGE = 65;
+const DECISION_CENTER_MAX_DEPLOYMENT_PCT = 0.90;
 
 function decisionClamp(
   value,
@@ -17504,6 +17509,946 @@ function decisionCandidateAction(
   };
 }
 
+function decisionCenterAnalystGate(
+  candidate
+) {
+  const analyst =
+    candidate?.analystCore ||
+    null;
+
+  if (!analyst) {
+    return {
+      state: 'RESEARCH_REQUIRED',
+      reason:
+        'Financial Analyst evidence is unavailable. The stock remains visible, but NOMAD will not promote it to a validated buy.'
+    };
+  }
+
+  const coverage =
+    safeNumber(
+      analyst.coverage
+        ?.coreCoveragePct
+    ) ||
+    0;
+
+  const overall =
+    String(
+      analyst.overallFinancialView
+        ?.state ||
+      'UNRELIABLE'
+    );
+
+  const earnings =
+    String(
+      analyst.views
+        ?.earningsQuality
+        ?.state ||
+      'UNRELIABLE'
+    );
+
+  const cash =
+    String(
+      analyst.views
+        ?.cashFlowQuality
+        ?.state ||
+      'UNRELIABLE'
+    );
+
+  const balance =
+    String(
+      analyst.views
+        ?.balanceSheet
+        ?.state ||
+      'UNRELIABLE'
+    );
+
+  if (
+    analyst.company
+      ?.financialSector ===
+        true &&
+    (
+      earnings ===
+        'SECTOR_MODEL_REQUIRED' ||
+      cash ===
+        'SECTOR_MODEL_REQUIRED' ||
+      balance ===
+        'SECTOR_MODEL_REQUIRED'
+    )
+  ) {
+    return {
+      state: 'RESEARCH_REQUIRED',
+      reason:
+        'A financial-sector-specific analyst model is required before NOMAD can validate this stock for Priority 1.'
+    };
+  }
+
+  if (
+    overall === 'WEAK' ||
+    cash === 'WEAK'
+  ) {
+    return {
+      state: 'REJECT',
+      reason:
+        overall === 'WEAK'
+          ? 'The Financial Analyst currently classifies the company financial view as weak.'
+          : 'Cash-flow evidence is currently weak relative to reported earnings.'
+    };
+  }
+
+  if (
+    coverage < 45 ||
+    overall === 'UNRELIABLE'
+  ) {
+    return {
+      state: 'RESEARCH_REQUIRED',
+      reason:
+        'Core financial evidence is too incomplete for a dependable analyst verdict.'
+    };
+  }
+
+  if (
+    coverage <
+      DECISION_CENTER_MIN_ANALYST_COVERAGE ||
+    earnings === 'UNRELIABLE' ||
+    cash === 'UNRELIABLE' ||
+    balance === 'UNRELIABLE'
+  ) {
+    return {
+      state: 'RESEARCH_REQUIRED',
+      reason:
+        'The company is still visible, but one or more critical evidence areas are not independently validated.'
+    };
+  }
+
+  if (
+    earnings === 'QUESTIONABLE' ||
+    cash === 'QUESTIONABLE' ||
+    overall === 'MIXED'
+  ) {
+    return {
+      state: 'REVIEW',
+      reason:
+        'The evidence is usable, but earnings quality, cash conversion or the overall financial view still needs caution.'
+    };
+  }
+
+  if (
+    overall === 'GOOD' &&
+    earnings === 'ACCEPTABLE' &&
+    (
+      cash === 'STRONG' ||
+      cash === 'ACCEPTABLE'
+    ) &&
+    balance ===
+      'EVIDENCE_AVAILABLE'
+  ) {
+    return {
+      state: 'VALIDATED',
+      reason:
+        'Core financial coverage, earnings quality, cash flow and balance-sheet evidence pass the current Decision Center gate.'
+    };
+  }
+
+  return {
+    state: 'REVIEW',
+    reason:
+      'The evidence is usable but does not yet satisfy every Priority 1 validation condition.'
+  };
+}
+
+function decisionCenterCandidateView(
+  candidate
+) {
+  const gate =
+    decisionCenterAnalystGate(
+      candidate
+    );
+
+  const legacyAction =
+    String(
+      candidate?.action ||
+      'WAIT'
+    );
+
+  let view = 'WATCH';
+  let bucket = 'PRIORITY_2';
+  let reason =
+    candidate?.actionReason ||
+    'The candidate remains under review.';
+
+  if (
+    gate.state ===
+      'RESEARCH_REQUIRED'
+  ) {
+    view =
+      'RESEARCH_REQUIRED';
+    bucket =
+      'RESEARCH_REQUIRED';
+    reason =
+      gate.reason;
+  } else if (
+    gate.state === 'REJECT' ||
+    legacyAction === 'AVOID'
+  ) {
+    view = 'AVOID';
+    bucket = 'AVOID';
+    reason =
+      gate.state === 'REJECT'
+        ? gate.reason
+        : (
+            candidate?.actionReason ||
+            'The current risk/reward does not pass the shadow model.'
+          );
+  } else if (
+    gate.state === 'VALIDATED' &&
+    legacyAction === 'BUY_NOW'
+  ) {
+    view = 'BUY';
+    bucket = 'PRIORITY_1';
+    reason =
+      'Validated analyst evidence and the current entry/risk gates support a new position.';
+  } else if (
+    gate.state === 'VALIDATED' &&
+    legacyAction === 'STAGED_BUY'
+  ) {
+    view = 'ACCUMULATE';
+    bucket = 'PRIORITY_1';
+    reason =
+      'The long-term thesis passes, but NOMAD prefers staged exposure at the current entry.';
+  } else if (
+    gate.state === 'REVIEW' &&
+    (
+      legacyAction === 'BUY_NOW' ||
+      legacyAction === 'STAGED_BUY'
+    )
+  ) {
+    view = 'ACCUMULATE';
+    bucket = 'PRIORITY_2';
+    reason =
+      gate.reason;
+  } else {
+    view = 'WATCH';
+    bucket = 'PRIORITY_2';
+    reason =
+      legacyAction === 'WAIT'
+        ? (
+            candidate?.actionReason ||
+            gate.reason
+          )
+        : gate.reason;
+  }
+
+  const coverage =
+    safeNumber(
+      candidate?.analystCore
+        ?.coverage
+        ?.coreCoveragePct
+    ) ||
+    0;
+
+  const rankScore =
+    decisionRound(
+      (
+        safeNumber(
+          candidate?.overallScore
+        ) ||
+        0
+      ) +
+      (
+        gate.state === 'VALIDATED'
+          ? 5
+          : gate.state === 'REVIEW'
+            ? 1
+            : 0
+      ) +
+      Math.min(
+        3,
+        coverage /
+          100 *
+          3
+      ),
+      2
+    );
+
+  return {
+    ...candidate,
+    analystGate:
+      gate,
+    decisionCenterView:
+      view,
+    decisionCenterBucket:
+      bucket,
+    decisionCenterReason:
+      reason,
+    opportunityRankScore:
+      rankScore
+  };
+}
+
+function decisionCenterSummary(
+  candidate,
+  rank
+) {
+  const analyst =
+    candidate?.analystCore ||
+    null;
+
+  return {
+    rank,
+    symbol:
+      candidate.symbol,
+    companyName:
+      candidate.companyName,
+    sector:
+      candidate.sector,
+    price:
+      candidate.price,
+    marketAsOf:
+      candidate.marketAsOf,
+    decisionCenterView:
+      candidate.decisionCenterView,
+    reason:
+      candidate.decisionCenterReason,
+    analystGate:
+      candidate.analystGate,
+    opportunityRankScore:
+      candidate.opportunityRankScore,
+    overallScore:
+      candidate.overallScore,
+    fundamentalScore:
+      candidate.fundamental?.score ??
+      null,
+    valuationScore:
+      candidate.valuation?.score ??
+      null,
+    entryScore:
+      candidate.entry?.score ??
+      null,
+    riskScore:
+      candidate.risk?.score ??
+      null,
+    dataQualityScore:
+      candidate.dataQuality?.score ??
+      null,
+    analyst: {
+      status:
+        analyst?.status ||
+        'UNAVAILABLE',
+      financialView:
+        analyst?.overallFinancialView
+          ?.state ||
+        'UNAVAILABLE',
+      coveragePct:
+        analyst?.coverage
+          ?.coreCoveragePct ??
+        null,
+      earningsQuality:
+        analyst?.views
+          ?.earningsQuality
+          ?.state ||
+        'UNAVAILABLE',
+      cashFlowQuality:
+        analyst?.views
+          ?.cashFlowQuality
+          ?.state ||
+        'UNAVAILABLE',
+      balanceSheet:
+        analyst?.views
+          ?.balanceSheet
+          ?.state ||
+        'UNAVAILABLE'
+    },
+    positives:
+      candidate.narrative
+        ?.positives ||
+      [],
+    risks:
+      candidate.narrative
+        ?.risks ||
+      []
+  };
+}
+
+function buildDecisionOpportunityBoard(
+  candidates
+) {
+  const enriched =
+    (candidates || [])
+      .map(
+        decisionCenterCandidateView
+      );
+
+  const sortGroup =
+    list =>
+      list.sort(
+        (
+          a,
+          b
+        ) =>
+          b.opportunityRankScore -
+          a.opportunityRankScore
+      );
+
+  const priority1 =
+    sortGroup(
+      enriched.filter(
+        item =>
+          item.decisionCenterBucket ===
+            'PRIORITY_1'
+      )
+    )
+      .slice(0, 5);
+
+  const priority2 =
+    sortGroup(
+      enriched.filter(
+        item =>
+          item.decisionCenterBucket ===
+            'PRIORITY_2'
+      )
+    )
+      .slice(0, 5);
+
+  const researchRequired =
+    sortGroup(
+      enriched.filter(
+        item =>
+          item.decisionCenterBucket ===
+            'RESEARCH_REQUIRED'
+      )
+    )
+      .slice(0, 5);
+
+  const avoid =
+    sortGroup(
+      enriched.filter(
+        item =>
+          item.decisionCenterBucket ===
+            'AVOID'
+      )
+    )
+      .slice(0, 5);
+
+  return {
+    priority1:
+      priority1.map(
+        (item, index) =>
+          decisionCenterSummary(
+            item,
+            index + 1
+          )
+      ),
+    priority2:
+      priority2.map(
+        (item, index) =>
+          decisionCenterSummary(
+            item,
+            index + 1
+          )
+      ),
+    researchRequired:
+      researchRequired.map(
+        (item, index) =>
+          decisionCenterSummary(
+            item,
+            index + 1
+          )
+      ),
+    avoid:
+      avoid.map(
+        (item, index) =>
+          decisionCenterSummary(
+            item,
+            index + 1
+          )
+      ),
+    all:
+      enriched
+  };
+}
+
+function allocateDecisionCenterOpportunities(
+  opportunityBoard,
+  amount,
+  riskPolicy
+) {
+  const budgetPaisa =
+    Math.max(
+      0,
+      Math.round(
+        Number(amount) *
+        100
+      )
+    );
+
+  const deployCap =
+    Math.floor(
+      budgetPaisa *
+      DECISION_CENTER_MAX_DEPLOYMENT_PCT
+    );
+
+  const candidates =
+    (opportunityBoard?.all || [])
+      .filter(
+        item =>
+          item.decisionCenterBucket ===
+            'PRIORITY_1' &&
+          (
+            item.decisionCenterView ===
+              'BUY' ||
+            item.decisionCenterView ===
+              'ACCUMULATE'
+          )
+      )
+      .sort(
+        (
+          a,
+          b
+        ) =>
+          b.opportunityRankScore -
+          a.opportunityRankScore
+      )
+      .slice(
+        0,
+        riskPolicy.maxAllocations
+      );
+
+  if (!candidates.length) {
+    return {
+      allocations: [],
+      amountInvestedPkr: 0,
+      cashRemainingPkr:
+        decisionRound(
+          amount,
+          2
+        ),
+      investedPct: 0,
+      deploymentCapPct:
+        DECISION_CENTER_MAX_DEPLOYMENT_PCT *
+        100,
+      unfundedPriorityOne: []
+    };
+  }
+
+  const strengthTotal =
+    candidates.reduce(
+      (
+        sum,
+        candidate
+      ) =>
+        sum +
+        Math.max(
+          1,
+          safeNumber(
+            candidate.opportunityRankScore
+          ) ||
+          1
+        ) *
+        (
+          candidate.decisionCenterView ===
+            'ACCUMULATE'
+            ? 0.65
+            : 1
+        ),
+      0
+    );
+
+  let remainingDeploy =
+    deployCap;
+
+  const allocations = [];
+  const sectorSpent =
+    new Map();
+
+  for (
+    const candidate
+    of candidates
+  ) {
+    const pricePaisa =
+      Math.round(
+        Number(
+          candidate.price
+        ) *
+        100
+      );
+
+    if (
+      !Number.isFinite(
+        pricePaisa
+      ) ||
+      pricePaisa <= 0
+    ) {
+      continue;
+    }
+
+    const strength =
+      Math.max(
+        1,
+        safeNumber(
+          candidate.opportunityRankScore
+        ) ||
+        1
+      ) *
+      (
+        candidate.decisionCenterView ===
+          'ACCUMULATE'
+          ? 0.65
+          : 1
+      );
+
+    const proportionalTarget =
+      Math.floor(
+        deployCap *
+        strength /
+        strengthTotal
+      );
+
+    const stockCap =
+      Math.floor(
+        budgetPaisa *
+        riskPolicy.maxStockPct *
+        (
+          candidate.decisionCenterView ===
+            'ACCUMULATE'
+            ? 0.65
+            : 1
+        )
+      );
+
+    const existingSectorSpent =
+      sectorSpent.get(
+        candidate.sector
+      ) ||
+      0;
+
+    const sectorCap =
+      Math.floor(
+        budgetPaisa *
+        riskPolicy.maxSectorPct
+      );
+
+    const allowed =
+      Math.max(
+        0,
+        Math.min(
+          remainingDeploy,
+          proportionalTarget,
+          stockCap,
+          sectorCap -
+            existingSectorSpent
+        )
+      );
+
+    const shares =
+      Math.floor(
+        allowed /
+        pricePaisa
+      );
+
+    if (shares < 1) {
+      continue;
+    }
+
+    const spent =
+      shares *
+      pricePaisa;
+
+    remainingDeploy -=
+      spent;
+
+    sectorSpent.set(
+      candidate.sector,
+      existingSectorSpent +
+        spent
+    );
+
+    allocations.push({
+      symbol:
+        candidate.symbol,
+      companyName:
+        candidate.companyName,
+      sector:
+        candidate.sector,
+      action:
+        candidate.decisionCenterView,
+      shares,
+      referencePrice:
+        decisionRound(
+          candidate.price,
+          2
+        ),
+      principalPkr:
+        decisionRound(
+          spent /
+          100,
+          2
+        ),
+      targetWeightPct:
+        decisionRound(
+          proportionalTarget /
+          budgetPaisa *
+          100,
+          2
+        ),
+      actualWeightPct:
+        decisionRound(
+          spent /
+          budgetPaisa *
+          100,
+          2
+        ),
+      overallScore:
+        candidate.overallScore,
+      opportunityRankScore:
+        candidate.opportunityRankScore,
+      evidenceStrength:
+        candidate.analystCore
+          ?.coverage
+          ?.coreCoveragePct ??
+        null,
+      note:
+        candidate.decisionCenterView ===
+          'ACCUMULATE'
+          ? 'Staged exposure: the analyst thesis is validated, but current entry conditions do not justify a full target position.'
+          : 'Priority 1 shadow allocation. Brokerage, taxes, levies and execution slippage are not included.'
+    });
+  }
+
+  // One conservative second pass lets whole-share rounding use some of the
+  // intended deployment without breaching stock/sector caps. It never forces
+  // deployment to 100%.
+  let progressed = true;
+
+  while (
+    remainingDeploy > 0 &&
+    progressed
+  ) {
+    progressed = false;
+
+    for (
+      const candidate
+      of candidates
+    ) {
+      const pricePaisa =
+        Math.round(
+          Number(
+            candidate.price
+          ) *
+          100
+        );
+
+      if (
+        !Number.isFinite(
+          pricePaisa
+        ) ||
+        pricePaisa <= 0 ||
+        pricePaisa >
+          remainingDeploy
+      ) {
+        continue;
+      }
+
+      const allocation =
+        allocations.find(
+          item =>
+            item.symbol ===
+              candidate.symbol
+        );
+
+      const currentSpent =
+        allocation
+          ? Math.round(
+              allocation.principalPkr *
+              100
+            )
+          : 0;
+
+      const stockCap =
+        Math.floor(
+          budgetPaisa *
+          riskPolicy.maxStockPct *
+          (
+            candidate.decisionCenterView ===
+              'ACCUMULATE'
+              ? 0.65
+              : 1
+          )
+        );
+
+      const sectorCurrent =
+        sectorSpent.get(
+          candidate.sector
+        ) ||
+        0;
+
+      const sectorCap =
+        Math.floor(
+          budgetPaisa *
+          riskPolicy.maxSectorPct
+        );
+
+      if (
+        currentSpent +
+          pricePaisa >
+            stockCap ||
+        sectorCurrent +
+          pricePaisa >
+            sectorCap
+      ) {
+        continue;
+      }
+
+      if (allocation) {
+        allocation.shares += 1;
+        allocation.principalPkr =
+          decisionRound(
+            allocation.principalPkr +
+              pricePaisa /
+                100,
+            2
+          );
+        allocation.actualWeightPct =
+          decisionRound(
+            allocation.principalPkr /
+              amount *
+              100,
+            2
+          );
+      } else {
+        allocations.push({
+          symbol:
+            candidate.symbol,
+          companyName:
+            candidate.companyName,
+          sector:
+            candidate.sector,
+          action:
+            candidate.decisionCenterView,
+          shares: 1,
+          referencePrice:
+            decisionRound(
+              candidate.price,
+              2
+            ),
+          principalPkr:
+            decisionRound(
+              pricePaisa /
+                100,
+              2
+            ),
+          targetWeightPct: 0,
+          actualWeightPct:
+            decisionRound(
+              pricePaisa /
+                budgetPaisa *
+                100,
+              2
+            ),
+          overallScore:
+            candidate.overallScore,
+          opportunityRankScore:
+            candidate.opportunityRankScore,
+          evidenceStrength:
+            candidate.analystCore
+              ?.coverage
+              ?.coreCoveragePct ??
+            null,
+          note:
+            'One-share whole-number fit inside the validated Priority 1 allocation and risk caps.'
+        });
+      }
+
+      remainingDeploy -=
+        pricePaisa;
+
+      sectorSpent.set(
+        candidate.sector,
+        sectorCurrent +
+          pricePaisa
+      );
+
+      progressed = true;
+
+      if (remainingDeploy <= 0) {
+        break;
+      }
+    }
+  }
+
+  const investedPaisa =
+    allocations.reduce(
+      (
+        sum,
+        item
+      ) =>
+        sum +
+        Math.round(
+          item.principalPkr *
+          100
+        ),
+      0
+    );
+
+  const allocatedSymbols =
+    new Set(
+      allocations.map(
+        item =>
+          item.symbol
+      )
+    );
+
+  const unfundedPriorityOne =
+    candidates
+      .filter(
+        candidate =>
+          !allocatedSymbols.has(
+            candidate.symbol
+          )
+      )
+      .map(
+        candidate => ({
+          symbol:
+            candidate.symbol,
+          price:
+            candidate.price,
+          reason:
+            'Priority 1 remains valid, but the entered amount and current position/sector caps could not fit one whole share.'
+      }));
+
+  return {
+    allocations,
+    amountInvestedPkr:
+      decisionRound(
+        investedPaisa /
+        100,
+        2
+      ),
+    cashRemainingPkr:
+      decisionRound(
+        Math.max(
+          0,
+          budgetPaisa -
+            investedPaisa
+        ) /
+        100,
+        2
+      ),
+    investedPct:
+      decisionRound(
+        budgetPaisa > 0
+          ? investedPaisa /
+            budgetPaisa *
+            100
+          : 0,
+        2
+      ),
+    deploymentCapPct:
+      DECISION_CENTER_MAX_DEPLOYMENT_PCT *
+      100,
+    unfundedPriorityOne
+  };
+}
+
 async function decisionMapWithConcurrency(
   items,
   concurrency,
@@ -17773,6 +18718,11 @@ async function saveDecisionFundamentalCache(
         ratios:
           fundamentals.ratios ||
           null,
+        analystCore:
+          fundamentals.analystCore ||
+          buildFinancialAnalystCore(
+            fundamentals
+          ),
         available: true
       }
     }
@@ -17831,9 +18781,18 @@ async function decisionLoadFundamentals(
     cache.ageMs <=
       DECISION_FUNDAMENTAL_CACHE_FRESH_MS
   ) {
+    const cachedFundamentals = {
+      ...cache.data,
+      analystCore:
+        cache.data?.analystCore ||
+        buildFinancialAnalystCore(
+          cache.data
+        )
+    };
+
     return {
       fundamentals:
-        cache.data,
+        cachedFundamentals,
       evidenceState:
         'CACHE_FRESH',
       cachedAt:
@@ -17916,9 +18875,18 @@ async function decisionLoadFundamentals(
     cache.ageMs <=
       DECISION_FUNDAMENTAL_CACHE_FALLBACK_MS
   ) {
+    const cachedFundamentals = {
+      ...cache.data,
+      analystCore:
+        cache.data?.analystCore ||
+        buildFinancialAnalystCore(
+          cache.data
+        )
+    };
+
     return {
       fundamentals:
-        cache.data,
+        cachedFundamentals,
       evidenceState:
         'CACHE_FALLBACK',
       cachedAt:
@@ -18583,8 +19551,10 @@ async function runDecisionLab(
           ) <= amount
       );
 
+  // Opportunity ranking is independent of the entered budget. The amount is
+  // applied only by the separate whole-share allocator later.
   const liquidityPassed =
-    affordableRows
+    eligibleRows
       .filter(
         row => {
           const volume =
@@ -18656,7 +19626,7 @@ async function runDecisionLab(
       count + 1
     );
 
-    if (shortList.length >= 12) {
+    if (shortList.length >= DECISION_CENTER_SHORTLIST_LIMIT) {
       break;
     }
   }
@@ -18710,7 +19680,7 @@ async function runDecisionLab(
         headline:
           'No investable candidate passed the first safety gates.',
         reason:
-          'The current amount, liquidity policy and eligible universe produced no candidate suitable for deeper analysis.',
+          'The current liquidity policy and eligible universe produced no candidate suitable for deeper analysis. The entered amount did not affect opportunity ranking.',
         amountInvestedPkr: 0,
         cashRemainingPkr:
           decisionRound(
@@ -18726,7 +19696,7 @@ async function runDecisionLab(
           eligibleRows.length -
           affordableRows.length,
         liquidityOrStatus:
-          affordableRows.length -
+          eligibleRows.length -
           liquidityPassed.length
       },
       warnings: [
@@ -18829,12 +19799,15 @@ async function runDecisionLab(
 
   const deepShortList =
     historyReady
-      .slice(0, 6);
+      .slice(
+        0,
+        DECISION_CENTER_DEEP_LIMIT
+      );
 
   const deepResults =
     await decisionMapWithConcurrency(
       deepShortList,
-      3,
+      4,
       async item => {
         const fundamentalEvidence =
           await decisionLoadFundamentals(
@@ -18977,18 +19950,23 @@ async function runDecisionLab(
           a.overallScore
       );
 
+  const opportunityBoard =
+    buildDecisionOpportunityBoard(
+      candidates
+    );
+
   const allocation =
-    allocateDecisionCandidates(
-      candidates,
+    allocateDecisionCenterOpportunities(
+      opportunityBoard,
       amount,
       riskPolicy
     );
 
-  let action = 'WAIT';
+  let action = 'WATCH';
   let headline =
-    'Wait — the shadow engine found no candidate strong enough to allocate this amount.';
+    'No validated Priority 1 allocation is available right now.';
   let reason =
-    'Cash remains a valid decision when the evidence or entry conditions are not strong enough.';
+    'NOMAD keeps opportunities visible, but only independently validated Priority 1 ideas can receive capital in this build.';
 
   const dataBlockedCount =
     candidates.filter(
@@ -18997,18 +19975,25 @@ async function runDecisionLab(
           'DATA_BLOCKED'
     ).length;
 
+  const priorityOneCount =
+    opportunityBoard
+      .priority1
+      .length;
+
+  const priorityTwoCount =
+    opportunityBoard
+      .priority2
+      .length;
+
+  const researchRequiredCount =
+    opportunityBoard
+      .researchRequired
+      .length;
+
   const decisionBlocked =
-    allocation.allocations.length === 0 &&
+    candidates.length === 0 &&
     (
-      (
-        candidates.length > 0 &&
-        dataBlockedCount ===
-          candidates.length
-      ) ||
-      (
-        deepShortList.length > 0 &&
-        candidates.length === 0
-      ) ||
+      deepShortList.length > 0 ||
       (
         shortList.length > 0 &&
         historyReady.length === 0
@@ -19019,44 +20004,68 @@ async function runDecisionLab(
     action =
       'DATA_BLOCKED';
     headline =
-      'Decision blocked — required evidence could not be completed.';
+      'Decision blocked — required market evidence could not be completed.';
     reason =
-      'This is a data/reliability failure, not an investment view. NOMAD did not convert missing evidence into a WAIT recommendation.';
-  } else if (
-    allocation.allocations.length &&
-    allocation.investedPct >= 75
-  ) {
-    action = 'INVEST';
-    headline =
-      'Experimental shadow allocation found.';
-    reason =
-      'The current model found candidates that pass its provisional quality, timing, risk and data gates.';
+      'This is a data/reliability failure, not an investment view. NOMAD did not substitute a guess.';
   } else if (
     allocation.allocations.length
   ) {
     action =
-      'PARTIAL_INVEST';
+      allocation.investedPct >= 75
+        ? 'INVEST'
+        : 'PARTIAL_INVEST';
     headline =
-      'Experimental partial allocation found; keep part of the amount in cash.';
+      priorityOneCount === 1
+        ? 'One validated Priority 1 opportunity is currently actionable.'
+        : 'Validated Priority 1 opportunities are currently actionable.';
     reason =
-      'NOMAD deliberately leaves cash when diversification, entry quality or risk limits prevent a fuller allocation.';
+      'The capital allocator used only Priority 1 ideas that passed the Financial Analyst evidence gate, then converted the entered amount into whole shares within stock and sector limits.';
+  } else if (
+    priorityOneCount > 0
+  ) {
+    action = 'WATCH';
+    headline =
+      'Priority 1 opportunities exist, but this amount cannot express them within current risk limits.';
+    reason =
+      'The opportunity ranking is independent of budget. NOMAD did not replace a better stock with a weaker one simply because the weaker share price fit the entered amount.';
+  } else if (
+    priorityTwoCount > 0
+  ) {
+    action = 'WATCH';
+    headline =
+      'No Priority 1 idea passes the full standard; the best current ideas remain Priority 2.';
+    reason =
+      'These companies remain worth monitoring, but one or more thesis, evidence, valuation or entry conditions are not strong enough for a validated allocation.';
+  } else if (
+    researchRequiredCount > 0
+  ) {
+    action =
+      'RESEARCH_REQUIRED';
+    headline =
+      'Interesting candidates exist, but NOMAD cannot independently validate them yet.';
+    reason =
+      'Missing evidence does not hide a stock. It is shown under Research Required until the missing analyst evidence is resolved.';
   }
 
+  const evidencePool =
+    opportunityBoard.priority1.length
+      ? opportunityBoard.priority1
+      : opportunityBoard.priority2.length
+        ? opportunityBoard.priority2
+        : opportunityBoard.researchRequired;
+
   const evidenceStrength =
-    candidates.length
+    evidencePool.length
       ? decisionRound(
-          candidates
+          evidencePool
             .slice(0, 3)
             .reduce(
-              (
-                sum,
-                candidate
-              ) =>
+              (sum, item) =>
                 sum +
                 (
                   safeNumber(
-                    candidate.dataQuality
-                      ?.score
+                    item.analyst
+                      ?.coveragePct
                   ) ||
                   0
                 ),
@@ -19064,7 +20073,7 @@ async function runDecisionLab(
             ) /
             Math.min(
               3,
-              candidates.length
+              evidencePool.length
             ),
           2
         )
@@ -19105,6 +20114,8 @@ async function runDecisionLab(
           riskPolicy.minDataQualityScore,
         minOverallScore:
           riskPolicy.minOverallScore,
+        minRiskScore:
+          riskPolicy.minRiskScore,
         maxStockPct:
           riskPolicy.maxStockPct *
           100,
@@ -19146,7 +20157,9 @@ async function runDecisionLab(
       deepAnalyzed:
         candidates.length,
       dataBlocked:
-        dataBlockedCount
+        dataBlockedCount,
+      rankingBudgetIndependent:
+        true
     },
     decision: {
       action,
@@ -19164,14 +20177,29 @@ async function runDecisionLab(
     },
     allocations:
       allocation.allocations,
-    candidates:
-      candidates.slice(0, 5),
+    opportunityBoard: {
+      priority1:
+        opportunityBoard.priority1,
+      priority2:
+        opportunityBoard.priority2,
+      researchRequired:
+        opportunityBoard.researchRequired,
+      avoid:
+        opportunityBoard.avoid
+    },
+    allocationDiagnostics: {
+      deploymentCapPct:
+        allocation.deploymentCapPct,
+      unfundedPriorityOne:
+        allocation.unfundedPriorityOne
+    },
+    candidates,
     exclusions: {
       unaffordable:
         eligibleRows.length -
         affordableRows.length,
       liquidityOrStatus:
-        affordableRows.length -
+        eligibleRows.length -
         liquidityPassed.length,
       historicalUnavailable:
         shortList.length -
@@ -19181,7 +20209,8 @@ async function runDecisionLab(
       'SHADOW MODE: this model has not passed historical and forward validation for real-money use.',
       'Allocations are planning principals only. Brokerage, levies, taxes and execution slippage are not yet included.',
       'No order-execution capability exists. The user remains the final decision maker.',
-      'Current scoring rules are versioned experimental hypotheses and must earn promotion through recorded performance.',
+      'Current scoring rules remain supporting evidence only; Priority 1 now also requires the Financial Analyst evidence gate.',
+      'Opportunity ranking is independent of the entered budget. The amount is applied only after ranking by the whole-share allocator.',
       ...(
         candidates.some(
           candidate =>
@@ -19591,6 +20620,107 @@ function runDecisionEngineSelfTests() {
     'conservative position cap must be tighter than aggressive'
   );
 
+  const validatedDecisionCandidate = {
+    ...goodCandidate,
+    symbol: 'VALID',
+    companyName: 'Validated Company',
+    sector: 'Engineering',
+    price: 100,
+    analystCore: {
+      company: {
+        financialSector: false
+      },
+      coverage: {
+        coreCoveragePct: 90
+      },
+      overallFinancialView: {
+        state: 'GOOD'
+      },
+      views: {
+        earningsQuality: {
+          state: 'ACCEPTABLE'
+        },
+        cashFlowQuality: {
+          state: 'STRONG'
+        },
+        balanceSheet: {
+          state: 'EVIDENCE_AVAILABLE'
+        }
+      }
+    },
+    action: 'BUY_NOW',
+    actionReason: 'Synthetic validated buy.',
+    narrative: {
+      positives: [],
+      risks: []
+    }
+  };
+
+  assert.equal(
+    decisionCenterAnalystGate(
+      validatedDecisionCandidate
+    ).state,
+    'VALIDATED',
+    'complete analyst evidence must be eligible for Priority 1 validation'
+  );
+
+  assert.equal(
+    decisionCenterAnalystGate({
+      ...validatedDecisionCandidate,
+      analystCore: null
+    }).state,
+    'RESEARCH_REQUIRED',
+    'missing analyst evidence must remain visible but cannot become Priority 1'
+  );
+
+  const syntheticBoard =
+    buildDecisionOpportunityBoard([
+      validatedDecisionCandidate,
+      {
+        ...validatedDecisionCandidate,
+        symbol: 'RESEARCH',
+        analystCore: null
+      }
+    ]);
+
+  assert.equal(
+    syntheticBoard.priority1[0]
+      .symbol,
+    'VALID',
+    'validated candidate must reach Priority 1'
+  );
+
+  assert.equal(
+    syntheticBoard.researchRequired[0]
+      .symbol,
+    'RESEARCH',
+    'missing-evidence candidate must remain visible under Research Required'
+  );
+
+  const strictAllocation =
+    allocateDecisionCenterOpportunities(
+      syntheticBoard,
+      5000,
+      riskBalanced
+    );
+
+  assert.ok(
+    strictAllocation.amountInvestedPkr <=
+      5000,
+    'Decision Center allocation must not exceed the entered amount'
+  );
+
+  assert.ok(
+    strictAllocation.allocations.every(
+      item =>
+        Number.isInteger(
+          item.shares
+        ) &&
+        item.shares > 0
+    ),
+    'Decision Center allocation must use positive whole shares'
+  );
+
   console.log(
     'NOMAD Decision Engine self-tests passed.'
   );
@@ -19598,7 +20728,7 @@ function runDecisionEngineSelfTests() {
 
 
 /* =========================================================
-   CONTINUOUS INTELLIGENCE SCANNER - BUILD 0.8.3.2
+   CONTINUOUS INTELLIGENCE SCANNER - BUILD 0.8.4B
 ========================================================= */
 
 function scannerSecretConfigured() {
@@ -23060,7 +24190,7 @@ body > main > header {
 
 
 /* =========================================================
-   TRADING WORKSPACE + DECISION UI - BUILD 0.8.3.2
+   TRADING WORKSPACE + DECISION CENTER UI - BUILD 0.8.4B
 ========================================================= */
 
 :root {
@@ -23934,6 +25064,286 @@ pre {
   }
 }
 
+
+/* =========================================================
+   DECISION CENTER - BUILD 0.8.4B
+========================================================= */
+.decisionTitleRow {
+  align-items: flex-start;
+}
+
+.decisionModeBadge {
+  border: 1px solid #344865;
+  border-radius: 999px;
+  padding: 8px 12px;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: .08em;
+  color: #bfd0e8;
+  background: #111d2d;
+  white-space: nowrap;
+}
+
+.decisionWorkspaceGrid {
+  display: grid;
+  grid-template-columns: minmax(270px, .8fr) minmax(0, 2.2fr);
+  gap: 16px;
+  margin-bottom: 18px;
+}
+
+.decisionSetupCard,
+.decisionVerdictCard,
+.opportunityCard,
+.decisionAuditCard {
+  min-width: 0;
+}
+
+.decisionMoneyInput {
+  margin: 14px 0 12px;
+}
+
+.decisionPrinciple,
+.decisionBoardNote {
+  margin-top: 12px;
+  font-size: 12px;
+  line-height: 1.55;
+  color: #91a4be;
+}
+
+.decisionBoardHeader {
+  display: flex;
+  justify-content: space-between;
+  gap: 18px;
+  align-items: flex-end;
+  margin: 8px 0 12px;
+}
+
+.decisionBoardHeader h2 {
+  margin: 2px 0 0;
+}
+
+.decisionBoardNote {
+  max-width: 560px;
+  margin: 0;
+  text-align: right;
+}
+
+.opportunityBoardGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.boardCount {
+  display: inline-flex;
+  min-width: 28px;
+  height: 28px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  border: 1px solid #33465f;
+  background: #111d2d;
+  color: #dfe9f7;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.opportunityList {
+  display: grid;
+  gap: 10px;
+}
+
+.opportunityRow {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: start;
+  border-top: 1px solid #223249;
+  padding-top: 12px;
+}
+
+.opportunityRow:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.opportunityRank {
+  width: 30px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  background: #111d2d;
+  border: 1px solid #2f435e;
+  color: #b9c9dc;
+  font-size: 11px;
+  font-weight: 900;
+}
+
+.opportunityIdentity {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.opportunityIdentity strong {
+  font-size: 14px;
+}
+
+.opportunityIdentity span,
+.opportunityMeta,
+.opportunityReason,
+.opportunityConcern {
+  font-size: 11px;
+  line-height: 1.5;
+  color: #8ea1ba;
+}
+
+.opportunityMeta {
+  margin-bottom: 5px;
+}
+
+.opportunityReason {
+  color: #bdcada;
+}
+
+.opportunityConcern {
+  margin-top: 3px;
+}
+
+.opportunityAction {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 82px;
+  border-radius: 999px;
+  padding: 6px 9px;
+  border: 1px solid #31445e;
+  background: #111d2d;
+  color: #dce8f8;
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: .04em;
+  white-space: nowrap;
+}
+
+.opportunityAction.buy,
+.opportunityAction.accumulate {
+  border-color: #315c4b;
+  background: #10251f;
+}
+
+.opportunityAction.research_required {
+  border-color: #69572f;
+  background: #2a2415;
+}
+
+.opportunityAction.avoid {
+  border-color: #603944;
+  background: #29161d;
+}
+
+.decisionHomeSummary {
+  min-height: 120px;
+}
+
+.homeDecisionHeadline {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
+  margin-bottom: 10px;
+}
+
+.homeDecisionHeadline strong {
+  font-size: 22px;
+}
+
+.homeDecisionMeta {
+  color: #93a6bf;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.homeDecisionSymbols {
+  margin-top: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.homeDecisionSymbols span {
+  border: 1px solid #2f435e;
+  background: #111d2d;
+  border-radius: 999px;
+  padding: 5px 8px;
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.decisionAudit {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0,1fr));
+  gap: 8px;
+}
+
+.auditMetric {
+  border: 1px solid #24364d;
+  background: #101a28;
+  border-radius: 10px;
+  padding: 10px;
+}
+
+.auditMetric span {
+  display: block;
+  font-size: 10px;
+  color: #8498b3;
+  margin-bottom: 4px;
+}
+
+.auditMetric strong {
+  font-size: 15px;
+}
+
+@media (max-width: 1000px) {
+  .decisionWorkspaceGrid,
+  .opportunityBoardGrid {
+    grid-template-columns: 1fr;
+  }
+
+  .decisionBoardHeader {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .decisionBoardNote {
+    text-align: left;
+  }
+
+  .decisionAudit {
+    grid-template-columns: repeat(3, minmax(0,1fr));
+  }
+}
+
+@media (max-width: 640px) {
+  .decisionAudit {
+    grid-template-columns: repeat(2, minmax(0,1fr));
+  }
+
+  .opportunityRow {
+    grid-template-columns: 30px minmax(0,1fr);
+  }
+
+  .opportunityAction {
+    grid-column: 2;
+    justify-self: start;
+  }
+}
+
 </style>
 
 </head>
@@ -23955,6 +25365,7 @@ pre {
 <nav class="sideNav">
 <button class="navButton active" data-nav="home"><span>⌂</span>Home</button>
 <button class="navButton" data-nav="portfolio"><span>▤</span>Portfolio</button>
+<button class="navButton" data-nav="decision"><span>◆</span>Decision Center</button>
 <button class="navButton" data-nav="research"><span>⌕</span>Research</button>
 <button class="navButton" data-nav="explore"><span>↗</span>Explore PSX</button>
 <button class="navButton" data-nav="universe"><span>◎</span>Universe</button>
@@ -24002,7 +25413,7 @@ Build ${VERSION}
 Market, company metadata, fundamentals, symbol normalization,
 canonical universe identity, metadata, fundamentals and deterministic technical analysis are connected.
 
-Persistent intelligence memory and the market scanner are connected. Build 0.8.3.2 hardens the shadow decision engine; its outputs are recorded for validation but are not real-money eligible yet.
+Persistent intelligence memory and the market scanner are connected. Build 0.8.4B introduces the dedicated Decision Center, strict analyst-evidence gating, budget-independent opportunity ranking and a separate whole-share allocator. It remains shadow-only.
 
 </p>
 
@@ -24020,7 +25431,7 @@ Checking connection...
 
 <div class="terminalHeader">
 <div>
-<div class="eyebrow">DECISION CENTER</div>
+<div class="eyebrow">HOME</div>
 <h1>Your market command center</h1>
 <div class="terminalSub">NOMAD prioritizes what matters to your money — holdings, meaningful changes, market leaders and decisions.</div>
 </div>
@@ -24059,15 +25470,16 @@ Checking connection...
 </div>
 
 <div class="terminalCard plannerCardNew">
-<div class="eyebrow">NEW MONEY</div>
-<h2>What should I do with it?</h2>
-<div class="moneyCompact"><span>PKR</span><input id="decisionAmount" inputmode="numeric" value="5000"></div>
-<div class="contextRow">
-<div><label>Horizon</label><select id="decisionHorizon"><option value="long_term">Long-term</option><option value="short_term">Short-term</option></select></div>
-<div><label>Risk</label><select id="decisionRisk"><option value="balanced">Balanced</option><option value="conservative">Conservative</option><option value="aggressive">Aggressive</option></select></div>
+<div class="panelHeader">
+<div>
+<div class="eyebrow">NOMAD DECISION</div>
+<h2>Latest capital decision</h2>
 </div>
-<button id="findBestOption" class="primaryWide">Find my best option</button>
-<div id="decisionResult" class="decisionResult">Build 0.8.3.2 runs the hardened experimental shadow decision across the eligible PSX universe. It is deliberately not real-money eligible until the model earns validation.</div>
+<button class="miniButton secondary" data-open-page="decision">Open Decision Center</button>
+</div>
+<div id="homeDecisionSummary" class="decisionHomeSummary">
+<div class="terminalEmpty">Run your first analysis in Decision Center.</div>
+</div>
 </div>
 
 <div class="terminalCard attentionCardNew">
@@ -24104,6 +25516,68 @@ Checking connection...
 </div>
 </div>
 
+</section>
+
+<section class="appPage" id="decisionCenterPage" data-page="decision">
+<div class="pageTitleRow decisionTitleRow">
+<div>
+<div class="eyebrow">CORE AI INTELLIGENCE</div>
+<h1>Decision Center</h1>
+<p class="muted">NOMAD first ranks the best PSX opportunities independently of your budget. Only after the thesis and evidence pass does the allocator convert your amount into whole shares.</p>
+</div>
+<div class="decisionModeBadge">SHADOW · STRICT EVIDENCE GATES</div>
+</div>
+
+<div class="decisionWorkspaceGrid">
+<div class="terminalCard decisionSetupCard">
+<div class="eyebrow">CAPITAL TO DEPLOY</div>
+<h2>Build the best feasible plan</h2>
+<div class="moneyCompact decisionMoneyInput"><span>PKR</span><input id="decisionAmount" inputmode="numeric" value="5000"></div>
+<div class="contextRow">
+<div><label>Horizon</label><select id="decisionHorizon"><option value="long_term">Long-term</option><option value="short_term">Short-term</option></select></div>
+<div><label>Risk</label><select id="decisionRisk"><option value="balanced">Balanced</option><option value="conservative">Conservative</option><option value="aggressive">Aggressive</option></select></div>
+</div>
+<button id="findBestOption" class="primaryWide">Analyze PSX & build plan</button>
+<div class="decisionPrinciple">Priority ranking does not change because of your budget. If a better stock cannot fit one whole share, NOMAD keeps it ranked and leaves cash rather than substituting a weaker idea.</div>
+</div>
+
+<div class="terminalCard decisionVerdictCard">
+<div class="panelHeader"><div><div class="eyebrow">CAPITAL DECISION</div><h2>What NOMAD would do now</h2></div></div>
+<div id="decisionResult" class="decisionResult">Run an analysis to generate the current ranked opportunity board and a separate whole-share allocation for your amount.</div>
+</div>
+</div>
+
+<div class="decisionBoardHeader">
+<div><div class="eyebrow">OPPORTUNITY BOARD</div><h2>Ranked before allocation</h2></div>
+<div class="decisionBoardNote">Priority 1 is intentionally difficult to earn. Missing evidence does not remove a stock; it moves to Research Required.</div>
+</div>
+
+<div class="opportunityBoardGrid">
+<div class="terminalCard opportunityCard priorityOneCard">
+<div class="panelHeader"><div><div class="eyebrow">PRIORITY 1</div><h2>Best current opportunities</h2></div><span class="boardCount" id="priorityOneCount">0</span></div>
+<div id="priorityOneList" class="opportunityList"><div class="terminalEmpty small">Run analysis to rank opportunities.</div></div>
+</div>
+
+<div class="terminalCard opportunityCard priorityTwoCard">
+<div class="panelHeader"><div><div class="eyebrow">PRIORITY 2</div><h2>Next best opportunities</h2></div><span class="boardCount" id="priorityTwoCount">0</span></div>
+<div id="priorityTwoList" class="opportunityList"><div class="terminalEmpty small">Run analysis to rank opportunities.</div></div>
+</div>
+
+<div class="terminalCard opportunityCard researchCard">
+<div class="panelHeader"><div><div class="eyebrow">RESEARCH REQUIRED</div><h2>Interesting but unverified</h2></div><span class="boardCount" id="researchRequiredCount">0</span></div>
+<div id="researchRequiredList" class="opportunityList"><div class="terminalEmpty small">Missing evidence will appear here instead of disappearing.</div></div>
+</div>
+
+<div class="terminalCard opportunityCard avoidCard">
+<div class="panelHeader"><div><div class="eyebrow">LOW PRIORITY / AVOID</div><h2>Not attractive enough now</h2></div><span class="boardCount" id="avoidCount">0</span></div>
+<div id="avoidList" class="opportunityList"><div class="terminalEmpty small">Evidence-backed rejects will appear here.</div></div>
+</div>
+</div>
+
+<div class="terminalCard decisionAuditCard">
+<div class="panelHeader"><div><div class="eyebrow">AUDIT</div><h2>What NOMAD actually analyzed</h2></div></div>
+<div id="decisionAudit" class="decisionAudit"><div class="terminalEmpty small">No analysis run yet.</div></div>
+</div>
 </section>
 
 <section class="appPage" id="portfolioPage" data-page="portfolio">
@@ -25192,7 +26666,7 @@ async function apiPost(
 
 
 /* =========================================================
-   APP NAVIGATION + DECISION CENTER - BUILD 0.8.3.2
+   APP NAVIGATION + DECISION CENTER - BUILD 0.8.4B
 ========================================================= */
 
 function openAppPage(
@@ -33846,21 +35320,395 @@ function decisionActionLabel(
   const labels = {
     BUY_NOW: 'BUY NOW',
     STAGED_BUY: 'STAGED BUY',
+    BUY: 'BUY',
+    ACCUMULATE: 'ACCUMULATE',
+    WATCH: 'WATCH',
+    HOLD: 'HOLD',
+    RESEARCH_REQUIRED:
+      'RESEARCH REQUIRED',
     WAIT: 'WAIT',
     WAIT_DATA: 'WAIT / DATA',
     DATA_BLOCKED: 'DATA BLOCKED',
     AVOID: 'AVOID',
     INVEST: 'INVEST',
-    PARTIAL_INVEST: 'PARTIAL INVEST'
+    PARTIAL_INVEST:
+      'PARTIAL INVEST'
   };
 
   return labels[action] ||
     String(
       action ||
-      'WAIT'
+      'WATCH'
     ).replace(
       /_/g,
       ' '
+    );
+}
+
+function renderOpportunityList(
+  targetId,
+  items,
+  emptyText
+) {
+  const target =
+    $(targetId);
+
+  if (!target) {
+    return;
+  }
+
+  const list =
+    Array.isArray(items)
+      ? items
+      : [];
+
+  if (!list.length) {
+    target.innerHTML =
+      '<div class="terminalEmpty small">' +
+      escapeHtml(
+        emptyText
+      ) +
+      '</div>';
+    return;
+  }
+
+  target.innerHTML =
+    list.map(
+      item => {
+        const firstRisk =
+          item.risks?.[0] ||
+          '';
+
+        const analyst =
+          item.analyst ||
+          {};
+
+        return (
+          '<div class="opportunityRow">' +
+          '<div class="opportunityRank">#' +
+          escapeHtml(
+            item.rank
+          ) +
+          '</div>' +
+          '<div>' +
+          '<div class="opportunityIdentity"><strong>' +
+          escapeHtml(
+            item.symbol
+          ) +
+          '</strong><span>' +
+          escapeHtml(
+            item.companyName ||
+            ''
+          ) +
+          '</span></div>' +
+          '<div class="opportunityMeta">PKR ' +
+          formatNumber(
+            item.price,
+            2
+          ) +
+          ' · ' +
+          escapeHtml(
+            item.sector ||
+            'Unknown sector'
+          ) +
+          ' · Analyst ' +
+          escapeHtml(
+            analyst.financialView ||
+            'UNAVAILABLE'
+          ) +
+          ' · Evidence ' +
+          (
+            analyst.coveragePct !==
+              null &&
+            analyst.coveragePct !==
+              undefined
+              ? formatNumber(
+                  analyst.coveragePct,
+                  0
+                ) + '%'
+              : 'N/A'
+          ) +
+          '</div>' +
+          '<div class="opportunityReason">' +
+          escapeHtml(
+            item.reason ||
+            ''
+          ) +
+          '</div>' +
+          (
+            firstRisk
+              ? '<div class="opportunityConcern">Risk: ' +
+                escapeHtml(
+                  firstRisk
+                ) +
+                '</div>'
+              : ''
+          ) +
+          '</div>' +
+          '<div class="opportunityAction ' +
+          escapeHtml(
+            String(
+              item.decisionCenterView ||
+              ''
+            ).toLowerCase()
+          ) +
+          '">' +
+          escapeHtml(
+            decisionActionLabel(
+              item.decisionCenterView
+            )
+          ) +
+          '</div>' +
+          '</div>'
+        );
+      }
+    ).join('');
+}
+
+function renderOpportunityBoard(
+  result
+) {
+  const board =
+    result?.opportunityBoard ||
+    {};
+
+  const priority1 =
+    board.priority1 ||
+    [];
+
+  const priority2 =
+    board.priority2 ||
+    [];
+
+  const research =
+    board.researchRequired ||
+    [];
+
+  const avoid =
+    board.avoid ||
+    [];
+
+  renderOpportunityList(
+    'priorityOneList',
+    priority1,
+    'No company currently earns Priority 1 under the strict analyst-evidence gate.'
+  );
+
+  renderOpportunityList(
+    'priorityTwoList',
+    priority2,
+    'No Priority 2 opportunity currently stands out.'
+  );
+
+  renderOpportunityList(
+    'researchRequiredList',
+    research,
+    'No shortlisted company is currently blocked by missing analyst evidence.'
+  );
+
+  renderOpportunityList(
+    'avoidList',
+    avoid,
+    'No evidence-backed avoid candidate in the current deep shortlist.'
+  );
+
+  if ($('priorityOneCount')) {
+    $('priorityOneCount')
+      .textContent =
+        priority1.length;
+  }
+
+  if ($('priorityTwoCount')) {
+    $('priorityTwoCount')
+      .textContent =
+        priority2.length;
+  }
+
+  if ($('researchRequiredCount')) {
+    $('researchRequiredCount')
+      .textContent =
+        research.length;
+  }
+
+  if ($('avoidCount')) {
+    $('avoidCount')
+      .textContent =
+        avoid.length;
+  }
+}
+
+function renderDecisionAudit(
+  result
+) {
+  const target =
+    $('decisionAudit');
+
+  if (!target) {
+    return;
+  }
+
+  const screening =
+    result?.screening ||
+    {};
+
+  const metrics = [
+    [
+      'Eligible universe',
+      screening.eligibleUniverse
+    ],
+    [
+      'Liquidity passed',
+      screening.liquidityPassed
+    ],
+    [
+      'Shortlisted',
+      screening.shortlisted
+    ],
+    [
+      'History analyzed',
+      screening.historicalAnalyzed
+    ],
+    [
+      'Deep analyzed',
+      screening.deepAnalyzed
+    ],
+    [
+      'Data blocked',
+      screening.dataBlocked
+    ]
+  ];
+
+  target.innerHTML =
+    metrics.map(
+      item =>
+        '<div class="auditMetric"><span>' +
+        escapeHtml(
+          item[0]
+        ) +
+        '</span><strong>' +
+        formatNumber(
+          item[1] ||
+          0,
+          0
+        ) +
+        '</strong></div>'
+    ).join('');
+}
+
+function homeDecisionSummaryData(
+  result
+) {
+  const board =
+    result?.opportunityBoard ||
+    {};
+
+  return {
+    savedAt:
+      new Date()
+        .toISOString(),
+    action:
+      result?.decision?.action ||
+      'WATCH',
+    headline:
+      result?.decision?.headline ||
+      '',
+    amount:
+      result?.input?.amount ||
+      0,
+    invested:
+      result?.decision
+        ?.amountInvestedPkr ||
+      0,
+    cash:
+      result?.decision
+        ?.cashRemainingPkr ||
+      0,
+    priority1:
+      (board.priority1 || [])
+        .map(
+          item =>
+            item.symbol
+        )
+        .slice(0, 5),
+    priority2Count:
+      (board.priority2 || [])
+        .length,
+    researchCount:
+      (board.researchRequired || [])
+        .length
+  };
+}
+
+function renderHomeDecisionSummary(
+  summary
+) {
+  const target =
+    $('homeDecisionSummary');
+
+  if (!target) {
+    return;
+  }
+
+  if (!summary) {
+    target.innerHTML =
+      '<div class="terminalEmpty">Run your first analysis in Decision Center.</div>';
+    return;
+  }
+
+  target.innerHTML =
+    '<div class="homeDecisionHeadline"><div><strong>' +
+    escapeHtml(
+      decisionActionLabel(
+        summary.action
+      )
+    ) +
+    '</strong><div class="homeDecisionMeta">' +
+    escapeHtml(
+      summary.headline ||
+      ''
+    ) +
+    '</div></div><div class="homeDecisionMeta">PKR ' +
+    formatNumber(
+      summary.amount,
+      0
+    ) +
+    '</div></div>' +
+    '<div class="homeDecisionMeta">Allocate PKR ' +
+    formatNumber(
+      summary.invested,
+      0
+    ) +
+    ' · Keep PKR ' +
+    formatNumber(
+      summary.cash,
+      0
+    ) +
+    ' cash · Priority 2: ' +
+    formatNumber(
+      summary.priority2Count,
+      0
+    ) +
+    ' · Research required: ' +
+    formatNumber(
+      summary.researchCount,
+      0
+    ) +
+    '</div>' +
+    (
+      summary.priority1?.length
+        ? '<div class="homeDecisionSymbols">' +
+          summary.priority1
+            .map(
+              symbol =>
+                '<span>' +
+                escapeHtml(
+                  symbol
+                ) +
+                '</span>'
+            )
+            .join('') +
+          '</div>'
+        : ''
     );
 }
 
@@ -33890,13 +35738,6 @@ function renderShadowDecision(
       ? result.allocations
       : [];
 
-  const candidates =
-    Array.isArray(
-      result.candidates
-    )
-      ? result.candidates
-      : [];
-
   let html =
     '<div class="decisionShadowBanner">SHADOW MODEL · NOT REAL-MONEY ELIGIBLE</div>' +
     '<div class="decisionOutcome">' +
@@ -33912,7 +35753,7 @@ function renderShadowDecision(
       ''
     ) +
     '</div></div>' +
-    '<span>Evidence coverage ' +
+    '<span>Analyst evidence ' +
     formatNumber(
       decision.evidenceStrength ||
       0,
@@ -33928,220 +35769,106 @@ function renderShadowDecision(
       0
     ) +
     '</strong></div>' +
-    '<div><span>Shadow allocation</span><strong>PKR ' +
+    '<div><span>Buy now</span><strong>PKR ' +
     formatNumber(
       decision.amountInvestedPkr ||
       0,
       0
     ) +
     '</strong></div>' +
-    '<div><span>Cash kept</span><strong>PKR ' +
+    '<div><span>Cash retained</span><strong>PKR ' +
     formatNumber(
       decision.cashRemainingPkr ||
       0,
       0
     ) +
     '</strong></div>' +
+    '</div>' +
+    '<div class="decisionMetaLine">' +
+    escapeHtml(
+      decision.reason ||
+      ''
+    ) +
     '</div>';
 
   if (allocations.length) {
     html +=
-      '<div class="decisionMetaLine">Experimental allocation</div>';
+      '<div class="decisionMetaLine">Whole-share implementation</div>';
 
     html +=
-      allocations
-        .map(
-          item =>
-            '<div class="decisionAllocationRow">' +
-            '<div class="decisionSymbol">' +
-            escapeHtml(
-              item.symbol
-            ) +
-            '</div>' +
-            '<div><strong>' +
-            formatNumber(
-              item.shares,
-              0
-            ) +
-            ' share' +
-            (
-              Number(
-                item.shares
-              ) === 1
-                ? ''
-                : 's'
-            ) +
-            ' · PKR ' +
-            formatNumber(
-              item.principalPkr,
-              0
-            ) +
-            '</strong><div class="decisionMinor">' +
-            escapeHtml(
-              item.companyName ||
+      allocations.map(
+        item =>
+          '<div class="decisionAllocationRow">' +
+          '<div class="decisionSymbol">' +
+          escapeHtml(
+            item.symbol
+          ) +
+          '</div>' +
+          '<div><strong>' +
+          formatNumber(
+            item.shares,
+            0
+          ) +
+          ' share' +
+          (
+            Number(
+              item.shares
+            ) === 1
+              ? ''
+              : 's'
+          ) +
+          ' · PKR ' +
+          formatNumber(
+            item.principalPkr,
+            0
+          ) +
+          '</strong><div class="decisionMinor">' +
+          escapeHtml(
+            item.companyName ||
+            ''
+          ) +
+          ' · actual ' +
+          formatNumber(
+            item.actualWeightPct,
+            1
+          ) +
+          '% of entered capital</div></div>' +
+          '<div class="decisionActionTag ' +
+          escapeHtml(
+            String(
+              item.action ||
               ''
-            ) +
-            ' · score ' +
-            formatNumber(
-              item.overallScore,
-              0
-            ) +
-            '</div></div>' +
-            '<div class="decisionActionTag ' +
-            escapeHtml(
-              String(
-                item.action ||
-                ''
-              ).toLowerCase()
-            ) +
-            '">' +
-            escapeHtml(
-              decisionActionLabel(
-                item.action
-              )
-            ) +
-            '</div>' +
-            '</div>'
-        )
-        .join('');
+            ).toLowerCase()
+          ) +
+          '">' +
+          escapeHtml(
+            decisionActionLabel(
+              item.action
+            )
+          ) +
+          '</div>' +
+          '</div>'
+      ).join('');
+  } else {
+    html +=
+      '<div class="decisionMetaLine">No capital is allocated until a Priority 1 thesis passes the evidence gate and at least one whole share fits the amount/risk limits.</div>';
   }
 
-  if (candidates.length) {
+  const unfunded =
+    result?.allocationDiagnostics
+      ?.unfundedPriorityOne ||
+    [];
+
+  if (unfunded.length) {
     html +=
-      '<div class="decisionMetaLine">Top candidates checked deeply</div>';
-
-    html +=
-      candidates
-        .slice(0, 4)
-        .map(
-          candidate => {
-            const firstPositive =
-              candidate.narrative
-                ?.positives?.[0] ||
-              candidate.actionReason ||
-              '';
-
-            const firstRisk =
-              candidate.narrative
-                ?.risks?.[0] ||
-              '';
-
-            const analystView =
-              candidate.analystCore
-                ?.overallFinancialView
-                ?.state ||
-              'UNAVAILABLE';
-
-            const analystCoverage =
-              candidate.analystCore
-                ?.coverage
-                ?.coreCoveragePct;
-
-            const earningsQuality =
-              candidate.analystCore
-                ?.views
-                ?.earningsQuality
-                ?.state ||
-              'UNAVAILABLE';
-
-            const cashFlowQuality =
-              candidate.analystCore
-                ?.views
-                ?.cashFlowQuality
-                ?.state ||
-              'UNAVAILABLE';
-
-            return (
-              '<div class="decisionCandidateRow">' +
-              '<div class="decisionSymbol">' +
-              escapeHtml(
-                candidate.symbol
-              ) +
-              '</div>' +
-              '<div><strong>Score ' +
-              formatNumber(
-                candidate.overallScore,
-                0
-              ) +
-              '</strong><div class="decisionMinor">F ' +
-              formatNumber(
-                candidate.fundamental?.score,
-                0
-              ) +
-              ' · V ' +
-              formatNumber(
-                candidate.valuation?.score,
-                0
-              ) +
-              ' · Entry ' +
-              formatNumber(
-                candidate.entry?.score,
-                0
-              ) +
-              ' · Risk ' +
-              formatNumber(
-                candidate.risk?.score,
-                0
-              ) +
-              ' · Data ' +
-              formatNumber(
-                candidate.dataQuality?.score,
-                0
-              ) +
-              '</div><div class="decisionMinor">Analyst ' +
-              escapeHtml(
-                analystView
-              ) +
-              ' · Core evidence ' +
-              (
-                analystCoverage !== null &&
-                analystCoverage !== undefined
-                  ? formatNumber(
-                      analystCoverage,
-                      0
-                    ) + '%'
-                  : 'N/A'
-              ) +
-              ' · Earnings ' +
-              escapeHtml(
-                earningsQuality
-              ) +
-              ' · Cash ' +
-              escapeHtml(
-                cashFlowQuality
-              ) +
-              '</div><div class="decisionMinor">' +
-              escapeHtml(
-                firstPositive
-              ) +
-              (
-                firstRisk
-                  ? ' Risk: ' +
-                    escapeHtml(
-                      firstRisk
-                    )
-                  : ''
-              ) +
-              '</div></div>' +
-              '<div class="decisionActionTag ' +
-              escapeHtml(
-                String(
-                  candidate.action ||
-                  ''
-                ).toLowerCase()
-              ) +
-              '">' +
-              escapeHtml(
-                decisionActionLabel(
-                  candidate.action
-                )
-              ) +
-              '</div>' +
-              '</div>'
-            );
-          }
-        )
-        .join('');
+      '<div class="decisionMetaLine"><strong>Priority 1 not fitted:</strong> ' +
+      unfunded.map(
+        item =>
+          escapeHtml(
+            item.symbol
+          )
+      ).join(', ') +
+      '. NOMAD kept these ranked instead of replacing them with weaker cheaper stocks.</div>';
   }
 
   html +=
@@ -34166,10 +35893,36 @@ function renderShadowDecision(
           )
     ) +
     '</div>' +
-    '<div class="decisionMetaLine">Execution costs are not included yet. Do not use this shadow output as a trade instruction.</div>';
+    '<div class="decisionMetaLine">Execution costs and forward-return scenarios are not included yet. This remains shadow research, not a trade instruction.</div>';
 
   target.innerHTML =
     html;
+
+  renderOpportunityBoard(
+    result
+  );
+
+  renderDecisionAudit(
+    result
+  );
+
+  const summary =
+    homeDecisionSummaryData(
+      result
+    );
+
+  try {
+    localStorage.setItem(
+      'nomadLastDecisionSummary',
+      JSON.stringify(
+        summary
+      )
+    );
+  } catch {}
+
+  renderHomeDecisionSummary(
+    summary
+  );
 }
 
 if ($('findBestOption')) {
@@ -34224,8 +35977,8 @@ if ($('findBestOption')) {
         $('decisionResult')
           .innerHTML =
             '<div class="decisionShadowBanner">SHADOW MODEL</div>' +
-            '<strong>NOMAD is screening the eligible universe.</strong><br>' +
-            'It is checking affordability, liquidity, historical conditions, fundamentals, entry timing and risk. This can take a few seconds.';
+            '<strong>NOMAD is ranking the eligible universe.</strong><br>' +
+            'Opportunity ranking is independent of your budget. NOMAD is checking liquidity, history, fundamentals, Financial Analyst evidence, valuation, entry and risk before the separate whole-share allocator runs.';
 
         try {
           const result =
@@ -34361,6 +36114,24 @@ try {
   }
 } catch {}
 
+try {
+  const storedDecisionSummary =
+    JSON.parse(
+      localStorage.getItem(
+        'nomadLastDecisionSummary'
+      ) ||
+      'null'
+    );
+
+  renderHomeDecisionSummary(
+    storedDecisionSummary
+  );
+} catch {
+  renderHomeDecisionSummary(
+    null
+  );
+}
+
 loadDecisionCenter();
 
 /* =========================================================
@@ -34436,6 +36207,12 @@ module.exports.decisionEngine = {
     scoreDecisionFundamentals,
   allocate:
     allocateDecisionCandidates,
+  allocateDecisionCenter:
+    allocateDecisionCenterOpportunities,
+  opportunityBoard:
+    buildDecisionOpportunityBoard,
+  analystGate:
+    decisionCenterAnalystGate,
   candidateAction:
     decisionCandidateAction
 };
