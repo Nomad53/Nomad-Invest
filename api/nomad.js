@@ -3,7 +3,7 @@
 const http = require('node:http');
 const crypto = require('node:crypto');
 
-const VERSION = '0.6.2';
+const VERSION = '0.6.3';
 
 const PSX_API_BASE =
   process.env.PSX_API_BASE ||
