@@ -3,7 +3,7 @@
 const http = require('node:http');
 const crypto = require('node:crypto');
 
-const VERSION = '0.6.5';
+const VERSION = '0.6.6';
 
 const PSX_API_BASE =
   process.env.PSX_API_BASE ||
@@ -2566,6 +2566,105 @@ function normalizeCompanyIdentityName(
     .trim();
 }
 
+function normalizeListingHeaderText(
+  value
+) {
+  return String(
+    value || ''
+  )
+    .replace(
+      /\s+/g,
+      ' '
+    )
+    .trim();
+}
+
+function findCompanyHeaderAnchor(
+  lines,
+  companyName,
+  symbol
+) {
+  const normalizedSymbol =
+    normalizeSymbol(
+      symbol
+    );
+
+  for (
+    let index = 0;
+    index < lines.length;
+    index++
+  ) {
+    const candidate =
+      normalizeSymbol(
+        lines[index]
+      );
+
+    if (
+      candidate !==
+      normalizedSymbol
+    ) {
+      continue;
+    }
+
+    const nearby =
+      lines
+        .slice(
+          index,
+          Math.min(
+            lines.length,
+            index + 14
+          )
+        )
+        .join(' ')
+        .toUpperCase();
+
+    if (
+      nearby.includes(
+        'QUOTE'
+      )
+    ) {
+      return index;
+    }
+  }
+
+  const normalizedCompany =
+    normalizeCompanyIdentityName(
+      companyName
+    );
+
+  if (
+    normalizedCompany
+  ) {
+    for (
+      let index = 0;
+      index < lines.length;
+      index++
+    ) {
+      const normalizedLine =
+        normalizeCompanyIdentityName(
+          lines[index]
+        );
+
+      if (
+        normalizedLine ===
+          normalizedCompany ||
+        (
+          normalizedLine.includes(
+            normalizedCompany
+          ) &&
+          normalizedLine.length <=
+            normalizedCompany.length +
+            80
+        )
+      ) {
+        return index;
+      }
+    }
+  }
+
+  return -1;
+}
+
 function parseCompanyListingInfo(
   lines,
   companyName,
@@ -2578,10 +2677,16 @@ function parseCompanyListingInfo(
     tradingStatusLabel:
       null,
 
+    statusEvidence:
+      null,
+
     boardType:
       null,
 
     boardLabel:
+      null,
+
+    boardEvidence:
       null,
 
     sectorName:
@@ -2590,64 +2695,109 @@ function parseCompanyListingInfo(
     successorName:
       null,
 
+    successorSymbol:
+      null,
+
     statusCodes: []
   };
 
-  if (!companyName) {
-    return info;
-  }
-
-  const companyLineIndex =
-    lines.findIndex(
-      line =>
-        String(
-          line || ''
-        )
-          .trim()
-          .toLowerCase() ===
-        companyName
-          .toLowerCase()
+  const anchorIndex =
+    findCompanyHeaderAnchor(
+      lines,
+      companyName,
+      symbol
     );
 
   if (
-    companyLineIndex < 0
+    anchorIndex < 0
   ) {
+    if (
+      /^GEM[A-Z0-9]/
+        .test(
+          normalizeSymbol(
+            symbol
+          )
+        ) ||
+      /\(\s*GEM\s*\)/i
+        .test(
+          String(
+            companyName || ''
+          )
+        )
+    ) {
+      info.boardType =
+        'GEM';
+
+      info.boardLabel =
+        'GEM Board';
+
+      info.boardEvidence =
+        'PSX symbol/name GEM marker';
+    }
+
     return info;
   }
 
-  const knownTradingStatuses = {
-    DELISTED:
-      'Delisted',
-
-    SUSPENDED:
-      'Suspended',
-
-    CHANGED:
-      'Changed / renamed',
-
-    RENAMED:
-      'Changed / renamed',
-
-    MERGED:
-      'Merged / amalgamated'
-  };
-
-  for (
-    let index =
-      companyLineIndex + 1;
-
-    index <
+  const headerLines =
+    lines.slice(
+      anchorIndex,
       Math.min(
         lines.length,
-        companyLineIndex + 20
-      );
+        anchorIndex + 55
+      )
+    );
 
-    index++
+  const knownTradingStatuses = [
+    {
+      pattern:
+        /\bDELISTED\b/i,
+      status:
+        'DELISTED',
+      label:
+        'Delisted'
+    },
+    {
+      pattern:
+        /\bSUSPENDED\b/i,
+      status:
+        'SUSPENDED',
+      label:
+        'Suspended'
+    },
+    {
+      pattern:
+        /\bCHANGED\b/i,
+      status:
+        'CHANGED',
+      label:
+        'Changed / renamed'
+    },
+    {
+      pattern:
+        /\bRENAMED\b/i,
+      status:
+        'CHANGED',
+      label:
+        'Changed / renamed'
+    },
+    {
+      pattern:
+        /\b(?:MERGED|AMALGAMATED)\b/i,
+      status:
+        'MERGED',
+      label:
+        'Merged / amalgamated'
+    }
+  ];
+
+  for (
+    const rawLine
+    of headerLines
   ) {
     const rawCandidate =
-      String(
-        lines[index] || ''
-      ).trim();
+      normalizeListingHeaderText(
+        rawLine
+      );
 
     const candidate =
       rawCandidate
@@ -2657,96 +2807,64 @@ function parseCompanyListingInfo(
       continue;
     }
 
-    if (
-      isSecurityStatusToken(
-        candidate
-      )
+    for (
+      const token
+      of candidate
+        .split(/\s+/)
     ) {
-      info.statusCodes.push(
-        candidate
-      );
-
-      continue;
+      if (
+        isSecurityStatusToken(
+          token
+        )
+      ) {
+        info.statusCodes.push(
+          token
+        );
+      }
     }
 
     const changedTo =
       rawCandidate.match(
-        /^CHANGED\s+TO\s*:\s*(.+)$/i
+        /\bCHANGED\s+TO\s*:\s*(.+)$/i
       );
 
     if (changedTo) {
       info.successorName =
-        String(
-          changedTo[1] || ''
-        ).trim();
-
-      continue;
+        normalizeListingHeaderText(
+          changedTo[1]
+        );
     }
 
     if (
-      Object.prototype
-        .hasOwnProperty
-        .call(
-          knownTradingStatuses,
-          candidate
-        )
+      !info.explicitTradingStatus
     ) {
-      info.explicitTradingStatus =
-        candidate ===
-          'RENAMED'
-          ? 'CHANGED'
-          : candidate;
+      for (
+        const statusInfo
+        of knownTradingStatuses
+      ) {
+        if (
+          statusInfo.pattern.test(
+            rawCandidate
+          )
+        ) {
+          info.explicitTradingStatus =
+            statusInfo.status;
 
-      info.tradingStatusLabel =
-        knownTradingStatuses[
-          candidate
-        ];
+          info.tradingStatusLabel =
+            statusInfo.label;
 
-      continue;
-    }
+          info.statusEvidence =
+            'PSX company header: ' +
+            statusInfo.status;
 
-    if (
-      candidate ===
-        normalizeSymbol(
-          symbol
-        )
-    ) {
-      continue;
-    }
-
-    if (
-      /^(QUOTE|PROFILE|EQUITY|ANNOUNCEMENTS|FINANCIALS|RATIOS|PAYOUTS|REPORTS|REG|DFC|CSF|ODL|SELECT)$/i
-        .test(
-          candidate
-        )
-    ) {
-      continue;
-    }
-
-    if (
-      /^RS\.?/i
-        .test(
-          candidate
-        ) ||
-      /^PKR\b/i
-        .test(
-          candidate
-        ) ||
-      /^\d/
-        .test(
-          candidate
-        ) ||
-      /^[+-]?\d+(?:\.\d+)?%$/
-        .test(
-          candidate
-        )
-    ) {
-      continue;
+          break;
+        }
+      }
     }
 
     const gemMatch =
       rawCandidate.match(
-        /^GEM\s+BOARD\s*-\s*(.*)$/i
+        /\bGEM\s+BOARD\s*-\s*(.*)$/i
       );
 
     if (gemMatch) {
@@ -2756,12 +2874,17 @@ function parseCompanyListingInfo(
       info.boardLabel =
         'GEM Board';
 
-      const gemSector =
-        String(
-          gemMatch[1] || ''
-        ).trim();
+      info.boardEvidence =
+        'PSX company header: GEM BOARD';
 
-      if (gemSector) {
+      const gemSector =
+        normalizeListingHeaderText(
+          gemMatch[1]
+        );
+
+      if (
+        gemSector
+      ) {
         info.sectorName =
           gemSector.toUpperCase();
       }
@@ -2770,8 +2893,10 @@ function parseCompanyListingInfo(
     }
 
     if (
-      candidate ===
-        'GEM BOARD'
+      /\bGEM\s+BOARD\b/i
+        .test(
+          rawCandidate
+        )
     ) {
       info.boardType =
         'GEM';
@@ -2779,23 +2904,129 @@ function parseCompanyListingInfo(
       info.boardLabel =
         'GEM Board';
 
+      info.boardEvidence =
+        'PSX company header: GEM BOARD';
+
       continue;
     }
+  }
 
-    if (
-      candidate.length <=
-        120 &&
-      candidate ===
-        candidate.toUpperCase() &&
-      !candidate.startsWith(
-        'CHANGED TO:'
-      )
+  if (
+    !info.boardType &&
+    (
+      /^GEM[A-Z0-9]/
+        .test(
+          normalizeSymbol(
+            symbol
+          )
+        ) ||
+      /\(\s*GEM\s*\)/i
+        .test(
+          String(
+            companyName || ''
+          )
+        )
+    )
+  ) {
+    info.boardType =
+      'GEM';
+
+    info.boardLabel =
+      'GEM Board';
+
+    info.boardEvidence =
+      'PSX symbol/name GEM marker';
+  }
+
+  if (
+    !info.sectorName
+  ) {
+    const normalizedCompany =
+      normalizeCompanyIdentityName(
+        companyName
+      );
+
+    const normalizedSymbol =
+      normalizeSymbol(
+        symbol
+      );
+
+    for (
+      const rawLine
+      of headerLines
     ) {
+      const rawCandidate =
+        normalizeListingHeaderText(
+          rawLine
+        );
+
+      const candidate =
+        rawCandidate
+          .toUpperCase();
+
+      if (!candidate) {
+        continue;
+      }
+
+      const normalizedCandidate =
+        normalizeCompanyIdentityName(
+          rawCandidate
+        );
+
       if (
-        !info.sectorName
+        candidate ===
+          normalizedSymbol ||
+        normalizedCandidate ===
+          normalizedCompany ||
+        candidate.startsWith(
+          'CHANGED TO:'
+        ) ||
+        /\b(?:DELISTED|SUSPENDED|CHANGED|RENAMED|MERGED|AMALGAMATED)\b/i
+          .test(
+            candidate
+          ) ||
+        /\bGEM\s+BOARD\b/i
+          .test(
+            candidate
+          ) ||
+        /^(QUOTE|PROFILE|EQUITY|ANNOUNCEMENTS|FINANCIALS|RATIOS|PAYOUTS|REPORTS|REG|DFC|CSF|ODL|SELECT)$/i
+          .test(
+            candidate
+          ) ||
+        /^RS\.?/i
+          .test(
+            candidate
+          ) ||
+        /^PKR\b/i
+          .test(
+            candidate
+          ) ||
+        /^\^?\s*AS\s+OF\b/i
+          .test(
+            candidate
+          ) ||
+        /^\d/
+          .test(
+            candidate
+          ) ||
+        /^[+-]?\d+(?:\.\d+)?%$/
+          .test(
+            candidate
+          )
+      ) {
+        continue;
+      }
+
+      if (
+        candidate.length <=
+          120 &&
+        candidate ===
+          candidate.toUpperCase()
       ) {
         info.sectorName =
           candidate;
+
+        break;
       }
     }
   }
@@ -2807,6 +3038,63 @@ function parseCompanyListingInfo(
       uniqueStrings(
         info.statusCodes
       )
+  };
+}
+
+function parseSuccessorFromCompanyPageHTML(
+  html
+) {
+  const source =
+    String(
+      html || ''
+    );
+
+  const changedIndex =
+    source.search(
+      /CHANGED\s+TO/i
+    );
+
+  if (
+    changedIndex < 0
+  ) {
+    return {
+      successorName:
+        null,
+      successorSymbol:
+        null
+    };
+  }
+
+  const fragment =
+    source.slice(
+      changedIndex,
+      changedIndex + 1800
+    );
+
+  const symbolMatch =
+    fragment.match(
+      /href=["'][^"']*\/company\/([^"'/?#]+)[^"']*["']/i
+    );
+
+  const nameMatch =
+    fragment.match(
+      /<a\b[^>]*>([\s\S]*?)<\/a>/i
+    );
+
+  return {
+    successorName:
+      nameMatch
+        ? cleanHtmlCell(
+            nameMatch[1]
+          )
+        : null,
+
+    successorSymbol:
+      symbolMatch
+        ? normalizeSymbol(
+            symbolMatch[1]
+          )
+        : null
   };
 }
 
@@ -2844,6 +3132,26 @@ function parsePSXCompanyPage(
       companyName,
       symbol
     );
+
+  const successorFromHTML =
+    parseSuccessorFromCompanyPageHTML(
+      html
+    );
+
+  if (
+    successorFromHTML.successorName &&
+    !listing.successorName
+  ) {
+    listing.successorName =
+      successorFromHTML.successorName;
+  }
+
+  if (
+    successorFromHTML.successorSymbol
+  ) {
+    listing.successorSymbol =
+      successorFromHTML.successorSymbol;
+  }
 
   const sectorName =
     listing.sectorName ||
@@ -2990,6 +3298,11 @@ function parsePSXCompanyPage(
         pageStatusCodes
       ),
 
+    pageIdentityValid:
+      Boolean(
+        companyName
+      ),
+
     listing: {
       explicitTradingStatus:
         listing.explicitTradingStatus,
@@ -2997,14 +3310,23 @@ function parsePSXCompanyPage(
       tradingStatusLabel:
         listing.tradingStatusLabel,
 
+      statusEvidence:
+        listing.statusEvidence,
+
       boardType:
         listing.boardType,
 
       boardLabel:
         listing.boardLabel,
 
+      boardEvidence:
+        listing.boardEvidence,
+
       successorName:
         listing.successorName,
+
+      successorSymbol:
+        listing.successorSymbol,
 
       source:
         'PSX Data Portal company page'
@@ -3113,6 +3435,254 @@ async function getPSXCompanySnapshot(
   );
 
   return data;
+}
+
+function waitMilliseconds(
+  milliseconds
+) {
+  return new Promise(
+    resolve =>
+      setTimeout(
+        resolve,
+        milliseconds
+      )
+  );
+}
+
+async function mapWithConcurrency(
+  items,
+  limit,
+  mapper
+) {
+  const list =
+    Array.isArray(
+      items
+    )
+      ? items
+      : [];
+
+  const output =
+    new Array(
+      list.length
+    );
+
+  let nextIndex = 0;
+
+  async function worker() {
+    while (true) {
+      const index =
+        nextIndex++;
+
+      if (
+        index >=
+        list.length
+      ) {
+        return;
+      }
+
+      output[index] =
+        await mapper(
+          list[index],
+          index
+        );
+
+      await waitMilliseconds(
+        90
+      );
+    }
+  }
+
+  const workerCount =
+    Math.max(
+      1,
+      Math.min(
+        Number(limit) || 1,
+        list.length || 1
+      )
+    );
+
+  await Promise.all(
+    Array.from(
+      {
+        length:
+          workerCount
+      },
+      () =>
+        worker()
+    )
+  );
+
+  return output;
+}
+
+async function getPSXCompanySnapshotForAudit(
+  stockSymbol
+) {
+  const symbol =
+    normalizeSymbol(
+      stockSymbol
+    );
+
+  if (!symbol) {
+    return {
+      snapshot:
+        null,
+      fetchStatus:
+        'INVALID_SYMBOL',
+      attempts:
+        0,
+      retried:
+        false,
+      httpStatus:
+        null,
+      error:
+        'Invalid symbol.'
+    };
+  }
+
+  const cached =
+    companyPageCache.get(
+      symbol
+    );
+
+  if (
+    cached &&
+    Date.now() -
+      cached.fetchedAt <
+      30 *
+      60 *
+      1000 &&
+    cached.data?.pageIdentityValid
+  ) {
+    return {
+      snapshot:
+        cached.data,
+      fetchStatus:
+        'SUCCESS_CACHE',
+      attempts:
+        0,
+      retried:
+        false,
+      httpStatus:
+        200,
+      error:
+        null
+    };
+  }
+
+  let lastError =
+    null;
+
+  for (
+    let attempt = 1;
+    attempt <= 2;
+    attempt++
+  ) {
+    try {
+      const html =
+        await fetchText(
+          `${PSX_DPS_BASE}/company/${encodeURIComponent(
+            symbol
+          )}`,
+          30000,
+          {
+            Referer:
+              `${PSX_DPS_BASE}/`,
+
+            'User-Agent':
+              `Mozilla/5.0 NOMAD-Invest/${VERSION}`
+          }
+        );
+
+      const data =
+        parsePSXCompanyPage(
+          html,
+          symbol
+        );
+
+      if (
+        !data?.pageIdentityValid
+      ) {
+        return {
+          snapshot:
+            null,
+          fetchStatus:
+            'INVALID_PAGE',
+          attempts:
+            attempt,
+          retried:
+            attempt > 1,
+          httpStatus:
+            200,
+          error:
+            'PSX returned a page without a recognizable company identity.'
+        };
+      }
+
+      companyPageCache.set(
+        symbol,
+        {
+          fetchedAt:
+            Date.now(),
+
+          data
+        }
+      );
+
+      return {
+        snapshot:
+          data,
+        fetchStatus:
+          'SUCCESS',
+        attempts:
+          attempt,
+        retried:
+          attempt > 1,
+        httpStatus:
+          200,
+        error:
+          null
+      };
+    } catch (error) {
+      lastError =
+        error;
+
+      if (
+        attempt < 2
+      ) {
+        await waitMilliseconds(
+          400
+        );
+      }
+    }
+  }
+
+  const httpStatus =
+    Number(
+      lastError?.status ||
+      0
+    ) ||
+    null;
+
+  return {
+    snapshot:
+      null,
+    fetchStatus:
+      httpStatus === 404 ||
+      httpStatus === 410
+        ? 'NOT_FOUND'
+        : 'FETCH_FAILED',
+    attempts:
+      2,
+    retried:
+      true,
+    httpStatus,
+    error:
+      String(
+        lastError?.message ||
+        'PSX company page request failed.'
+      )
+  };
 }
 
 /* =========================================================
@@ -5430,33 +6000,216 @@ function quoteAgeDays(
   );
 }
 
+function inferGemBoard(
+  row,
+  snapshot = null
+) {
+  const listing =
+    snapshot?.listing ||
+    {};
+
+  if (
+    listing.boardType ===
+      'GEM'
+  ) {
+    return {
+      boardType:
+        'GEM',
+      boardLabel:
+        listing.boardLabel ||
+        'GEM Board',
+      boardEvidence:
+        listing.boardEvidence ||
+        'PSX company page GEM Board marker'
+    };
+  }
+
+  const symbol =
+    normalizeSymbol(
+      row?.symbol
+    );
+
+  const name =
+    String(
+      snapshot?.companyName ||
+      row?.companyName ||
+      ''
+    );
+
+  if (
+    /^GEM[A-Z0-9]/
+      .test(
+        symbol
+      ) ||
+    /\(\s*GEM\s*\)/i
+      .test(
+        name
+      )
+  ) {
+    return {
+      boardType:
+        'GEM',
+      boardLabel:
+        'GEM Board',
+      boardEvidence:
+        'Verified GEM symbol/name marker'
+    };
+  }
+
+  return {
+    boardType:
+      row?.boardType ||
+      null,
+    boardLabel:
+      row?.boardLabel ||
+      null,
+    boardEvidence:
+      row?.boardEvidence ||
+      null
+  };
+}
+
 function enrichAuditRowWithSnapshot(
   row,
   snapshot,
   knownSymbols,
-  companyNameIndex
+  companyNameIndex,
+  fetchDiagnostic = null
 ) {
+  const fetchStatus =
+    fetchDiagnostic?.fetchStatus ||
+    (
+      snapshot
+        ? 'SUCCESS'
+        : 'UNKNOWN'
+    );
+
+  const fetchFields = {
+    companyPageFetchStatus:
+      fetchStatus,
+
+    companyPageFetchAttempts:
+      fetchDiagnostic?.attempts ??
+      null,
+
+    companyPageRetried:
+      Boolean(
+        fetchDiagnostic?.retried
+      ),
+
+    companyPageHTTPStatus:
+      fetchDiagnostic?.httpStatus ??
+      null,
+
+    companyPageFetchError:
+      fetchDiagnostic?.error ||
+      null
+  };
+
   if (!snapshot) {
-    return {
+    const boardInfo =
+      inferGemBoard(
+        row,
+        null
+      );
+
+    let tradingStatus =
+      row.tradingStatus ===
+        'CURRENT'
+        ? 'CURRENT'
+        : 'NO_COMPANY_PAGE_EVIDENCE';
+
+    let tradingStatusLabel =
+      row.tradingStatus ===
+        'CURRENT'
+        ? row.tradingStatusLabel
+        : 'No PSX company-page evidence found';
+
+    let universeClass =
+      row.universeClass;
+
+    let universeLabel =
+      row.universeLabel;
+
+    let universeReason =
+      row.universeReason;
+
+    if (
+      fetchStatus ===
+        'FETCH_FAILED' ||
+      fetchStatus ===
+        'INVALID_PAGE'
+    ) {
+      if (
+        row.tradingStatus !==
+          'CURRENT'
+      ) {
+        tradingStatus =
+          fetchStatus ===
+            'FETCH_FAILED'
+            ? 'PAGE_FETCH_FAILED'
+            : 'PAGE_INVALID';
+
+        tradingStatusLabel =
+          fetchStatus ===
+            'FETCH_FAILED'
+            ? 'PSX company-page request failed - retry later'
+            : 'PSX page returned but identity could not be verified';
+
+        universeClass =
+          row.isSpecialSecurity
+            ? 'SPECIAL_INSTRUMENT'
+            : 'REVIEW_REQUIRED';
+
+        universeLabel =
+          row.isSpecialSecurity
+            ? 'Special instrument'
+            : 'Review required';
+
+        universeReason =
+          'NOMAD could not complete the official PSX company-page status check. This row must not be treated as absent or delisted.';
+      }
+    } else if (
+      row.tradingStatus !==
+        'CURRENT'
+    ) {
+      universeReason =
+        'The symbol remains in the feed, but NOMAD could not retrieve a supporting PSX company page for status resolution.';
+    }
+
+    const base = {
       ...row,
+      ...boardInfo,
+      ...fetchFields,
 
-      tradingStatus:
-        row.tradingStatus ===
-          'CURRENT'
-          ? 'CURRENT'
-          : 'NO_COMPANY_PAGE_EVIDENCE',
+      tradingStatus,
+      tradingStatusLabel,
+      statusEvidence:
+        null,
 
-      tradingStatusLabel:
-        row.tradingStatus ===
-          'CURRENT'
-          ? row.tradingStatusLabel
-          : 'No PSX company-page evidence found',
+      universeClass,
+      universeLabel,
+      universeReason
+    };
 
-      universeReason:
-        row.tradingStatus ===
-          'CURRENT'
-          ? row.universeReason
-          : 'The symbol remains in the feed, but NOMAD could not retrieve a supporting PSX company page for status resolution.'
+    const eligibility =
+      deriveEligibility(
+        base
+      );
+
+    const withEligibility = {
+      ...base,
+      ...eligibility
+    };
+
+    const issue =
+      deriveIssueState(
+        withEligibility
+      );
+
+    return {
+      ...withEligibility,
+      ...issue
     };
   }
 
@@ -5502,6 +6255,16 @@ function enrichAuditRowWithSnapshot(
     snapshot.listing ||
     {};
 
+  const boardInfo =
+    inferGemBoard(
+      {
+        ...row,
+        companyName,
+        sector
+      },
+      snapshot
+    );
+
   let tradingStatus =
     pageListing.explicitTradingStatus ||
     row.tradingStatus ||
@@ -5517,13 +6280,20 @@ function enrichAuditRowWithSnapshot(
     null;
 
   let successorSymbol =
+    pageListing.successorSymbol ||
+    null;
+
+  if (
+    !successorSymbol &&
     successorName
-      ? matchCurrentSymbolByCompanyName(
-          successorName,
-          companyNameIndex,
-          row.symbol
-        )
-      : null;
+  ) {
+    successorSymbol =
+      matchCurrentSymbolByCompanyName(
+        successorName,
+        companyNameIndex,
+        row.symbol
+      );
+  }
 
   if (
     !successorSymbol &&
@@ -5654,7 +6424,9 @@ function enrichAuditRowWithSnapshot(
       'Historical / inactive';
 
     universeReason =
-      'Official company-page evidence indicates that this is not a normal current trading identity.';
+      pageListing.statusEvidence
+        ? 'Official PSX company-page header provides an explicit historical trading-status signal.'
+        : 'Official company-page evidence indicates that this is not a normal current trading identity.';
   } else if (
     tradingStatus ===
       'SUSPENDED'
@@ -5704,6 +6476,7 @@ function enrichAuditRowWithSnapshot(
 
   const enriched = {
     ...row,
+    ...fetchFields,
 
     companyName,
     sector,
@@ -5711,18 +6484,13 @@ function enrichAuditRowWithSnapshot(
     sectorResolved,
 
     ...typeInfo,
+    ...boardInfo,
 
     tradingStatus,
     tradingStatusLabel,
 
-    boardType:
-      pageListing.boardType ||
-      row.boardType ||
-      null,
-
-    boardLabel:
-      pageListing.boardLabel ||
-      row.boardLabel ||
+    statusEvidence:
+      pageListing.statusEvidence ||
       null,
 
     successorName,
@@ -5848,17 +6616,70 @@ async function getSecurityStatusBatch(
       )
       .filter(Boolean);
 
-  const snapshots =
-    await Promise.all(
-      rows.map(
-        row =>
-          getPSXCompanySnapshot(
-            row.symbol
-          ).catch(
-            () => null
-          )
-      )
+  const fetchResults =
+    await mapWithConcurrency(
+      rows,
+      4,
+      row =>
+        getPSXCompanySnapshotForAudit(
+          row.symbol
+        )
     );
+
+  const diagnostics = {
+    requested:
+      requested.length,
+
+    attempted:
+      rows.length,
+
+    succeeded:
+      fetchResults.filter(
+        item =>
+          item?.snapshot
+      ).length,
+
+    retried:
+      fetchResults.filter(
+        item =>
+          item?.retried
+      ).length,
+
+    notFound:
+      fetchResults.filter(
+        item =>
+          item?.fetchStatus ===
+          'NOT_FOUND'
+      ).length,
+
+    fetchFailed:
+      fetchResults.filter(
+        item =>
+          item?.fetchStatus ===
+          'FETCH_FAILED'
+      ).length,
+
+    invalidPage:
+      fetchResults.filter(
+        item =>
+          item?.fetchStatus ===
+          'INVALID_PAGE'
+      ).length,
+
+    totalAttempts:
+      fetchResults.reduce(
+        (
+          sum,
+          item
+        ) =>
+          sum +
+          Number(
+            item?.attempts ||
+            0
+          ),
+        0
+      )
+  };
 
   return {
     version:
@@ -5871,6 +6692,8 @@ async function getSecurityStatusBatch(
     requested:
       requested.length,
 
+    diagnostics,
+
     rows:
       rows.map(
         (
@@ -5879,9 +6702,12 @@ async function getSecurityStatusBatch(
         ) =>
           enrichAuditRowWithSnapshot(
             row,
-            snapshots[index],
+            fetchResults[index]?.snapshot ||
+            null,
             knownSymbols,
-            companyNameIndex
+            companyNameIndex,
+            fetchResults[index] ||
+            null
           )
       )
   };
@@ -14232,6 +15058,10 @@ function renderMetadataAuditSummary(
     result.sourceCoverage ||
     {};
 
+  const fetchDiagnostics =
+    result.fetchDiagnostics ||
+    {};
+
   $('metadataAuditSummary')
     .innerHTML =
       '<div class="summaryGrid">' +
@@ -14372,10 +15202,30 @@ function renderMetadataAuditSummary(
         'Deep PSX status checks'
       ) +
 
+      metricCard(
+        'Page retries',
+        formatNumber(
+          fetchDiagnostics.retried ||
+          0,
+          0
+        ),
+        'Automatic one-time retry'
+      ) +
+
+      metricCard(
+        'Page fetch failures',
+        formatNumber(
+          fetchDiagnostics.fetchFailed ||
+          0,
+          0
+        ),
+        'Kept review-required, never treated as delisted'
+      ) +
+
       '</div>' +
 
       '<div class="infoBox">' +
-      'Build 0.6.5 separates trading status, security type, issuer type and future universe eligibility. No symbol is removed automatically. Delisted/changed/suspended classifications come from PSX company-page evidence; unclear rows remain review-required.' +
+      'Build 0.6.6 strengthens PSX company-header parsing, GEM Board recognition and fetch reliability. Explicit DELISTED / SUSPENDED / CHANGED / MERGED labels take priority over quote-age heuristics. Failed page requests remain review-required and are never treated as evidence of delisting.' +
       '</div>';
 }
 
@@ -14768,6 +15618,25 @@ function renderMetadataAuditTable() {
                     '</span>'
                   )
             ) +
+            (
+              row.statusEvidence
+                ? (
+                    '<span class="symbolSub">' +
+                    escapeHtml(
+                      row.statusEvidence
+                    ) +
+                    '</span>'
+                  )
+                : ''
+            ) +
+            (
+              row.companyPageFetchStatus ===
+                'FETCH_FAILED'
+                ? (
+                    '<span class="symbolSub negative">Page fetch failed after retry</span>'
+                  )
+                : ''
+            ) +
             '</td>' +
 
             '<td>' +
@@ -14905,7 +15774,23 @@ async function deepResolveMetadataAudit(
           row.universeClass ===
             'LEGACY_STALE_CANDIDATE' ||
           row.universeClass ===
-            'SPECIAL_INSTRUMENT'
+            'SPECIAL_INSTRUMENT' ||
+          row.boardType ===
+            'GEM' ||
+          /^GEM[A-Z0-9]/
+            .test(
+              String(
+                row.symbol ||
+                ''
+              ).toUpperCase()
+            ) ||
+          /\(\s*GEM\s*\)/i
+            .test(
+              String(
+                row.companyName ||
+                ''
+              )
+            )
       )
       .map(
         row =>
@@ -14920,6 +15805,25 @@ async function deepResolveMetadataAudit(
 
   let successfulBatches =
     0;
+
+  const fetchDiagnostics = {
+    requested:
+      0,
+    attempted:
+      0,
+    succeeded:
+      0,
+    retried:
+      0,
+    notFound:
+      0,
+    fetchFailed:
+      0,
+    invalidPage:
+      0,
+    totalAttempts:
+      0
+  };
 
   for (
     let index = 0;
@@ -14960,6 +15864,22 @@ async function deepResolveMetadataAudit(
         }
       );
 
+      const diagnostics =
+        batchResult.diagnostics ||
+        {};
+
+      Object.keys(
+        fetchDiagnostics
+      ).forEach(
+        key => {
+          fetchDiagnostics[key] +=
+            Number(
+              diagnostics[key] ||
+              0
+            );
+        }
+      );
+
       successfulBatches++;
     } catch (error) {
       console.warn(
@@ -14972,6 +15892,9 @@ async function deepResolveMetadataAudit(
   const resolved =
     recalculateMetadataAuditResult({
       ...result,
+
+      fetchDiagnostics,
+
       universe:
         Array.from(
           universeMap.values()
@@ -14984,7 +15907,15 @@ async function deepResolveMetadataAudit(
       successfulBatches +
       '/' +
       batches.length +
-      ' batches completed. No securities were removed.';
+      ' batches. Pages: ' +
+      fetchDiagnostics.succeeded +
+      ' resolved, ' +
+      fetchDiagnostics.retried +
+      ' retried, ' +
+      fetchDiagnostics.fetchFailed +
+      ' fetch failures, ' +
+      fetchDiagnostics.notFound +
+      ' not found. No securities were removed.';
 
   return resolved;
 }
@@ -15072,6 +16003,9 @@ function downloadMetadataAuditCSV() {
     'Universe Class',
     'Universe Eligibility',
     'Official Evidence',
+    'Status Evidence',
+    'Company Page Fetch Status',
+    'Company Page Retried',
     'All Metadata Sources',
     'Issue Type',
     'Issue Bucket',
@@ -15126,6 +16060,13 @@ function downloadMetadataAuditCSV() {
           row.officialEvidenceSources ||
           []
         ).join(' | '),
+        row.statusEvidence ||
+          '',
+        row.companyPageFetchStatus ||
+          '',
+        row.companyPageRetried
+          ? 'Yes'
+          : 'No',
         (
           row.metadataSources ||
           []
