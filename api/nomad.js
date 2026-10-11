@@ -151,10 +151,13 @@ function isSecurityStatusToken(
       value
     );
 
-  return /^X[A-Z]$/
-    .test(
-      token
-    );
+  return (
+    token === 'NC' ||
+    /^X[A-Z]$/
+      .test(
+        token
+      )
+  );
 }
 
 function uniqueStrings(
