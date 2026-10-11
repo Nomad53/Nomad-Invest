@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.8.0';
+const VERSION = '0.8.1';
 
 
 const SUPABASE_URL =
@@ -19,6 +19,10 @@ const SUPABASE_URL =
   )
     .trim()
     .replace(
+      /\/rest\/v1\/?$/i,
+      ''
+    )
+    .replace(
       /\/+$/,
       ''
     );
@@ -26,6 +30,13 @@ const SUPABASE_URL =
 const SUPABASE_SECRET_KEY =
   String(
     process.env.SUPABASE_SECRET_KEY ||
+    ''
+  ).trim();
+
+
+const NOMAD_SCANNER_SECRET =
+  String(
+    process.env.NOMAD_SCANNER_SECRET ||
     ''
   ).trim();
 
@@ -12138,7 +12149,7 @@ async function supabaseRest(
       'application/json',
 
     'User-Agent':
-      'NOMAD-Invest-Server/0.8.0'
+      'NOMAD-Invest-Server/0.8.1'
   };
 
   if (
@@ -12229,7 +12240,10 @@ async function readSecurityMemory(symbol) {
     : null;
 }
 
-async function createIntelligenceRun(metadata = {}) {
+async function createIntelligenceRun(
+  metadata = {},
+  runType = 'manual'
+) {
   const rows =
     await supabaseRest(
       'intelligence_runs?select=id,started_at',
@@ -12237,7 +12251,7 @@ async function createIntelligenceRun(metadata = {}) {
         method: 'POST',
         prefer: 'return=representation',
         body: {
-          run_type: 'manual',
+          run_type: runType,
           status: 'running',
           universe_version:
             PSX_UNIVERSE_MASTER.masterVersion,
@@ -12990,6 +13004,843 @@ async function runContinuousMemoryTest(
   }
 }
 
+
+/* =========================================================
+   CONTINUOUS INTELLIGENCE SCANNER - BUILD 0.8.1
+========================================================= */
+
+function scannerSecretConfigured() {
+  return Boolean(
+    NOMAD_SCANNER_SECRET
+  );
+}
+
+function scannerRequestAuthorized(
+  request
+) {
+  if (!scannerSecretConfigured()) {
+    return false;
+  }
+
+  const direct =
+    String(
+      request.headers[
+        'x-nomad-scanner-secret'
+      ] ||
+      ''
+    ).trim();
+
+  const authorization =
+    String(
+      request.headers.authorization ||
+      ''
+    ).trim();
+
+  const bearer =
+    authorization
+      .replace(
+        /^Bearer\s+/i,
+        ''
+      )
+      .trim();
+
+  const supplied =
+    direct ||
+    (
+      /^Bearer\s+/i.test(
+        authorization
+      )
+        ? bearer
+        : ''
+    );
+
+  return Boolean(
+    supplied &&
+    safeEqual(
+      supplied,
+      NOMAD_SCANNER_SECRET
+    )
+  );
+}
+
+function normalizeStatusArray(
+  value
+) {
+  return (
+    Array.isArray(value)
+      ? value
+      : []
+  )
+    .map(
+      item =>
+        String(item || '')
+          .trim()
+          .toUpperCase()
+    )
+    .filter(Boolean)
+    .sort();
+}
+
+function sameStringArray(
+  a,
+  b
+) {
+  return (
+    JSON.stringify(
+      normalizeStatusArray(a)
+    ) ===
+    JSON.stringify(
+      normalizeStatusArray(b)
+    )
+  );
+}
+
+function marketMoveSignificance(
+  percentageChange
+) {
+  const absolute =
+    Math.abs(
+      safeNumber(
+        percentageChange
+      ) || 0
+    );
+
+  if (absolute >= 8) {
+    return 'critical';
+  }
+
+  if (absolute >= 4) {
+    return 'high';
+  }
+
+  if (absolute >= 1.5) {
+    return 'medium';
+  }
+
+  return 'low';
+}
+
+function scannerStateHash(
+  marketState,
+  previous
+) {
+  return crypto
+    .createHash('sha256')
+    .update(
+      JSON.stringify({
+        marketState,
+        technicalState:
+          previous?.technical_state ||
+          {},
+        fundamentalState:
+          previous?.fundamental_state ||
+          {},
+        currentView:
+          previous?.current_view ||
+          null
+      })
+    )
+    .digest('hex');
+}
+
+function buildScannerSecurityState(
+  marketRow,
+  previous,
+  runId,
+  evaluatedAt
+) {
+  const symbol =
+    normalizeSymbol(
+      marketRow.symbol
+    );
+
+  const currentPrice =
+    safeNumber(
+      marketRow.price
+    );
+
+  const previousPrice =
+    safeNumber(
+      previous?.market_price
+    );
+
+  const scanChangePct =
+    previousPrice !== null &&
+    previousPrice !== 0 &&
+    currentPrice !== null
+      ? (
+          (
+            currentPrice -
+            previousPrice
+          ) /
+          Math.abs(
+            previousPrice
+          )
+        ) * 100
+      : null;
+
+  const marketState = {
+    asOf:
+      marketRow.asOf ||
+      null,
+    price:
+      roundMemoryNumber(
+        currentPrice,
+        4
+      ),
+    peRatio:
+      roundMemoryNumber(
+        marketRow.peRatio,
+        4
+      ),
+    dividendYield:
+      roundMemoryNumber(
+        marketRow.dividendYield,
+        4
+      ),
+    averageVolume30d:
+      roundMemoryNumber(
+        marketRow.averageVolume30d,
+        2
+      ),
+    change1yPct:
+      roundMemoryNumber(
+        marketRow.change1yPct,
+        2
+      ),
+    statusCodes:
+      normalizeStatusArray(
+        marketRow.statusCodes
+      ),
+    scanChangePct:
+      roundMemoryNumber(
+        scanChangePct,
+        4
+      )
+  };
+
+  const state = {
+    symbol,
+    company_name:
+      marketRow.companyName ||
+      previous?.company_name ||
+      symbol,
+    sector:
+      marketRow.sector ||
+      previous?.sector ||
+      null,
+    universe_class:
+      marketRow.universeClass ||
+      previous?.universe_class ||
+      null,
+    eligibility:
+      marketRow.recommendationEligible === true
+        ? 'RECOMMENDATION_ELIGIBLE'
+        : 'NOT_RECOMMENDATION_ELIGIBLE',
+    market_price:
+      roundMemoryNumber(
+        currentPrice,
+        4
+      ),
+    market_change_pct:
+      roundMemoryNumber(
+        scanChangePct,
+        4
+      ),
+    volume:
+      previous?.volume ??
+      null,
+    volume_ratio_20d:
+      previous?.volume_ratio_20d ??
+      null,
+    technical_score:
+      previous?.technical_score ??
+      null,
+    fundamental_score:
+      previous?.fundamental_score ??
+      null,
+    risk_score:
+      previous?.risk_score ??
+      null,
+    overall_score:
+      previous?.overall_score ??
+      null,
+    technical_state:
+      previous?.technical_state ||
+      {},
+    fundamental_state:
+      previous?.fundamental_state ||
+      {},
+    risk_state:
+      previous?.risk_state ||
+      {},
+    market_state:
+      marketState,
+    current_view:
+      previous?.current_view ||
+      'Market baseline established',
+    current_view_reason:
+      previous?.current_view_reason ||
+      'NOMAD has a persistent market baseline. Deeper technical and fundamental views are updated by their respective intelligence engines.',
+    data_quality_score:
+      previous?.data_quality_score ??
+      70,
+    source_timestamp:
+      marketRow.asOf ||
+      null,
+    last_run_id:
+      runId,
+    state_hash:
+      scannerStateHash(
+        marketState,
+        previous
+      ),
+    evaluated_at:
+      evaluatedAt,
+    created_at:
+      previous?.created_at ||
+      evaluatedAt
+  };
+
+  return {
+    state,
+    scanChangePct
+  };
+}
+
+function detectScannerChanges(
+  marketRow,
+  previous,
+  currentState,
+  scanChangePct
+) {
+  if (!previous) {
+    return [];
+  }
+
+  const changes = [];
+  const absoluteMove =
+    Math.abs(
+      safeNumber(
+        scanChangePct
+      ) || 0
+    );
+
+  if (
+    scanChangePct !== null &&
+    absoluteMove >= 1.5
+  ) {
+    const oldPrice =
+      safeNumber(
+        previous.market_price
+      );
+
+    const newPrice =
+      safeNumber(
+        currentState.market_price
+      );
+
+    changes.push({
+      symbol:
+        currentState.symbol,
+      change_category:
+        'market',
+      field_name:
+        'market_price',
+      old_value: {
+        value: oldPrice
+      },
+      new_value: {
+        value: newPrice
+      },
+      absolute_change:
+        roundMemoryNumber(
+          newPrice !== null &&
+          oldPrice !== null
+            ? newPrice - oldPrice
+            : null,
+          4
+        ),
+      percentage_change:
+        roundMemoryNumber(
+          scanChangePct,
+          4
+        ),
+      significance:
+        marketMoveSignificance(
+          scanChangePct
+        ),
+      summary:
+        currentState.symbol +
+        ' moved ' +
+        (
+          scanChangePct > 0
+            ? '+'
+            : ''
+        ) +
+        roundMemoryNumber(
+          scanChangePct,
+          2
+        ) +
+        '% since NOMAD\'s previous market snapshot.',
+      evidence: {
+        source:
+          'psxdata-api',
+        previousPrice:
+          oldPrice,
+        currentPrice:
+          newPrice,
+        sourceTimestamp:
+          marketRow.asOf ||
+          null
+      }
+    });
+  }
+
+  const previousStatuses =
+    previous.market_state
+      ?.statusCodes ||
+    [];
+
+  const currentStatuses =
+    marketRow.statusCodes ||
+    [];
+
+  if (
+    !sameStringArray(
+      previousStatuses,
+      currentStatuses
+    )
+  ) {
+    changes.push({
+      symbol:
+        currentState.symbol,
+      change_category:
+        'security_status',
+      field_name:
+        'status_codes',
+      old_value: {
+        value:
+          normalizeStatusArray(
+            previousStatuses
+          )
+      },
+      new_value: {
+        value:
+          normalizeStatusArray(
+            currentStatuses
+          )
+      },
+      absolute_change:
+        null,
+      percentage_change:
+        null,
+      significance:
+        'high',
+      summary:
+        currentState.symbol +
+        ' market-status code changed from [' +
+        normalizeStatusArray(
+          previousStatuses
+        ).join(', ') +
+        '] to [' +
+        normalizeStatusArray(
+          currentStatuses
+        ).join(', ') +
+        '].',
+      evidence: {
+        source:
+          'PSX market feed'
+      }
+    });
+  }
+
+  return changes;
+}
+
+async function readAllSecurityMemory() {
+  const rows =
+    await supabaseRest(
+      'security_state?select=*'
+    );
+
+  return Array.isArray(rows)
+    ? rows
+    : [];
+}
+
+async function upsertSecurityStatesBulk(
+  states
+) {
+  const saved = [];
+  const chunkSize = 100;
+
+  for (
+    let index = 0;
+    index < states.length;
+    index += chunkSize
+  ) {
+    const chunk =
+      states.slice(
+        index,
+        index + chunkSize
+      );
+
+    const rows =
+      await supabaseRest(
+        'security_state?on_conflict=symbol&select=symbol,evaluated_at,market_price',
+        {
+          method: 'POST',
+          prefer:
+            'resolution=merge-duplicates,return=representation',
+          body:
+            chunk
+        }
+      );
+
+    if (Array.isArray(rows)) {
+      saved.push(
+        ...rows
+      );
+    }
+  }
+
+  return saved;
+}
+
+async function saveScannerChangesBulk(
+  runId,
+  changes
+) {
+  if (!changes.length) {
+    return [];
+  }
+
+  const saved = [];
+  const chunkSize = 100;
+
+  for (
+    let index = 0;
+    index < changes.length;
+    index += chunkSize
+  ) {
+    const chunk =
+      changes
+        .slice(
+          index,
+          index + chunkSize
+        )
+        .map(
+          change => ({
+            run_id:
+              runId,
+            ...change
+          })
+        );
+
+    const rows =
+      await supabaseRest(
+        'state_changes?select=id,symbol,field_name,percentage_change,significance,summary,detected_at',
+        {
+          method: 'POST',
+          prefer:
+            'return=representation',
+          body:
+            chunk
+        }
+      );
+
+    if (Array.isArray(rows)) {
+      saved.push(
+        ...rows
+      );
+    }
+  }
+
+  return saved;
+}
+
+async function runMarketSnapshotScan(
+  runType = 'manual'
+) {
+  if (!continuousMemoryConfigured()) {
+    bad(
+      'Continuous intelligence database is not configured.',
+      503
+    );
+  }
+
+  const run =
+    await createIntelligenceRun(
+      {
+        scanner:
+          'CORE_EQUITY_MARKET_SNAPSHOT',
+        build:
+          VERSION,
+        purpose:
+          'Detect meaningful market-state changes without waiting for the user to open a stock.'
+      },
+      runType
+    );
+
+  try {
+    const [
+      market,
+      previousRows
+    ] =
+      await Promise.all([
+        loadPSXMarket(),
+        readAllSecurityMemory()
+      ]);
+
+    const previousMap =
+      new Map(
+        previousRows.map(
+          row => [
+            normalizeSymbol(
+              row.symbol
+            ),
+            row
+          ]
+        )
+      );
+
+    const coreRows =
+      market.stocks.filter(
+        row =>
+          row.recommendationEligible ===
+          true
+      );
+
+    const evaluatedAt =
+      new Date().toISOString();
+
+    const states = [];
+    const changes = [];
+    let firstBaselines = 0;
+
+    for (
+      const marketRow
+      of coreRows
+    ) {
+      const symbol =
+        normalizeSymbol(
+          marketRow.symbol
+        );
+
+      const previous =
+        previousMap.get(
+          symbol
+        ) ||
+        null;
+
+      if (!previous) {
+        firstBaselines += 1;
+      }
+
+      const built =
+        buildScannerSecurityState(
+          marketRow,
+          previous,
+          run.id,
+          evaluatedAt
+        );
+
+      states.push(
+        built.state
+      );
+
+      changes.push(
+        ...detectScannerChanges(
+          marketRow,
+          previous,
+          built.state,
+          built.scanChangePct
+        )
+      );
+    }
+
+    await upsertSecurityStatesBulk(
+      states
+    );
+
+    const savedChanges =
+      await saveScannerChangesBulk(
+        run.id,
+        changes
+      );
+
+    await finishIntelligenceRun(
+      run.id,
+      {
+        status:
+          'completed',
+        securities_processed:
+          states.length,
+        changes_detected:
+          changes.length,
+        signals_generated:
+          0,
+        alerts_generated:
+          0,
+        predictions_generated:
+          0,
+        metadata: {
+          scanner:
+            'CORE_EQUITY_MARKET_SNAPSHOT',
+          build:
+            VERSION,
+          marketAsOf:
+            market.asOf,
+          firstBaselines
+        }
+      }
+    );
+
+    const attention =
+      [...savedChanges]
+        .sort(
+          (
+            a,
+            b
+          ) =>
+            Math.abs(
+              safeNumber(
+                b.percentage_change
+              ) || 0
+            ) -
+            Math.abs(
+              safeNumber(
+                a.percentage_change
+              ) || 0
+            )
+        )
+        .slice(0, 10);
+
+    return {
+      status:
+        'OK',
+      runId:
+        run.id,
+      runType,
+      marketAsOf:
+        market.asOf,
+      coreUniverse:
+        coreRows.length,
+      securitiesProcessed:
+        states.length,
+      firstBaselines,
+      changesDetected:
+        changes.length,
+      meaningfulChanges:
+        savedChanges.filter(
+          item =>
+            item.significance !==
+            'low'
+        ).length,
+      attention
+    };
+  } catch (error) {
+    await finishIntelligenceRun(
+      run.id,
+      {
+        status:
+          'failed',
+        error_message:
+          String(
+            error.message ||
+            'Scanner failed.'
+          ).slice(
+            0,
+            1000
+          )
+      }
+    ).catch(
+      () => {}
+    );
+
+    throw error;
+  }
+}
+
+async function getIntelligenceFeed() {
+  if (!continuousMemoryConfigured()) {
+    return {
+      configured:
+        false,
+      latestRun:
+        null,
+      stateCoverage:
+        0,
+      coreUniverse:
+        PSX_UNIVERSE_MASTER.summary
+          .coreEquity,
+      attention:
+        []
+    };
+  }
+
+  const [
+    runs,
+    states,
+    changes
+  ] =
+    await Promise.all([
+      supabaseRest(
+        'intelligence_runs?select=id,run_type,status,started_at,completed_at,securities_processed,changes_detected,error_message,metadata&order=started_at.desc&limit=5'
+      ),
+      supabaseRest(
+        'security_state?select=symbol,market_price,current_view,evaluated_at&eligibility=eq.RECOMMENDATION_ELIGIBLE'
+      ),
+      supabaseRest(
+        'state_changes?select=id,symbol,change_category,field_name,old_value,new_value,percentage_change,significance,summary,detected_at&order=detected_at.desc&limit=60'
+      )
+    ]);
+
+  const meaningful =
+    (
+      Array.isArray(changes)
+        ? changes
+        : []
+    )
+      .filter(
+        item =>
+          [
+            'medium',
+            'high',
+            'critical'
+          ].includes(
+            item.significance
+          )
+      )
+      .slice(0, 12);
+
+  return {
+    configured:
+      true,
+    scannerSecretConfigured:
+      scannerSecretConfigured(),
+    latestRun:
+      Array.isArray(runs) &&
+      runs.length
+        ? runs[0]
+        : null,
+    recentRuns:
+      Array.isArray(runs)
+        ? runs
+        : [],
+    stateCoverage:
+      Array.isArray(states)
+        ? states.length
+        : 0,
+    coreUniverse:
+      PSX_UNIVERSE_MASTER.summary
+        .coreEquity,
+    attention:
+      meaningful
+  };
+}
+
 /* =========================================================
    AUTH
 ========================================================= */
@@ -13129,15 +13980,6 @@ async function handler(
   );
 
   try {
-    if (
-      !authorize(
-        request,
-        response
-      )
-    ) {
-      return;
-    }
-
     const url =
       new URL(
         request.url,
@@ -13149,6 +13991,23 @@ async function handler(
         'action'
       ) ||
       'app';
+
+    const scannerAuthorized =
+      action ===
+        'intelligence-scan' &&
+      scannerRequestAuthorized(
+        request
+      );
+
+    if (
+      !scannerAuthorized &&
+      !authorize(
+        request,
+        response
+      )
+    ) {
+      return;
+    }
 
     if (
       request.method ===
@@ -13207,6 +14066,12 @@ async function handler(
               ? 'CONFIGURED'
               : 'NOT_CONFIGURED',
 
+          intelligenceScanner:
+            'MARKET_SNAPSHOT_IMPLEMENTED',
+
+          scannerSecretConfigured:
+            scannerSecretConfigured(),
+
           supabaseConfigured:
             continuousMemoryConfigured(),
 
@@ -13228,6 +14093,38 @@ async function handler(
           tradeExecution:
             false
         }
+      );
+    }
+
+    if (
+      request.method ===
+        'GET' &&
+      action ===
+        'intelligence-feed'
+    ) {
+      return sendJSON(
+        response,
+        await getIntelligenceFeed()
+      );
+    }
+
+    if (
+      (
+        request.method ===
+          'GET' ||
+        request.method ===
+          'POST'
+      ) &&
+      action ===
+        'intelligence-scan'
+    ) {
+      return sendJSON(
+        response,
+        await runMarketSnapshotScan(
+          scannerAuthorized
+            ? 'scheduled'
+            : 'manual'
+        )
       );
     }
 
@@ -14390,22 +15287,581 @@ pre {
 
 }
 
+
+
+/* =========================================================
+   APP SHELL + DECISION CENTER - BUILD 0.8.1
+========================================================= */
+
+:root {
+  --nomad-navy: #0b1728;
+  --nomad-navy-2: #132238;
+  --nomad-accent: #1f6f8b;
+  --nomad-bg: #f3f6fa;
+  --nomad-card: #ffffff;
+  --nomad-border: #dfe6ee;
+  --nomad-text: #172a3c;
+  --nomad-muted: #6b7c8f;
+}
+
+body {
+  background: var(--nomad-bg);
+}
+
+.appShell {
+  min-height: 100vh;
+  display: flex;
+}
+
+.sidebar {
+  position: fixed;
+  inset: 0 auto 0 0;
+  width: 238px;
+  box-sizing: border-box;
+  padding: 22px 14px 16px;
+  background: var(--nomad-navy);
+  color: #fff;
+  display: flex;
+  flex-direction: column;
+  z-index: 30;
+  border-right: 1px solid rgba(255,255,255,.06);
+}
+
+.brandBlock {
+  display: flex;
+  gap: 11px;
+  align-items: center;
+  padding: 2px 8px 24px;
+}
+
+.brandMark {
+  width: 36px;
+  height: 36px;
+  border-radius: 9px;
+  display: grid;
+  place-items: center;
+  font-weight: 800;
+  background: #fff;
+  color: var(--nomad-navy);
+}
+
+.brandName {
+  font-size: 16px;
+  font-weight: 750;
+}
+
+.brandSub,
+.sidebarFoot {
+  color: #8fa2b8;
+  font-size: 11px;
+}
+
+.sideNav {
+  display: grid;
+  gap: 5px;
+}
+
+.navButton {
+  width: 100%;
+  text-align: left;
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  border: 0;
+  padding: 11px 12px;
+  border-radius: 8px;
+  background: transparent;
+  color: #c9d4e1;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.navButton:hover,
+.navButton.active {
+  background: #223149;
+  color: #fff;
+}
+
+.navButton span {
+  width: 18px;
+  opacity: .85;
+}
+
+.sideSpacer {
+  flex: 1;
+}
+
+.sideNavBottom {
+  margin-top: 18px;
+}
+
+.sidebarFoot {
+  padding: 14px 12px 0;
+}
+
+.appMain {
+  width: calc(100% - 238px);
+  max-width: none;
+  margin: 0 0 0 238px;
+  padding: 0 32px 48px;
+  box-sizing: border-box;
+}
+
+.topBar {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  min-height: 72px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  background: rgba(243,246,250,.94);
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid rgba(211,220,230,.75);
+}
+
+.topSearchWrap {
+  flex: 1;
+}
+
+.topSearch {
+  margin: 0;
+  background: #fff;
+  border-radius: 9px;
+  padding: 12px 15px;
+  border: 1px solid #d8e1ea;
+}
+
+.askNomadButton {
+  white-space: nowrap;
+  background: var(--nomad-navy);
+}
+
+.legacyHeader,
+body > main > header {
+  display: none;
+}
+
+.appPage {
+  display: none;
+  max-width: 1320px;
+  margin: 0 auto;
+}
+
+.appPage.active {
+  display: block;
+}
+
+#error {
+  max-width: 1320px;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+.notice,
+#status {
+  display: none;
+}
+
+.decisionHero {
+  margin: 28px 0 18px;
+  padding: 28px 30px;
+  border-radius: 14px;
+  background: linear-gradient(135deg, #0b1728, #172b44);
+  color: #fff;
+  display: flex;
+  justify-content: space-between;
+  gap: 28px;
+  align-items: center;
+}
+
+.decisionHero h1 {
+  margin: 4px 0 7px;
+  font-size: 32px;
+}
+
+.decisionHero p {
+  max-width: 720px;
+  margin: 0;
+  color: #c2cede;
+  line-height: 1.55;
+}
+
+.eyebrow {
+  font-size: 11px;
+  letter-spacing: .12em;
+  font-weight: 800;
+  color: #6f8499;
+}
+
+.decisionHero .eyebrow {
+  color: #80a7bd;
+}
+
+.heroStatus {
+  min-width: 210px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 13px 15px;
+  border: 1px solid rgba(255,255,255,.12);
+  background: rgba(255,255,255,.06);
+  border-radius: 10px;
+}
+
+.statusDot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #4fd39a;
+  box-shadow: 0 0 0 5px rgba(79,211,154,.1);
+}
+
+.heroStatus .metricLabel {
+  color: #98abc0;
+}
+
+.heroStatusValue {
+  font-weight: 750;
+  margin-top: 2px;
+}
+
+.decisionGrid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.65fr) minmax(300px, .9fr);
+  gap: 16px;
+}
+
+.decisionCard {
+  background: #fff;
+  border: 1px solid var(--nomad-border);
+  border-radius: 12px;
+  padding: 20px;
+  box-shadow: 0 1px 2px rgba(16,31,50,.03);
+}
+
+.attentionCard {
+  grid-row: span 2;
+  min-height: 390px;
+}
+
+.cardTopline {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.cardTopline h2,
+.decisionCard h2 {
+  margin: 4px 0 12px;
+  font-size: 21px;
+}
+
+.ghostButton {
+  background: #f3f6f9;
+  color: #274158;
+  border: 1px solid #dce5ed;
+}
+
+.fullButton {
+  width: 100%;
+  margin-top: 16px;
+}
+
+.attentionFeed {
+  display: grid;
+  gap: 0;
+  border-top: 1px solid #edf1f5;
+}
+
+.attentionItem {
+  display: grid;
+  grid-template-columns: 76px minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  padding: 15px 0;
+  border-bottom: 1px solid #edf1f5;
+}
+
+.attentionSymbol {
+  font-weight: 800;
+  font-size: 15px;
+}
+
+.attentionSummary {
+  font-size: 14px;
+  line-height: 1.4;
+}
+
+.attentionTime {
+  margin-top: 3px;
+  color: var(--nomad-muted);
+  font-size: 11px;
+}
+
+.severityPill {
+  font-size: 10px;
+  text-transform: uppercase;
+  font-weight: 800;
+  letter-spacing: .05em;
+  border-radius: 999px;
+  padding: 5px 8px;
+  background: #eef3f7;
+  color: #617487;
+}
+
+.severityPill.high,
+.severityPill.critical {
+  background: #fff0ee;
+  color: #b73c32;
+}
+
+.severityPill.medium {
+  background: #fff7e5;
+  color: #946b12;
+}
+
+.emptyState {
+  padding: 44px 8px;
+  color: var(--nomad-muted);
+  text-align: center;
+}
+
+.contextCard label {
+  font-size: 12px;
+  color: #5d7084;
+}
+
+.moneyInputWrap {
+  display: flex;
+  align-items: center;
+  border: 1px solid #d7e0e9;
+  border-radius: 9px;
+  overflow: hidden;
+  margin: 7px 0 14px;
+}
+
+.moneyInputWrap span {
+  padding: 0 0 0 12px;
+  color: #64778a;
+  font-weight: 700;
+}
+
+.moneyInputWrap input {
+  border: 0;
+  margin: 0;
+  font-size: 20px;
+  font-weight: 760;
+}
+
+.contextRow {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.contextRow select {
+  margin-top: 6px;
+}
+
+.primaryWide {
+  width: 100%;
+  margin-top: 12px;
+}
+
+.smallStatus {
+  min-height: 16px;
+  margin-top: 9px;
+  font-size: 12px;
+  color: var(--nomad-muted);
+}
+
+.bigMetric {
+  margin-top: 8px;
+  font-size: 34px;
+  font-weight: 800;
+  letter-spacing: -.03em;
+}
+
+.bigMetric small {
+  font-size: 16px;
+  color: #8090a0;
+}
+
+.progressTrack {
+  height: 7px;
+  margin-top: 16px;
+  border-radius: 999px;
+  background: #e9eef3;
+  overflow: hidden;
+}
+
+.progressFill {
+  width: 0%;
+  height: 100%;
+  background: var(--nomad-accent);
+  transition: width .25s ease;
+}
+
+.scanHeadline {
+  font-size: 21px;
+  font-weight: 770;
+  margin: 8px 0 5px;
+}
+
+.quickCard {
+  grid-column: 1 / -1;
+}
+
+.quickAction {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  background: transparent;
+  color: #22384d;
+  border: 0;
+  border-bottom: 1px solid #edf1f5;
+  border-radius: 0;
+  padding: 12px 0;
+  text-align: left;
+}
+
+.quickAction:last-child {
+  border-bottom: 0;
+}
+
+.principleStrip {
+  margin: 16px 0 30px;
+  padding: 13px 16px;
+  border-left: 3px solid var(--nomad-accent);
+  background: #eaf2f6;
+  color: #385065;
+  border-radius: 7px;
+  font-size: 13px;
+}
+
+.card.appPage {
+  margin-top: 26px;
+}
+
+@media (max-width: 900px) {
+  .sidebar {
+    position: static;
+    width: 100%;
+    min-height: auto;
+    padding: 12px;
+  }
+
+  .appShell {
+    display: block;
+  }
+
+  .brandBlock,
+  .sideSpacer,
+  .sideNavBottom,
+  .sidebarFoot {
+    display: none;
+  }
+
+  .sideNav {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  .navButton {
+    justify-content: center;
+    font-size: 12px;
+    padding: 9px 6px;
+  }
+
+  .navButton span {
+    display: none;
+  }
+
+  .appMain {
+    width: 100%;
+    margin: 0;
+    padding: 0 16px 30px;
+  }
+
+  .topBar {
+    min-height: 62px;
+  }
+
+  .decisionHero {
+    display: block;
+    padding: 22px;
+  }
+
+  .heroStatus {
+    margin-top: 18px;
+    min-width: 0;
+  }
+
+  .decisionGrid {
+    grid-template-columns: 1fr;
+  }
+
+  .attentionCard,
+  .quickCard {
+    grid-row: auto;
+    grid-column: auto;
+  }
+}
+
 </style>
 
 </head>
 
 <body>
 
-<main>
+<div class="appShell">
 
-<header>
+<aside class="sidebar">
+
+<div class="brandBlock">
+<div class="brandMark">N</div>
+<div>
+<div class="brandName">NOMAD Invest</div>
+<div class="brandSub">Decision intelligence</div>
+</div>
+</div>
+
+<nav class="sideNav">
+<button class="navButton active" data-nav="home"><span>⌂</span>Home</button>
+<button class="navButton" data-nav="research"><span>⌕</span>Research</button>
+<button class="navButton" data-nav="explore"><span>↗</span>Explore PSX</button>
+<button class="navButton" data-nav="universe"><span>◎</span>Universe</button>
+</nav>
+
+<div class="sideSpacer"></div>
+
+<nav class="sideNav sideNavBottom">
+<button class="navButton" data-nav="system"><span>⚙</span>System</button>
+</nav>
+
+<div class="sidebarFoot">Build ${VERSION}</div>
+
+</aside>
+
+<main class="appMain">
+
+<div class="topBar">
+<div class="topSearchWrap">
+<input id="globalSymbolSearch" class="topSearch" placeholder="Search company or PSX symbol...">
+</div>
+<button id="askNomadButton" class="askNomadButton">Ask NOMAD</button>
+</div>
+
+<header class="legacyHeader">
 
 <div>
 
 <h1>NOMAD Invest</h1>
 
 <div class="sub">
-PSX research and personal investment intelligence
+AI-powered PSX decision intelligence
 </div>
 
 </div>
@@ -14421,8 +15877,7 @@ Build ${VERSION}
 Market, company metadata, fundamentals, symbol normalization,
 canonical universe identity, metadata, fundamentals and deterministic technical analysis are connected.
 
-Persistent intelligence memory is now connected. Predictions and investment recommendations remain disabled
-until their models are built and validated.
+Persistent intelligence memory and the market-change scanner are connected. Recommendations remain disabled until scoring and validation are complete.
 
 </p>
 
@@ -14433,8 +15888,93 @@ Checking connection...
 <p id="error"></p>
 
 <section
-  class="card"
-  id="researchSection"
+  class="appPage active"
+  data-page="home"
+  id="homePage"
+>
+
+<div class="decisionHero">
+<div>
+<div class="eyebrow">DECISION CENTER</div>
+<h1>What matters now?</h1>
+<p>NOMAD watches the market so you can focus on decisions — what changed, why it matters, and where your money could work best.</p>
+</div>
+<div class="heroStatus">
+<div class="statusDot"></div>
+<div>
+<div class="metricLabel">Continuous intelligence</div>
+<div id="homeEngineStatus" class="heroStatusValue">Checking...</div>
+</div>
+</div>
+</div>
+
+<div class="decisionGrid">
+
+<div class="decisionCard attentionCard">
+<div class="cardTopline">
+<div>
+<div class="eyebrow">NEEDS YOUR ATTENTION</div>
+<h2>Meaningful changes</h2>
+</div>
+<button id="refreshIntelligenceFeed" class="ghostButton">Refresh</button>
+</div>
+<div id="attentionFeed" class="attentionFeed">
+<div class="emptyState">Loading NOMAD's latest observations...</div>
+</div>
+</div>
+
+<div class="decisionCard contextCard">
+<div class="eyebrow">YOUR NEXT DECISION</div>
+<h2>Put money to work</h2>
+<p class="muted">Set the amount and decision horizon now. NOMAD's allocation engine will use this context once validated scoring is active.</p>
+<label>Investment amount</label>
+<div class="moneyInputWrap"><span>PKR</span><input id="decisionAmount" inputmode="numeric" value="5000"></div>
+<div class="contextRow">
+<div>
+<label>Horizon</label>
+<select id="decisionHorizon"><option value="long_term">Long-term</option><option value="short_term">Short-term opportunity</option></select>
+</div>
+<div>
+<label>Risk</label>
+<select id="decisionRisk"><option value="balanced">Balanced</option><option value="conservative">Conservative</option><option value="aggressive">Aggressive</option></select>
+</div>
+</div>
+<button id="saveDecisionContext" class="primaryWide">Set decision context</button>
+<div id="decisionContextStatus" class="smallStatus"></div>
+</div>
+
+<div class="decisionCard compactCard">
+<div class="eyebrow">INTELLIGENCE COVERAGE</div>
+<div class="bigMetric"><span id="homeStateCoverage">0</span><small> / ${PSX_UNIVERSE_MASTER.summary.coreEquity}</small></div>
+<div class="muted">Core equities with persistent state</div>
+<div class="progressTrack"><div id="homeCoverageBar" class="progressFill"></div></div>
+</div>
+
+<div class="decisionCard compactCard">
+<div class="eyebrow">LAST SCAN</div>
+<div id="homeLastScan" class="scanHeadline">No scan yet</div>
+<div id="homeLastScanMeta" class="muted">NOMAD will build a market baseline first.</div>
+<button id="homeRunScan" class="ghostButton fullButton">Run intelligence scan</button>
+</div>
+
+<div class="decisionCard compactCard quickCard">
+<div class="eyebrow">QUICK ACTIONS</div>
+<button class="quickAction" data-open-page="research">Research a stock <span>→</span></button>
+<button class="quickAction" data-open-page="explore">Explore PSX <span>→</span></button>
+<button class="quickAction" data-open-page="universe">View investable universe <span>→</span></button>
+</div>
+
+</div>
+
+<div class="principleStrip">
+<strong>NOMAD principle:</strong> Important information comes to you. Advanced information waits until you ask for it.
+</div>
+
+</section>
+
+<section
+  class="card appPage"
+  id="researchSection" data-page="research"
 >
 
 <h2>
@@ -14496,7 +16036,7 @@ More
 
 </section>
 
-<section class="card">
+<section class="card appPage" id="exploreSection" data-page="explore">
 
 <h2>
 Explore PSX
@@ -14621,7 +16161,7 @@ Next
 
 </section>
 
-<section class="card" id="universeMasterSection">
+<section class="card appPage" id="universeMasterSection" data-page="universe">
 
 <h2>Canonical PSX Universe</h2>
 
@@ -14651,12 +16191,28 @@ NOMAD now uses a frozen, versioned security master for identity and recommendati
 
 </section>
 
-<section class="card" id="continuousMemorySection">
+<section class="card appPage" id="scannerSystemSection" data-page="system">
+
+<h2>Intelligence Scanner</h2>
+<p class="muted">The scanner builds a persistent market baseline across the core universe and detects material changes between observations. This is descriptive intelligence, not a Buy/Sell engine.</p>
+
+<div class="summaryGrid">
+<div class="metric"><div class="metricLabel">Core universe</div><div class="metricValue">${PSX_UNIVERSE_MASTER.summary.coreEquity}</div></div>
+<div class="metric"><div class="metricLabel">Scanner</div><div id="scannerSystemState" class="metricValue">Ready</div><div class="metricSub">Market snapshot layer</div></div>
+<div class="metric"><div class="metricLabel">Autonomous schedule</div><div id="scannerScheduleState" class="metricValue">Pending</div><div class="metricSub">Configured separately after scan verification</div></div>
+</div>
+
+<div class="actions"><button id="runIntelligenceScan">Run intelligence scan now</button></div>
+<div id="scanSystemResult" class="infoBox">Run once to establish or refresh the core-equity market baseline.</div>
+
+</section>
+
+<section class="card appPage" id="continuousMemorySection" data-page="system">
 
 <h2>Continuous Intelligence Memory</h2>
 
 <p class="muted">
-Build 0.8.0 connects NOMAD to persistent server-side memory. This test reads a stock's previously stored state, recalculates its current market and technical state, records any changes, and then saves the new state for the next run.
+Developer verification tool. NOMAD reads a stock's previously stored state, recalculates its current market and technical state, records changes, and saves the new state for the next run.
 </p>
 
 <div class="grid3">
@@ -14700,7 +16256,8 @@ Run the test once to create the first observation. Run it again later to prove N
 </section>
 
 <section
-  class="card"
+  class="card appPage"
+  data-page="system"
   id="metadataAuditSection"
   style="display:none"
 >
@@ -15012,6 +16569,8 @@ Next
 </section>
 
 </main>
+
+</div>
 
 <script>
 
@@ -15405,6 +16964,313 @@ async function api(
   }
 
   return result;
+}
+
+
+
+/* =========================================================
+   APP NAVIGATION + DECISION CENTER - BUILD 0.8.1
+========================================================= */
+
+function openAppPage(
+  page
+) {
+  document
+    .querySelectorAll(
+      '.appPage'
+    )
+    .forEach(
+      element => {
+        element.classList.toggle(
+          'active',
+          element.dataset.page ===
+            page
+        );
+      }
+    );
+
+  document
+    .querySelectorAll(
+      '.navButton[data-nav]'
+    )
+    .forEach(
+      button => {
+        button.classList.toggle(
+          'active',
+          button.dataset.nav ===
+            page
+        );
+      }
+    );
+
+  window.scrollTo({
+    top: 0,
+    behavior: 'smooth'
+  });
+}
+
+function relativeTime(
+  value
+) {
+  const time =
+    Date.parse(value);
+
+  if (!Number.isFinite(time)) {
+    return '';
+  }
+
+  const seconds =
+    Math.max(
+      0,
+      Math.round(
+        (
+          Date.now() -
+          time
+        ) /
+        1000
+      )
+    );
+
+  if (seconds < 60) {
+    return seconds + ' sec ago';
+  }
+
+  const minutes =
+    Math.round(
+      seconds / 60
+    );
+
+  if (minutes < 60) {
+    return minutes + ' min ago';
+  }
+
+  const hours =
+    Math.round(
+      minutes / 60
+    );
+
+  if (hours < 24) {
+    return hours + ' hr ago';
+  }
+
+  return Math.round(
+    hours / 24
+  ) + ' d ago';
+}
+
+function renderAttentionFeed(
+  items
+) {
+  const target =
+    $('attentionFeed');
+
+  if (!target) {
+    return;
+  }
+
+  if (
+    !Array.isArray(items) ||
+    !items.length
+  ) {
+    target.innerHTML =
+      '<div class="emptyState">No material changes are waiting for you right now. NOMAD will surface them here when the scanner detects something meaningful.</div>';
+    return;
+  }
+
+  target.innerHTML =
+    items
+      .map(
+        item =>
+          '<div class="attentionItem">' +
+          '<div class="attentionSymbol">' +
+          escapeHtml(
+            item.symbol || '-'
+          ) +
+          '</div>' +
+          '<div>' +
+          '<div class="attentionSummary">' +
+          escapeHtml(
+            item.summary ||
+            'Meaningful state change detected.'
+          ) +
+          '</div>' +
+          '<div class="attentionTime">' +
+          escapeHtml(
+            relativeTime(
+              item.detected_at
+            )
+          ) +
+          '</div>' +
+          '</div>' +
+          '<div class="severityPill ' +
+          escapeHtml(
+            item.significance ||
+            'medium'
+          ) +
+          '">' +
+          escapeHtml(
+            item.significance ||
+            'medium'
+          ) +
+          '</div>' +
+          '</div>'
+      )
+      .join('');
+}
+
+async function loadDecisionCenter() {
+  try {
+    const result =
+      await api(
+        'intelligence-feed'
+      );
+
+    $('homeEngineStatus')
+      .textContent =
+        result.configured
+          ? 'Memory online'
+          : 'Not configured';
+
+    const coverage =
+      Number(
+        result.stateCoverage || 0
+      );
+
+    const total =
+      Number(
+        result.coreUniverse || 0
+      );
+
+    $('homeStateCoverage')
+      .textContent =
+        formatNumber(
+          coverage,
+          0
+        );
+
+    $('homeCoverageBar')
+      .style.width =
+        total > 0
+          ? Math.min(
+              100,
+              (
+                coverage /
+                total
+              ) * 100
+            ) + '%'
+          : '0%';
+
+    if (result.latestRun) {
+      const run =
+        result.latestRun;
+
+      $('homeLastScan')
+        .textContent =
+          run.status === 'completed'
+            ? 'Completed ' +
+              relativeTime(
+                run.completed_at ||
+                run.started_at
+              )
+            : String(
+                run.status ||
+                'Unknown'
+              );
+
+      $('homeLastScanMeta')
+        .textContent =
+          formatNumber(
+            run.securities_processed || 0,
+            0
+          ) +
+          ' securities checked · ' +
+          formatNumber(
+            run.changes_detected || 0,
+            0
+          ) +
+          ' changes recorded';
+    } else {
+      $('homeLastScan')
+        .textContent =
+          'No scan yet';
+
+      $('homeLastScanMeta')
+        .textContent =
+          'Run the first intelligence scan to establish the market baseline.';
+    }
+
+    renderAttentionFeed(
+      result.attention || []
+    );
+
+    if ($('scannerScheduleState')) {
+      $('scannerScheduleState')
+        .textContent =
+          result.scannerSecretConfigured
+            ? 'Ready to schedule'
+            : 'Secret not configured';
+    }
+  } catch (error) {
+    $('homeEngineStatus')
+      .textContent =
+        'Unavailable';
+
+    if ($('attentionFeed')) {
+      $('attentionFeed')
+        .innerHTML =
+          '<div class="emptyState">' +
+          escapeHtml(
+            error.message
+          ) +
+          '</div>';
+    }
+  }
+}
+
+async function runDecisionScanner(
+  outputId
+) {
+  const output =
+    $(outputId);
+
+  if (output) {
+    output.textContent =
+      'Scanning the core equity universe...';
+  }
+
+  try {
+    const result =
+      await api(
+        'intelligence-scan'
+      );
+
+    if (output) {
+      output.innerHTML =
+        '<strong>Scan complete.</strong> ' +
+        formatNumber(
+          result.securitiesProcessed,
+          0
+        ) +
+        ' core equities checked; ' +
+        formatNumber(
+          result.firstBaselines,
+          0
+        ) +
+        ' new baselines; ' +
+        formatNumber(
+          result.changesDetected,
+          0
+        ) +
+        ' material changes recorded.';
+    }
+
+    await loadDecisionCenter();
+  } catch (error) {
+    if (output) {
+      output.textContent =
+        error.message;
+    }
+  }
 }
 
 function clamp(
@@ -22552,6 +24418,197 @@ $('runMemoryTest')
           'Test persistent memory';
       }
     };
+
+
+/* =========================================================
+   APP SHELL EVENTS
+========================================================= */
+
+document
+  .querySelectorAll(
+    '.navButton[data-nav]'
+  )
+  .forEach(
+    button => {
+      button.onclick =
+        () =>
+          openAppPage(
+            button.dataset.nav
+          );
+    }
+  );
+
+document
+  .querySelectorAll(
+    '[data-open-page]'
+  )
+  .forEach(
+    button => {
+      button.onclick =
+        () =>
+          openAppPage(
+            button.dataset.openPage
+          );
+    }
+  );
+
+if ($('globalSymbolSearch')) {
+  $('globalSymbolSearch')
+    .onkeydown =
+      event => {
+        if (event.key !== 'Enter') {
+          return;
+        }
+
+        const symbol =
+          String(
+            $('globalSymbolSearch')
+              .value ||
+            ''
+          )
+            .trim()
+            .toUpperCase();
+
+        if (!symbol) {
+          return;
+        }
+
+        $('stockSymbol')
+          .value =
+            symbol;
+
+        openAppPage(
+          'research'
+        );
+
+        $('loadQuote')
+          .click();
+      };
+}
+
+if ($('askNomadButton')) {
+  $('askNomadButton')
+    .onclick =
+      () => {
+        alert(
+          'Ask NOMAD will become the conversational layer on top of the validated intelligence engine. The current build is establishing the engine first.'
+        );
+      };
+}
+
+if ($('refreshIntelligenceFeed')) {
+  $('refreshIntelligenceFeed')
+    .onclick =
+      () =>
+        loadDecisionCenter();
+}
+
+if ($('homeRunScan')) {
+  $('homeRunScan')
+    .onclick =
+      () =>
+        runDecisionScanner(
+          'homeLastScanMeta'
+        );
+}
+
+if ($('runIntelligenceScan')) {
+  $('runIntelligenceScan')
+    .onclick =
+      () =>
+        runDecisionScanner(
+          'scanSystemResult'
+        );
+}
+
+if ($('saveDecisionContext')) {
+  $('saveDecisionContext')
+    .onclick =
+      () => {
+        const amount =
+          Number(
+            String(
+              $('decisionAmount')
+                .value ||
+              ''
+            ).replace(
+              /,/g,
+              ''
+            )
+          );
+
+        const context = {
+          amount:
+            Number.isFinite(amount) &&
+            amount > 0
+              ? amount
+              : 5000,
+          horizon:
+            $('decisionHorizon')
+              .value,
+          risk:
+            $('decisionRisk')
+              .value
+        };
+
+        localStorage.setItem(
+          'nomadDecisionContext',
+          JSON.stringify(
+            context
+          )
+        );
+
+        $('decisionContextStatus')
+          .textContent =
+            'Decision context saved: PKR ' +
+            formatNumber(
+              context.amount,
+              0
+            ) +
+            '. Allocation recommendations remain disabled until the scoring engine is validated.';
+      };
+}
+
+try {
+  const storedContext =
+    JSON.parse(
+      localStorage.getItem(
+        'nomadDecisionContext'
+      ) ||
+      'null'
+    );
+
+  if (storedContext) {
+    if (
+      storedContext.amount &&
+      $('decisionAmount')
+    ) {
+      $('decisionAmount')
+        .value =
+          storedContext.amount;
+    }
+
+    if (
+      storedContext.horizon &&
+      $('decisionHorizon')
+    ) {
+      $('decisionHorizon')
+        .value =
+          storedContext.horizon;
+    }
+
+    if (
+      storedContext.risk &&
+      $('decisionRisk')
+    ) {
+      $('decisionRisk')
+        .value =
+          storedContext.risk;
+    }
+  }
+} catch {}
+
+loadDecisionCenter();
 
 /* =========================================================
    HEALTH
