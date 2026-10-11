@@ -3,7 +3,7 @@
 const http = require('node:http');
 const crypto = require('node:crypto');
 
-const VERSION = '0.6.3';
+const VERSION = '0.6.4';
 
 const PSX_API_BASE =
   process.env.PSX_API_BASE ||
@@ -177,6 +177,79 @@ function uniqueStrings(
         .filter(Boolean)
     )
   ];
+}
+
+function uniqueTextValues(
+  values
+) {
+  const output = [];
+  const seen =
+    new Set();
+
+  for (
+    const value
+    of values
+  ) {
+    const text =
+      String(
+        value || ''
+      ).trim();
+
+    if (!text) {
+      continue;
+    }
+
+    const key =
+      text.toLowerCase();
+
+    if (
+      seen.has(key)
+    ) {
+      continue;
+    }
+
+    seen.add(key);
+    output.push(text);
+  }
+
+  return output;
+}
+
+function mergeMetadataEvidence(
+  current = {},
+  incoming = {}
+) {
+  return {
+    psxSymbols:
+      Boolean(
+        current.psxSymbols ||
+        incoming.psxSymbols
+      ),
+
+    eligibleScrips:
+      Boolean(
+        current.eligibleScrips ||
+        incoming.eligibleScrips
+      ),
+
+    allShare:
+      Boolean(
+        current.allShare ||
+        incoming.allShare
+      ),
+
+    pyPSX:
+      Boolean(
+        current.pyPSX ||
+        incoming.pyPSX
+      ),
+
+    fallback:
+      Boolean(
+        current.fallback ||
+        incoming.fallback
+      )
+  };
 }
 
 function normalizeTimestamp(
@@ -1090,7 +1163,7 @@ async function fetchText(
             'text/html,application/xhtml+xml',
 
           'User-Agent':
-            'Mozilla/5.0 NOMAD-Invest/0.6.2',
+            `Mozilla/5.0 NOMAD-Invest/${VERSION}`,
 
           ...headers
         },
@@ -1419,6 +1492,35 @@ function mergeCompanyMetadata(
       ''
     ).trim();
 
+  const sources =
+    uniqueTextValues([
+      ...(
+        Array.isArray(
+          current.sources
+        )
+          ? current.sources
+          : [
+              current.source
+            ]
+      ),
+
+      ...(
+        Array.isArray(
+          update.sources
+        )
+          ? update.sources
+          : [
+              update.source
+            ]
+      )
+    ]);
+
+  const evidence =
+    mergeMetadataEvidence(
+      current.evidence || {},
+      update.evidence || {}
+    );
+
   map.set(
     key,
     {
@@ -1443,6 +1545,10 @@ function mergeCompanyMetadata(
         update.source ||
         '',
 
+      sources,
+
+      evidence,
+
       isCanonical:
         Boolean(
           current.isCanonical ||
@@ -1463,7 +1569,7 @@ async function loadOfficialSymbolsMap() {
         30000,
         {
           'User-Agent':
-            'Mozilla/5.0 NOMAD-Invest/0.6.2',
+            `Mozilla/5.0 NOMAD-Invest/${VERSION}`,
 
           Referer:
             `${PSX_DPS_BASE}/`,
@@ -1528,6 +1634,11 @@ async function loadOfficialSymbolsMap() {
 
           source:
             'PSX symbols',
+
+          evidence: {
+            psxSymbols:
+              true
+          },
 
           isCanonical:
             true
@@ -1609,6 +1720,11 @@ async function enrichFromEligibleScrips(
             source:
               'PSX eligible scrips',
 
+            evidence: {
+              eligibleScrips:
+                true
+            },
+
             isCanonical:
               true
           }
@@ -1687,6 +1803,11 @@ async function enrichFromAllShareIndex(
 
             source:
               'PSX ALLSHR',
+
+            evidence: {
+              allShare:
+                true
+            },
 
             isCanonical:
               false
@@ -1775,6 +1896,11 @@ async function enrichFromPyPSX(
           source:
             'pyPSX symbols',
 
+          evidence: {
+            pyPSX:
+              true
+          },
+
           isCanonical:
             false
         }
@@ -1835,6 +1961,11 @@ async function enrichFromFallbackMetadata(
 
           source:
             'psx-rest-api',
+
+          evidence: {
+            fallback:
+              true
+          },
 
           isCanonical:
             false
@@ -1901,6 +2032,18 @@ function reconcileStatusMetadata(
         source:
           canonical.source ||
           rawMetadata.source,
+
+        sources:
+          uniqueTextValues([
+            ...(canonical.sources || []),
+            ...(rawMetadata.sources || [])
+          ]),
+
+        evidence:
+          mergeMetadataEvidence(
+            canonical.evidence || {},
+            rawMetadata.evidence || {}
+          ),
 
         isCanonical:
           true
@@ -3486,6 +3629,23 @@ function normalizeScreenerRow(
     normalizedSymbol:
       identity.normalized,
 
+    metadataSources:
+      Array.isArray(
+        company?.sources
+      )
+        ? company.sources
+        : (
+            company?.source
+              ? [
+                  company.source
+                ]
+              : []
+          ),
+
+    metadataEvidence:
+      company?.evidence ||
+      {},
+
     companyName:
       company?.name &&
       company.name !==
@@ -3764,7 +3924,7 @@ async function loadPSXMarket() {
 }
 
 /* =========================================================
-   METADATA AUDIT - BUILD 0.6.2
+   METADATA / SECURITY UNIVERSE AUDIT - BUILD 0.6.4
 ========================================================= */
 
 function metadataNameResolved(
@@ -3835,8 +3995,202 @@ function containsAny(
   );
 }
 
-function classifyInstrumentForAudit(
+function metadataEvidenceForAudit(
   stock
+) {
+  const evidence =
+    stock?.metadataEvidence ||
+    {};
+
+  const sources =
+    uniqueTextValues(
+      Array.isArray(
+        stock?.metadataSources
+      )
+        ? stock.metadataSources
+        : []
+    );
+
+  const officialSources = [];
+
+  if (
+    evidence.psxSymbols
+  ) {
+    officialSources.push(
+      'PSX symbols'
+    );
+  }
+
+  if (
+    evidence.eligibleScrips
+  ) {
+    officialSources.push(
+      'PSX eligible scrips'
+    );
+  }
+
+  if (
+    evidence.allShare
+  ) {
+    officialSources.push(
+      'PSX ALLSHR'
+    );
+  }
+
+  const supplementalSources = [];
+
+  if (
+    evidence.pyPSX
+  ) {
+    supplementalSources.push(
+      'pyPSX symbols'
+    );
+  }
+
+  if (
+    evidence.fallback
+  ) {
+    supplementalSources.push(
+      'psx-rest-api'
+    );
+  }
+
+  return {
+    sources,
+
+    officialSources:
+      uniqueTextValues(
+        officialSources
+      ),
+
+    supplementalSources:
+      uniqueTextValues(
+        supplementalSources
+      ),
+
+    hasOfficialCurrentEvidence:
+      Boolean(
+        evidence.psxSymbols ||
+        evidence.eligibleScrips ||
+        evidence.allShare
+      ),
+
+    hasEligibleScripEvidence:
+      Boolean(
+        evidence.eligibleScrips
+      ),
+
+    hasAllShareEvidence:
+      Boolean(
+        evidence.allShare
+      ),
+
+    hasPSXSymbolsEvidence:
+      Boolean(
+        evidence.psxSymbols
+      ),
+
+    hasPyPSXEvidence:
+      Boolean(
+        evidence.pyPSX
+      ),
+
+    hasFallbackEvidence:
+      Boolean(
+        evidence.fallback
+      )
+  };
+}
+
+function inferValidatedRightsParent(
+  symbol,
+  knownSymbols
+) {
+  const match =
+    normalizeSymbol(
+      symbol
+    ).match(
+      /^(.+?)R\d*$/
+    );
+
+  if (!match) {
+    return null;
+  }
+
+  const candidate =
+    normalizeSymbol(
+      match[1]
+    );
+
+  if (
+    candidate &&
+    candidate !==
+      normalizeSymbol(
+        symbol
+      ) &&
+    knownSymbols.has(
+      candidate
+    )
+  ) {
+    return candidate;
+  }
+
+  return null;
+}
+
+function inferValidatedClassParent(
+  symbol,
+  knownSymbols
+) {
+  const normalized =
+    normalizeSymbol(
+      symbol
+    );
+
+  const patterns = [
+    /^(.+?)CPS[A-Z0-9]*$/,
+    /^(.+?)PREF[A-Z0-9]*$/,
+    /^(.+?)PP$/,
+    /^(.+?)PVI$/,
+    /^(.+?)NV$/
+  ];
+
+  for (
+    const pattern
+    of patterns
+  ) {
+    const match =
+      normalized.match(
+        pattern
+      );
+
+    if (!match) {
+      continue;
+    }
+
+    const candidate =
+      normalizeSymbol(
+        match[1]
+      );
+
+    if (
+      candidate &&
+      candidate !==
+        normalized &&
+      knownSymbols.has(
+        candidate
+      )
+    ) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+function classifyInstrumentForAudit(
+  stock,
+  knownSymbols
 ) {
   const symbol =
     normalizeSymbol(
@@ -3876,6 +4230,11 @@ function classifyInstrumentForAudit(
       stock
     );
 
+  const evidence =
+    metadataEvidenceForAudit(
+      stock
+    );
+
   const searchable =
     [
       symbol,
@@ -3886,6 +4245,18 @@ function classifyInstrumentForAudit(
     ]
       .join(' ')
       .toUpperCase();
+
+  const validatedRightsParent =
+    inferValidatedRightsParent(
+      symbol,
+      knownSymbols
+    );
+
+  const validatedClassParent =
+    inferValidatedClassParent(
+      symbol,
+      knownSymbols
+    );
 
   let instrumentType =
     'ORDINARY_OR_UNCLASSIFIED';
@@ -3898,6 +4269,9 @@ function classifyInstrumentForAudit(
 
   let classificationConfidence =
     'medium';
+
+  let parentSymbol =
+    null;
 
   if (
     containsAny(
@@ -3944,7 +4318,7 @@ function classifyInstrumentForAudit(
       searchable,
       [
         /\bMUTUAL FUND\b/,
-        /\bCLOSED END FUND\b/,
+        /\bCLOSED[ -]END FUND\b/,
         /\bFUND\b/
       ]
     )
@@ -3964,7 +4338,7 @@ function classifyInstrumentForAudit(
     containsAny(
       searchable,
       [
-        /\bMODARABA\b/
+        /\bMODARABAS?\b/
       ]
     )
   ) {
@@ -3976,6 +4350,26 @@ function classifyInstrumentForAudit(
 
     classificationReason =
       'Name or sector identifies a Modaraba.';
+
+    classificationConfidence =
+      'high';
+  } else if (
+    containsAny(
+      searchable,
+      [
+        /\bSPAC\b/,
+        /\bSPECIAL PURPOSE ACQUISITION\b/
+      ]
+    )
+  ) {
+    instrumentType =
+      'SPAC';
+
+    instrumentLabel =
+      'SPAC';
+
+    classificationReason =
+      'Name or symbol identifies a special purpose acquisition company.';
 
     classificationConfidence =
       'high';
@@ -4008,10 +4402,11 @@ function classifyInstrumentForAudit(
       [
         /\bRIGHT ISSUE\b/,
         /\bRIGHTS ISSUE\b/,
-        /\bRIGHTS\b/,
+        /\bRIGHTS?\b/,
         /\bENTITLEMENT\b/
       ]
-    )
+    ) ||
+    validatedRightsParent
   ) {
     instrumentType =
       'RIGHTS_OR_ENTITLEMENT';
@@ -4019,28 +4414,22 @@ function classifyInstrumentForAudit(
     instrumentLabel =
       'Rights / entitlement';
 
-    classificationReason =
-      'Name or listing information contains a rights or entitlement marker.';
-
-    classificationConfidence =
-      'high';
-  } else if (
-    !nameResolved &&
-    /R\d*$/.test(
-      symbol
-    )
-  ) {
-    instrumentType =
-      'POSSIBLE_RIGHTS_OR_ENTITLEMENT';
-
-    instrumentLabel =
-      'Possible rights / entitlement';
+    parentSymbol =
+      validatedRightsParent;
 
     classificationReason =
-      'Unresolved symbol ends in R or R plus digits. This is only a diagnostic hint and is not treated as confirmed.';
+      validatedRightsParent
+        ? (
+            'Rights-style symbol maps safely to verified parent ticker ' +
+            validatedRightsParent +
+            '.'
+          )
+        : 'Name or listing information contains a rights or entitlement marker.';
 
     classificationConfidence =
-      'low';
+      validatedRightsParent
+        ? 'high'
+        : 'medium';
   } else if (
     containsAny(
       searchable,
@@ -4049,7 +4438,8 @@ function classifyInstrumentForAudit(
         /\bPREFERRED\b/,
         /\bPREF\b/
       ]
-    )
+    ) ||
+    validatedClassParent
   ) {
     instrumentType =
       'PREFERENCE_OR_CLASS';
@@ -4057,11 +4447,22 @@ function classifyInstrumentForAudit(
     instrumentLabel =
       'Preference / special class';
 
+    parentSymbol =
+      validatedClassParent;
+
     classificationReason =
-      'Name or listing information contains a preference-security marker.';
+      validatedClassParent
+        ? (
+            'Special share-class symbol maps safely to verified parent ticker ' +
+            validatedClassParent +
+            '.'
+          )
+        : 'Name or listing information contains a preference-security marker.';
 
     classificationConfidence =
-      'high';
+      validatedClassParent
+        ? 'high'
+        : 'medium';
   }
 
   const hasSpecialClassification =
@@ -4101,6 +4502,62 @@ function classifyInstrumentForAudit(
       'Sector missing';
   }
 
+  let universeClass =
+    'UNVERIFIED';
+
+  let universeLabel =
+    'Unverified';
+
+  let universeReason =
+    'NOMAD could not establish current-security status from the official PSX metadata sources used by this build.';
+
+  if (
+    hasSpecialClassification
+  ) {
+    universeClass =
+      'SPECIAL_INSTRUMENT';
+
+    universeLabel =
+      'Special instrument';
+
+    universeReason =
+      evidence.hasOfficialCurrentEvidence
+        ? 'Special security type detected and current official PSX metadata evidence is present.'
+        : 'Special security type detected. It remains separate from the ordinary-share investable universe.';
+  } else if (
+    evidence.hasOfficialCurrentEvidence
+  ) {
+    universeClass =
+      'VERIFIED_CURRENT';
+
+    universeLabel =
+      'Verified current';
+
+    universeReason =
+      'Current identity is supported by one or more official PSX metadata sources.';
+  } else if (
+    !listedIn &&
+    !evidence.hasOfficialCurrentEvidence
+  ) {
+    universeClass =
+      'LEGACY_STALE_CANDIDATE';
+
+    universeLabel =
+      'Legacy / stale candidate';
+
+    universeReason =
+      'The screener feed contains this symbol, but NOMAD found no current official PSX metadata evidence and no active index/listing marker. This is a candidate only, not a confirmed delisting.';
+  } else {
+    universeClass =
+      'UNVERIFIED';
+
+    universeLabel =
+      'Unverified';
+
+    universeReason =
+      'Some market/listing evidence exists, but current official identity verification is incomplete.';
+  }
+
   let bucket =
     null;
 
@@ -4127,6 +4584,20 @@ function classifyInstrumentForAudit(
         '. ' +
         classificationReason;
     } else if (
+      universeClass ===
+        'LEGACY_STALE_CANDIDATE'
+    ) {
+      bucket =
+        'LEGACY_STALE_CANDIDATE';
+
+      bucketLabel =
+        'Legacy / stale candidate';
+
+      auditReason =
+        issueLabel +
+        '. ' +
+        universeReason;
+    } else if (
       nameResolved ||
       sectorResolved
     ) {
@@ -4138,7 +4609,7 @@ function classifyInstrumentForAudit(
 
       auditReason =
         issueLabel +
-        '. Some identity metadata is already resolved, so this is likely a normal listed security with incomplete metadata.';
+        '. Some identity metadata is already resolved, so this is likely a listed security with incomplete metadata.';
     } else {
       bucket =
         'UNRESOLVED';
@@ -4147,7 +4618,7 @@ function classifyInstrumentForAudit(
         'Unresolved';
 
       auditReason =
-        'Neither company name nor sector is reliably resolved and no strong special-security marker was detected. NOMAD should not guess this identity.';
+        'Neither company name nor sector is reliably resolved and NOMAD does not have enough evidence to identify this security safely.';
     }
   }
 
@@ -4198,9 +4669,29 @@ function classifyInstrumentForAudit(
 
     instrumentLabel,
 
+    parentSymbol,
+
     classificationReason,
 
     classificationConfidence,
+
+    universeClass,
+
+    universeLabel,
+
+    universeReason,
+
+    metadataSources:
+      evidence.sources,
+
+    officialEvidenceSources:
+      evidence.officialSources,
+
+    supplementalEvidenceSources:
+      evidence.supplementalSources,
+
+    hasOfficialCurrentEvidence:
+      evidence.hasOfficialCurrentEvidence,
 
     issueType,
 
@@ -4257,9 +4748,23 @@ async function getMetadataAudit() {
   const market =
     await loadPSXMarket();
 
+  const knownSymbols =
+    new Set(
+      market.stocks.map(
+        stock =>
+          normalizeSymbol(
+            stock.symbol
+          )
+      )
+    );
+
   const classified =
     market.stocks.map(
-      classifyInstrumentForAudit
+      stock =>
+        classifyInstrumentForAudit(
+          stock,
+          knownSymbols
+        )
     );
 
   const issues =
@@ -4291,6 +4796,13 @@ async function getMetadataAudit() {
         'LIKELY_SPECIAL_INSTRUMENT'
     );
 
+  const legacyIssues =
+    issues.filter(
+      row =>
+        row.bucket ===
+        'LEGACY_STALE_CANDIDATE'
+    );
+
   const unresolvedIssues =
     issues.filter(
       row =>
@@ -4310,6 +4822,44 @@ async function getMetadataAudit() {
         row.sectorResolved
     ).length;
 
+  const universeClasses =
+    countBy(
+      classified,
+      'universeClass'
+    );
+
+  const officialEvidenceCoverage = {
+    verifiedByAnyOfficialSource:
+      classified.filter(
+        row =>
+          row.hasOfficialCurrentEvidence
+      ).length,
+
+    psxSymbols:
+      classified.filter(
+        row =>
+          row.officialEvidenceSources.includes(
+            'PSX symbols'
+          )
+      ).length,
+
+    eligibleScrips:
+      classified.filter(
+        row =>
+          row.officialEvidenceSources.includes(
+            'PSX eligible scrips'
+          )
+      ).length,
+
+    allShare:
+      classified.filter(
+        row =>
+          row.officialEvidenceSources.includes(
+            'PSX ALLSHR'
+          )
+      ).length
+  };
+
   const data = {
     version:
       VERSION,
@@ -4322,7 +4872,7 @@ async function getMetadataAudit() {
       market.asOf,
 
     mode:
-      'READ_ONLY_DIAGNOSTIC',
+      'READ_ONLY_SECURITY_UNIVERSE_QA',
 
     summary: {
       totalCanonicalSecurities:
@@ -4355,12 +4905,36 @@ async function getMetadataAudit() {
       likelySpecialInstrumentIssues:
         likelySpecialIssues.length,
 
+      legacyStaleIssueCandidates:
+        legacyIssues.length,
+
       unresolved:
         unresolvedIssues.length,
 
       totalSpecialInstrumentsDetected:
-        specialInstruments.length
+        specialInstruments.length,
+
+      verifiedCurrentSecurities:
+        universeClasses.VERIFIED_CURRENT ||
+        0,
+
+      specialInstrumentSecurities:
+        universeClasses.SPECIAL_INSTRUMENT ||
+        0,
+
+      legacyStaleCandidates:
+        universeClasses.LEGACY_STALE_CANDIDATE ||
+        0,
+
+      unverifiedCurrentStatus:
+        universeClasses.UNVERIFIED ||
+        0
     },
+
+    sourceCoverage:
+      officialEvidenceCoverage,
+
+    universeClasses,
 
     issueBuckets:
       countBy(
@@ -4380,7 +4954,10 @@ async function getMetadataAudit() {
         'instrumentType'
       ),
 
-    issues
+    issues,
+
+    universe:
+      classified
   };
 
   metadataAuditCache = {
@@ -7315,7 +7892,7 @@ async function handler(
             'VALIDATED_CANONICAL_STATUS_SEPARATION',
 
           metadataAudit:
-            'READ_ONLY_DIAGNOSTIC',
+            'READ_ONLY_SECURITY_UNIVERSE_QA',
 
           fundamentalsProvider:
             'PSX Data Portal company page',
@@ -7730,8 +8307,10 @@ select {
 .auditFilters {
   display: grid;
   grid-template-columns:
-    minmax(260px,2fr)
-    minmax(240px,1fr);
+    repeat(
+      auto-fit,
+      minmax(210px,1fr)
+    );
   gap: 12px;
   margin: 18px 0;
 }
@@ -7846,6 +8425,7 @@ tbody tr:hover {
 }
 
 .statusPill {
+  position: relative;
   display: inline-block;
   padding: 2px 7px;
   border-radius: 999px;
@@ -7854,6 +8434,41 @@ tbody tr:hover {
   font-size: 11px;
   font-weight: 700;
   border: 1px solid #f0d39e;
+  cursor: help;
+  outline: none;
+}
+
+.statusPill:hover::after,
+.statusPill:focus::after {
+  content: attr(data-help);
+  position: absolute;
+  z-index: 40;
+  left: 50%;
+  bottom: calc(100% + 7px);
+  transform: translateX(-50%);
+  width: max-content;
+  max-width: 260px;
+  padding: 8px 10px;
+  border-radius: 7px;
+  background: #18384e;
+  color: white;
+  font-size: 11px;
+  line-height: 1.4;
+  font-weight: 500;
+  white-space: normal;
+  box-shadow: 0 4px 16px rgba(0,0,0,.14);
+}
+
+.auditEvidence {
+  min-width: 180px;
+  line-height: 1.45;
+  color: #53697b;
+}
+
+.auditEvidence strong {
+  display: block;
+  color: #31495d;
+  margin-bottom: 3px;
 }
 
 .auditPill {
@@ -8440,7 +9055,7 @@ Build ${VERSION}
 <p class="notice">
 
 Market, company metadata, fundamentals, symbol normalization,
-metadata auditing and deterministic technical analysis are connected.
+metadata/security-universe auditing and deterministic technical analysis are connected.
 
 Predictions and investment recommendations remain disabled
 until their models are built and validated.
@@ -8648,17 +9263,31 @@ Next
 >
 
 <h2>
-Metadata Audit
+Metadata & Security Universe Audit
 </h2>
 
 <p class="muted">
-Read-only diagnostic. This checks which PSX securities still have incomplete company-name or sector metadata. It does not modify any market data.
+Read-only diagnostic. This checks metadata completeness, current-security evidence, special instruments and possible legacy/stale feed rows. It does not remove or modify any security.
 </p>
 
 <div class="actions">
 
 <button id="runMetadataAudit">
 Run metadata audit
+</button>
+
+<button
+  id="downloadMetadataAuditCSV"
+  style="display:none"
+>
+Download current view CSV
+</button>
+
+<button
+  id="downloadMetadataAuditJSON"
+  style="display:none"
+>
+Download full audit JSON
 </button>
 
 </div>
@@ -8675,13 +9304,33 @@ Run metadata audit
 <div>
 
 <label>
+Audit view
+</label>
+
+<select id="metadataAuditView">
+
+<option value="issues">
+Metadata issues only
+</option>
+
+<option value="universe">
+All securities
+</option>
+
+</select>
+
+</div>
+
+<div>
+
+<label>
 Search audit
 </label>
 
 <input
   id="metadataAuditSearch"
   type="search"
-  placeholder="Symbol, company, sector, market symbol or reason"
+  placeholder="Symbol, company, sector, evidence or reason"
 >
 
 </div>
@@ -8695,7 +9344,7 @@ Issue category
 <select id="metadataAuditCategory">
 
 <option value="">
-All metadata issues
+All issue categories
 </option>
 
 <option value="LIKELY_NORMAL_COMPANY_MISSING_METADATA">
@@ -8703,11 +9352,47 @@ Likely company metadata gaps
 </option>
 
 <option value="LIKELY_SPECIAL_INSTRUMENT">
-Likely special instruments
+Special-instrument metadata gaps
+</option>
+
+<option value="LEGACY_STALE_CANDIDATE">
+Legacy / stale candidates
 </option>
 
 <option value="UNRESOLVED">
 Unresolved
+</option>
+
+</select>
+
+</div>
+
+<div>
+
+<label>
+Security QA
+</label>
+
+<select id="metadataAuditUniverseClass">
+
+<option value="">
+All security QA classes
+</option>
+
+<option value="VERIFIED_CURRENT">
+Verified current
+</option>
+
+<option value="SPECIAL_INSTRUMENT">
+Special instrument
+</option>
+
+<option value="LEGACY_STALE_CANDIDATE">
+Legacy / stale candidate
+</option>
+
+<option value="UNVERIFIED">
+Unverified
 </option>
 
 </select>
@@ -8768,6 +9453,11 @@ let currentPage = 1;
 const PAGE_SIZE = 50;
 
 let metadataAuditRows = [];
+
+let metadataAuditUniverseRows = [];
+
+let lastMetadataAuditResult =
+  null;
 
 let metadataAuditPage = 1;
 
@@ -9332,6 +10022,36 @@ function metricCard(
   );
 }
 
+function statusHelpText(
+  code
+) {
+  const normalized =
+    String(
+      code || ''
+    )
+      .trim()
+      .toUpperCase();
+
+  const known = {
+    NC:
+      'Non-Compliant Segment - a PSX regulatory/listing status. This is not a Shariah-compliance label.',
+
+    XD:
+      'Ex-Dividend - the security is trading after the entitlement date for the relevant cash dividend.',
+
+    XB:
+      'Ex-Bonus - the security is trading after the entitlement date for the relevant bonus shares.',
+
+    XR:
+      'Ex-Right - the security is trading after the entitlement date for the relevant rights issue.'
+  };
+
+  return (
+    known[normalized] ||
+    'PSX market-status / ex-entitlement marker. NOMAD keeps this separate from the permanent company ticker.'
+  );
+}
+
 function statusPills(
   codes
 ) {
@@ -9344,15 +10064,38 @@ function statusPills(
 
   return list
     .map(
-      code =>
-        '<span class="statusPill">' +
-        escapeHtml(
-          code
-        ) +
-        '</span>'
+      code => {
+        const help =
+          statusHelpText(
+            code
+          );
+
+        return (
+          '<span class="statusPill" tabindex="0" title="' +
+          escapeHtml(
+            help
+          ) +
+          '" data-help="' +
+          escapeHtml(
+            help
+          ) +
+          '" aria-label="' +
+          escapeHtml(
+            String(code) +
+            ': ' +
+            help
+          ) +
+          '">' +
+          escapeHtml(
+            code
+          ) +
+          '</span>'
+        );
+      }
     )
     .join('');
 }
+
 
 function identityNote(
   identity
@@ -11823,7 +12566,7 @@ function populateSectors() {
 }
 
 /* =========================================================
-   METADATA AUDIT UI
+   METADATA / SECURITY UNIVERSE AUDIT UI
 ========================================================= */
 
 function auditBucketClass(
@@ -11831,14 +12574,18 @@ function auditBucketClass(
 ) {
   if (
     bucket ===
-    'UNRESOLVED'
+      'UNRESOLVED' ||
+    bucket ===
+      'LEGACY_STALE_CANDIDATE'
   ) {
     return 'danger';
   }
 
   if (
     bucket ===
-    'LIKELY_SPECIAL_INSTRUMENT'
+      'LIKELY_SPECIAL_INSTRUMENT' ||
+    bucket ===
+      'SPECIAL_INSTRUMENT'
   ) {
     return 'warning';
   }
@@ -11846,11 +12593,40 @@ function auditBucketClass(
   return 'info';
 }
 
+function universeClassPill(
+  row
+) {
+  const className =
+    row.universeClass ===
+      'LEGACY_STALE_CANDIDATE'
+      ? 'danger'
+      : row.universeClass ===
+          'SPECIAL_INSTRUMENT'
+        ? 'warning'
+        : 'info';
+
+  return (
+    '<span class="auditPill ' +
+    className +
+    '">' +
+    escapeHtml(
+      row.universeLabel ||
+      row.universeClass ||
+      'Unverified'
+    ) +
+    '</span>'
+  );
+}
+
 function renderMetadataAuditSummary(
   result
 ) {
   const summary =
     result.summary ||
+    {};
+
+  const sourceCoverage =
+    result.sourceCoverage ||
     {};
 
   $('metadataAuditSummary')
@@ -11861,6 +12637,50 @@ function renderMetadataAuditSummary(
         'Canonical securities',
         formatNumber(
           summary.totalCanonicalSecurities,
+          0
+        )
+      ) +
+
+      metricCard(
+        'Verified current',
+        formatNumber(
+          summary.verifiedCurrentSecurities,
+          0
+        ),
+        'Official PSX evidence'
+      ) +
+
+      metricCard(
+        'Special instruments',
+        formatNumber(
+          summary.specialInstrumentSecurities,
+          0
+        )
+      ) +
+
+      metricCard(
+        'Legacy / stale candidates',
+        '<span class="' +
+        (
+          Number(
+            summary.legacyStaleCandidates
+          ) > 0
+            ? 'negative'
+            : 'positive'
+        ) +
+        '">' +
+        formatNumber(
+          summary.legacyStaleCandidates,
+          0
+        ) +
+        '</span>',
+        'Not confirmed delistings'
+      ) +
+
+      metricCard(
+        'Unverified status',
+        formatNumber(
+          summary.unverifiedCurrentStatus,
           0
         )
       ) +
@@ -11900,44 +12720,39 @@ function renderMetadataAuditSummary(
       ) +
 
       metricCard(
-        'Likely company gaps',
+        'Metadata issues',
         formatNumber(
-          summary.likelyNormalCompaniesMissingMetadata,
+          summary.totalMetadataIssues,
           0
         )
       ) +
 
       metricCard(
-        'Likely special instruments',
+        'Official evidence coverage',
         formatNumber(
-          summary.likelySpecialInstrumentIssues,
+          sourceCoverage.verifiedByAnyOfficialSource,
           0
-        )
-      ) +
-
-      metricCard(
-        'Unresolved',
-        '<span class="' +
-        (
-          Number(
-            summary.unresolved
-          ) > 0
-            ? 'negative'
-            : 'positive'
-        ) +
-        '">' +
-        formatNumber(
-          summary.unresolved,
-          0
-        ) +
-        '</span>'
+        ),
+        'PSX symbols / eligible scrips / ALLSHR'
       ) +
 
       '</div>' +
 
       '<div class="infoBox">' +
-      'This audit does not change metadata. Low-confidence classifications are diagnostic hints only. Unresolved securities remain unresolved rather than being guessed.' +
+      'Security QA is diagnostic only. “Legacy / stale candidate” means the screener feed contains the symbol but this audit did not find current official PSX metadata evidence; it is not automatically treated as delisted or removed.' +
       '</div>';
+}
+
+function activeMetadataAuditRows() {
+  const view =
+    $('metadataAuditView')
+      ?.value ||
+    'issues';
+
+  return view ===
+    'universe'
+      ? metadataAuditUniverseRows
+      : metadataAuditRows;
 }
 
 function getFilteredMetadataAuditRows() {
@@ -11951,45 +12766,71 @@ function getFilteredMetadataAuditRows() {
     $('metadataAuditCategory')
       .value;
 
-  return metadataAuditRows.filter(
-    row => {
-      const searchable =
-        (
-          row.symbol +
-          ' ' +
-          row.marketSymbol +
-          ' ' +
-          row.rawSymbol +
-          ' ' +
-          row.companyName +
-          ' ' +
-          row.sector +
-          ' ' +
-          row.instrumentLabel +
-          ' ' +
-          row.issueLabel +
-          ' ' +
-          row.auditReason +
-          ' ' +
-          (
-            row.statusCodes ||
-            []
-          ).join(' ')
-        )
-          .toLowerCase();
+  const universeClass =
+    $('metadataAuditUniverseClass')
+      .value;
 
-      return (
-        searchable.includes(
-          query
-        ) &&
-        (
-          !category ||
-          row.bucket ===
-            category
-        )
-      );
-    }
-  );
+  return activeMetadataAuditRows()
+    .filter(
+      row => {
+        const searchable =
+          (
+            row.symbol +
+            ' ' +
+            row.marketSymbol +
+            ' ' +
+            row.rawSymbol +
+            ' ' +
+            row.companyName +
+            ' ' +
+            row.sector +
+            ' ' +
+            row.instrumentLabel +
+            ' ' +
+            row.issueLabel +
+            ' ' +
+            row.auditReason +
+            ' ' +
+            row.universeLabel +
+            ' ' +
+            row.universeReason +
+            ' ' +
+            row.parentSymbol +
+            ' ' +
+            (
+              row.metadataSources ||
+              []
+            ).join(' ') +
+            ' ' +
+            (
+              row.officialEvidenceSources ||
+              []
+            ).join(' ') +
+            ' ' +
+            (
+              row.statusCodes ||
+              []
+            ).join(' ')
+          )
+            .toLowerCase();
+
+        return (
+          searchable.includes(
+            query
+          ) &&
+          (
+            !category ||
+            row.bucket ===
+              category
+          ) &&
+          (
+            !universeClass ||
+            row.universeClass ===
+              universeClass
+          )
+        );
+      }
+    );
 }
 
 function renderMetadataAuditTable() {
@@ -12027,10 +12868,19 @@ function renderMetadataAuditTable() {
       METADATA_AUDIT_PAGE_SIZE
     );
 
+  const viewLabel =
+    $('metadataAuditView')
+      .value ===
+      'universe'
+      ? 'securities'
+      : 'metadata issues';
+
   $('metadataAuditInfo')
     .textContent =
       rows.length +
-      ' metadata issues after current filters.';
+      ' ' +
+      viewLabel +
+      ' after current filters.';
 
   if (
     !pageRows.length
@@ -12038,7 +12888,7 @@ function renderMetadataAuditTable() {
     $('metadataAuditTable')
       .innerHTML =
         '<div class="emptyState">' +
-        'No metadata issues match this filter.' +
+        'No audit rows match this filter.' +
         '</div>';
 
     $('metadataAuditPageInfo')
@@ -12068,9 +12918,10 @@ function renderMetadataAuditTable() {
       '<th>Market symbol</th>' +
       '<th>Company</th>' +
       '<th>Sector</th>' +
-      '<th>Issue</th>' +
+      '<th>Security QA</th>' +
       '<th>Instrument</th>' +
-      '<th>Confidence</th>' +
+      '<th>Evidence</th>' +
+      '<th>Issue</th>' +
       '<th>Why flagged</th>' +
 
       '</tr>' +
@@ -12080,109 +12931,160 @@ function renderMetadataAuditTable() {
       '<tbody>' +
 
       pageRows.map(
-        row =>
-          '<tr>' +
+        row => {
+          const evidence =
+            row.officialEvidenceSources
+              ?.length
+              ? row.officialEvidenceSources
+              : row.metadataSources ||
+                [];
 
-          '<td class="symbol">' +
+          return (
+            '<tr>' +
 
-          escapeHtml(
-            row.symbol
-          ) +
+            '<td class="symbol">' +
 
-          (
-            row.statusCodes?.length
-              ? (
-                  ' ' +
-                  statusPills(
-                    row.statusCodes
+            escapeHtml(
+              row.symbol
+            ) +
+
+            (
+              row.statusCodes?.length
+                ? (
+                    ' ' +
+                    statusPills(
+                      row.statusCodes
+                    )
                   )
-                )
-              : ''
-          ) +
+                : ''
+            ) +
 
-          '</td>' +
+            '</td>' +
 
-          '<td>' +
-          escapeHtml(
-            row.marketSymbol ||
-            row.symbol
-          ) +
-          '</td>' +
+            '<td>' +
+            escapeHtml(
+              row.marketSymbol ||
+              row.symbol
+            ) +
+            '</td>' +
 
-          '<td>' +
-          (
-            row.nameResolved
-              ? escapeHtml(
-                  row.companyName
-                )
-              : (
-                  '<span class="negative">' +
-                  'Unresolved' +
-                  '</span>'
-                )
-          ) +
-          '</td>' +
+            '<td>' +
+            (
+              row.nameResolved
+                ? escapeHtml(
+                    row.companyName
+                  )
+                : (
+                    '<span class="negative">' +
+                    'Unresolved' +
+                    '</span>'
+                  )
+            ) +
+            '</td>' +
 
-          '<td>' +
-          (
-            row.sectorResolved
-              ? escapeHtml(
-                  row.sector
-                )
-              : (
-                  '<span class="negative">' +
-                  'Unknown' +
-                  '</span>'
-                )
-          ) +
-          '</td>' +
+            '<td>' +
+            (
+              row.sectorResolved
+                ? escapeHtml(
+                    row.sector
+                  )
+                : (
+                    '<span class="negative">' +
+                    'Unknown' +
+                    '</span>'
+                  )
+            ) +
+            '</td>' +
 
-          '<td>' +
+            '<td>' +
+            universeClassPill(
+              row
+            ) +
+            '<div class="symbolSub">' +
+            escapeHtml(
+              row.universeReason ||
+              ''
+            ) +
+            '</div>' +
+            '</td>' +
 
-          '<span class="auditPill ' +
-          auditBucketClass(
-            row.bucket
-          ) +
-          '">' +
+            '<td>' +
+            escapeHtml(
+              row.instrumentLabel
+            ) +
+            (
+              row.parentSymbol
+                ? (
+                    '<span class="symbolSub">Parent: ' +
+                    escapeHtml(
+                      row.parentSymbol
+                    ) +
+                    '</span>'
+                  )
+                : ''
+            ) +
+            '</td>' +
 
-          escapeHtml(
-            row.bucketLabel ||
-            row.issueLabel ||
-            'Issue'
-          ) +
+            '<td class="auditEvidence">' +
+            (
+              evidence.length
+                ? (
+                    '<strong>' +
+                    escapeHtml(
+                      evidence.join(', ')
+                    ) +
+                    '</strong>'
+                  )
+                : (
+                    '<span class="negative">' +
+                    'No current official evidence' +
+                    '</span>'
+                  )
+            ) +
+            '</td>' +
 
-          '</span>' +
+            '<td>' +
+            (
+              row.issueType
+                ? (
+                    '<span class="auditPill ' +
+                    auditBucketClass(
+                      row.bucket
+                    ) +
+                    '">' +
+                    escapeHtml(
+                      row.bucketLabel ||
+                      row.issueLabel ||
+                      'Issue'
+                    ) +
+                    '</span>' +
+                    '<div class="symbolSub">' +
+                    escapeHtml(
+                      row.issueLabel ||
+                      ''
+                    ) +
+                    '</div>'
+                  )
+                : (
+                    '<span class="positive">' +
+                    'No metadata gap' +
+                    '</span>'
+                  )
+            ) +
+            '</td>' +
 
-          '<div class="symbolSub">' +
+            '<td class="auditReason">' +
+            escapeHtml(
+              row.auditReason ||
+              row.classificationReason ||
+              row.universeReason ||
+              ''
+            ) +
+            '</td>' +
 
-          escapeHtml(
-            row.issueLabel ||
-            ''
-          ) +
-
-          '</div>' +
-
-          '</td>' +
-
-          '<td>' +
-          escapeHtml(
-            row.instrumentLabel
-          ) +
-          '</td>' +
-
-          '<td>' +
-          escapeHtml(
-            row.classificationConfidence
-          ) +
-          '</td>' +
-
-          '<td class="auditReason">' +
-          escapeHtml(
-            row.auditReason
-          ) +
-          '</td>' +
-
-          '</tr>'
+            '</tr>'
+          );
+        }
       )
         .join('') +
 
@@ -12191,7 +13093,8 @@ function renderMetadataAuditTable() {
       '</table>';
 
   const first =
-    start + 1;
+    start +
+    1;
 
   const last =
     Math.min(
@@ -12207,7 +13110,7 @@ function renderMetadataAuditTable() {
       last +
       ' of ' +
       rows.length +
-      ' issues | Page ' +
+      ' | Page ' +
       metadataAuditPage +
       ' of ' +
       pageCount;
@@ -12221,6 +13124,178 @@ function renderMetadataAuditTable() {
     .disabled =
       metadataAuditPage >=
       pageCount;
+}
+
+function csvCell(
+  value
+) {
+  const text =
+    String(
+      value ?? ''
+    );
+
+  return (
+    '"' +
+    text.replace(
+      /"/g,
+      '""'
+    ) +
+    '"'
+  );
+}
+
+function triggerTextDownload(
+  filename,
+  content,
+  mimeType
+) {
+  const blob =
+    new Blob(
+      [content],
+      {
+        type:
+          mimeType
+      }
+    );
+
+  const url =
+    URL.createObjectURL(
+      blob
+    );
+
+  const anchor =
+    document.createElement(
+      'a'
+    );
+
+  anchor.href =
+    url;
+
+  anchor.download =
+    filename;
+
+  document.body.appendChild(
+    anchor
+  );
+
+  anchor.click();
+  anchor.remove();
+
+  setTimeout(
+    () =>
+      URL.revokeObjectURL(
+        url
+      ),
+    1000
+  );
+}
+
+function downloadMetadataAuditCSV() {
+  const rows =
+    getFilteredMetadataAuditRows();
+
+  const headers = [
+    'Symbol',
+    'Market Symbol',
+    'Company',
+    'Sector',
+    'Status Codes',
+    'Security QA',
+    'Instrument Type',
+    'Parent Symbol',
+    'Classification Confidence',
+    'Official Evidence',
+    'All Metadata Sources',
+    'Issue Type',
+    'Issue Bucket',
+    'Reason'
+  ];
+
+  const lines = [
+    headers.map(
+      csvCell
+    ).join(',')
+  ];
+
+  for (
+    const row
+    of rows
+  ) {
+    lines.push(
+      [
+        row.symbol,
+        row.marketSymbol,
+        row.companyName,
+        row.sector,
+        (
+          row.statusCodes ||
+          []
+        ).join(' | '),
+        row.universeLabel,
+        row.instrumentLabel,
+        row.parentSymbol ||
+          '',
+        row.classificationConfidence,
+        (
+          row.officialEvidenceSources ||
+          []
+        ).join(' | '),
+        (
+          row.metadataSources ||
+          []
+        ).join(' | '),
+        row.issueLabel ||
+          '',
+        row.bucketLabel ||
+          '',
+        row.auditReason ||
+        row.universeReason ||
+          ''
+      ]
+        .map(
+          csvCell
+        )
+        .join(',')
+    );
+  }
+
+  triggerTextDownload(
+    'nomad-metadata-audit-' +
+    new Date()
+      .toISOString()
+      .slice(
+        0,
+        10
+      ) +
+    '.csv',
+    lines.join('\\n'),
+    'text/csv;charset=utf-8'
+  );
+}
+
+function downloadMetadataAuditJSON() {
+  if (
+    !lastMetadataAuditResult
+  ) {
+    return;
+  }
+
+  triggerTextDownload(
+    'nomad-metadata-audit-' +
+    new Date()
+      .toISOString()
+      .slice(
+        0,
+        10
+      ) +
+    '.json',
+    JSON.stringify(
+      lastMetadataAuditResult,
+      null,
+      2
+    ),
+    'application/json;charset=utf-8'
+  );
 }
 
 /* =========================================================
@@ -14015,7 +15090,7 @@ $('loadMarket')
     };
 
 /* =========================================================
-   METADATA AUDIT BUTTON
+   METADATA / SECURITY UNIVERSE AUDIT BUTTONS
 ========================================================= */
 
 $('runMetadataAudit')
@@ -14032,7 +15107,7 @@ $('runMetadataAudit')
       $('metadataAuditSummary')
         .innerHTML =
           '<p class="muted">' +
-          'Running read-only metadata audit...' +
+          'Running read-only metadata and security-universe audit...' +
           '</p>';
 
       try {
@@ -14041,8 +15116,15 @@ $('runMetadataAudit')
             'metadata-audit'
           );
 
+        lastMetadataAuditResult =
+          result;
+
         metadataAuditRows =
           result.issues ||
+          [];
+
+        metadataAuditUniverseRows =
+          result.universe ||
           [];
 
         metadataAuditPage =
@@ -14057,11 +15139,29 @@ $('runMetadataAudit')
           .display =
             'block';
 
+        $('downloadMetadataAuditCSV')
+          .style
+          .display =
+            'inline-block';
+
+        $('downloadMetadataAuditJSON')
+          .style
+          .display =
+            'inline-block';
+
+        $('metadataAuditView')
+          .value =
+            'issues';
+
         $('metadataAuditSearch')
           .value =
             '';
 
         $('metadataAuditCategory')
+          .value =
+            '';
+
+        $('metadataAuditUniverseClass')
           .value =
             '';
 
@@ -14081,6 +15181,15 @@ $('runMetadataAudit')
       }
     };
 
+$('metadataAuditView')
+  .onchange =
+    () => {
+      metadataAuditPage =
+        1;
+
+      renderMetadataAuditTable();
+    };
+
 $('metadataAuditSearch')
   .oninput =
     () => {
@@ -14098,6 +15207,23 @@ $('metadataAuditCategory')
 
       renderMetadataAuditTable();
     };
+
+$('metadataAuditUniverseClass')
+  .onchange =
+    () => {
+      metadataAuditPage =
+        1;
+
+      renderMetadataAuditTable();
+    };
+
+$('downloadMetadataAuditCSV')
+  .onclick =
+    downloadMetadataAuditCSV;
+
+$('downloadMetadataAuditJSON')
+  .onclick =
+    downloadMetadataAuditJSON;
 
 $('metadataAuditPrevious')
   .onclick =
@@ -14640,7 +15766,7 @@ api(
           'Market: connected | ' +
           'Company metadata: connected | ' +
           'Symbol normalization: validated canonical mapping | ' +
-          'Metadata audit: read-only | ' +
+          'Security universe audit: read-only | ' +
           'pyPSX: ' +
           (
             result.pyPSXConfigured
