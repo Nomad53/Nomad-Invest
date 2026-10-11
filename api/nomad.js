@@ -3,7 +3,7 @@
 const http = require('node:http');
 const crypto = require('node:crypto');
 
-const VERSION = '0.6.4';
+const VERSION = '0.6.5';
 
 const PSX_API_BASE =
   process.env.PSX_API_BASE ||
@@ -2540,6 +2540,276 @@ function parseOfficialQuoteStats(
   };
 }
 
+function normalizeCompanyIdentityName(
+  value
+) {
+  return String(
+    value || ''
+  )
+    .toUpperCase()
+    .replace(
+      /\(\s*GEM\s*\)/g,
+      ' '
+    )
+    .replace(
+      /&/g,
+      ' AND '
+    )
+    .replace(
+      /[^A-Z0-9]+/g,
+      ' '
+    )
+    .replace(
+      /\s+/g,
+      ' '
+    )
+    .trim();
+}
+
+function parseCompanyListingInfo(
+  lines,
+  companyName,
+  symbol
+) {
+  const info = {
+    explicitTradingStatus:
+      null,
+
+    tradingStatusLabel:
+      null,
+
+    boardType:
+      null,
+
+    boardLabel:
+      null,
+
+    sectorName:
+      null,
+
+    successorName:
+      null,
+
+    statusCodes: []
+  };
+
+  if (!companyName) {
+    return info;
+  }
+
+  const companyLineIndex =
+    lines.findIndex(
+      line =>
+        String(
+          line || ''
+        )
+          .trim()
+          .toLowerCase() ===
+        companyName
+          .toLowerCase()
+    );
+
+  if (
+    companyLineIndex < 0
+  ) {
+    return info;
+  }
+
+  const knownTradingStatuses = {
+    DELISTED:
+      'Delisted',
+
+    SUSPENDED:
+      'Suspended',
+
+    CHANGED:
+      'Changed / renamed',
+
+    RENAMED:
+      'Changed / renamed',
+
+    MERGED:
+      'Merged / amalgamated'
+  };
+
+  for (
+    let index =
+      companyLineIndex + 1;
+
+    index <
+      Math.min(
+        lines.length,
+        companyLineIndex + 20
+      );
+
+    index++
+  ) {
+    const rawCandidate =
+      String(
+        lines[index] || ''
+      ).trim();
+
+    const candidate =
+      rawCandidate
+        .toUpperCase();
+
+    if (!candidate) {
+      continue;
+    }
+
+    if (
+      isSecurityStatusToken(
+        candidate
+      )
+    ) {
+      info.statusCodes.push(
+        candidate
+      );
+
+      continue;
+    }
+
+    const changedTo =
+      rawCandidate.match(
+        /^CHANGED\s+TO\s*:\s*(.+)$/i
+      );
+
+    if (changedTo) {
+      info.successorName =
+        String(
+          changedTo[1] || ''
+        ).trim();
+
+      continue;
+    }
+
+    if (
+      Object.prototype
+        .hasOwnProperty
+        .call(
+          knownTradingStatuses,
+          candidate
+        )
+    ) {
+      info.explicitTradingStatus =
+        candidate ===
+          'RENAMED'
+          ? 'CHANGED'
+          : candidate;
+
+      info.tradingStatusLabel =
+        knownTradingStatuses[
+          candidate
+        ];
+
+      continue;
+    }
+
+    if (
+      candidate ===
+        normalizeSymbol(
+          symbol
+        )
+    ) {
+      continue;
+    }
+
+    if (
+      /^(QUOTE|PROFILE|EQUITY|ANNOUNCEMENTS|FINANCIALS|RATIOS|PAYOUTS|REPORTS|REG|DFC|CSF|ODL|SELECT)$/i
+        .test(
+          candidate
+        )
+    ) {
+      continue;
+    }
+
+    if (
+      /^RS\.?/i
+        .test(
+          candidate
+        ) ||
+      /^PKR\b/i
+        .test(
+          candidate
+        ) ||
+      /^\d/
+        .test(
+          candidate
+        ) ||
+      /^[+-]?\d+(?:\.\d+)?%$/
+        .test(
+          candidate
+        )
+    ) {
+      continue;
+    }
+
+    const gemMatch =
+      rawCandidate.match(
+        /^GEM\s+BOARD\s*-\s*(.*)$/i
+      );
+
+    if (gemMatch) {
+      info.boardType =
+        'GEM';
+
+      info.boardLabel =
+        'GEM Board';
+
+      const gemSector =
+        String(
+          gemMatch[1] || ''
+        ).trim();
+
+      if (gemSector) {
+        info.sectorName =
+          gemSector.toUpperCase();
+      }
+
+      continue;
+    }
+
+    if (
+      candidate ===
+        'GEM BOARD'
+    ) {
+      info.boardType =
+        'GEM';
+
+      info.boardLabel =
+        'GEM Board';
+
+      continue;
+    }
+
+    if (
+      candidate.length <=
+        120 &&
+      candidate ===
+        candidate.toUpperCase() &&
+      !candidate.startsWith(
+        'CHANGED TO:'
+      )
+    ) {
+      if (
+        !info.sectorName
+      ) {
+        info.sectorName =
+          candidate;
+      }
+    }
+  }
+
+  return {
+    ...info,
+
+    statusCodes:
+      uniqueStrings(
+        info.statusCodes
+      )
+  };
+}
+
 function parsePSXCompanyPage(
   html,
   symbol
@@ -2568,113 +2838,20 @@ function parsePSXCompanyPage(
         )
       : null;
 
-  let sectorName =
+  const listing =
+    parseCompanyListingInfo(
+      lines,
+      companyName,
+      symbol
+    );
+
+  const sectorName =
+    listing.sectorName ||
     null;
 
-  const pageStatusCodes = [];
-
-  if (
-    companyName
-  ) {
-    const companyLineIndex =
-      lines.findIndex(
-        line =>
-          String(
-            line || ''
-          )
-            .trim()
-            .toLowerCase() ===
-          companyName
-            .toLowerCase()
-      );
-
-    if (
-      companyLineIndex >= 0
-    ) {
-      for (
-        let index =
-          companyLineIndex + 1;
-
-        index <
-          Math.min(
-            lines.length,
-            companyLineIndex + 12
-          );
-
-        index++
-      ) {
-        const candidate =
-          String(
-            lines[index] || ''
-          )
-            .trim()
-            .toUpperCase();
-
-        if (!candidate) {
-          continue;
-        }
-
-        if (
-          isSecurityStatusToken(
-            candidate
-          )
-        ) {
-          pageStatusCodes.push(
-            candidate
-          );
-
-          continue;
-        }
-
-        if (
-          candidate ===
-            normalizeSymbol(
-              symbol
-            )
-        ) {
-          continue;
-        }
-
-        if (
-          /^(QUOTE|PROFILE|EQUITY|ANNOUNCEMENTS|FINANCIALS|RATIOS|PAYOUTS|REPORTS|REG|DFC|CSF|ODL)$/i
-            .test(
-              candidate
-            )
-        ) {
-          continue;
-        }
-
-        if (
-          /^RS\.?/i
-            .test(
-              candidate
-            ) ||
-          /^PKR\b/i
-            .test(
-              candidate
-            ) ||
-          /^\d/
-            .test(
-              candidate
-            )
-        ) {
-          continue;
-        }
-
-        if (
-          candidate.length <=
-          120 &&
-          candidate ===
-            candidate.toUpperCase()
-        ) {
-          sectorName =
-            candidate;
-
-          break;
-        }
-      }
-    }
-  }
+  const pageStatusCodes =
+    listing.statusCodes ||
+    [];
 
   let annual =
     null;
@@ -2796,6 +2973,11 @@ function parsePSXCompanyPage(
       null;
   }
 
+  const quote =
+    parseOfficialQuoteStats(
+      lines
+    );
+
   return {
     symbol,
 
@@ -2808,6 +2990,26 @@ function parsePSXCompanyPage(
         pageStatusCodes
       ),
 
+    listing: {
+      explicitTradingStatus:
+        listing.explicitTradingStatus,
+
+      tradingStatusLabel:
+        listing.tradingStatusLabel,
+
+      boardType:
+        listing.boardType,
+
+      boardLabel:
+        listing.boardLabel,
+
+      successorName:
+        listing.successorName,
+
+      source:
+        'PSX Data Portal company page'
+    },
+
     sourceUrl:
       `${PSX_DPS_BASE}/company/${encodeURIComponent(
         symbol
@@ -2817,10 +3019,7 @@ function parsePSXCompanyPage(
       new Date()
         .toISOString(),
 
-    quote:
-      parseOfficialQuoteStats(
-        lines
-      ),
+    quote,
 
     equity: {
       marketCapThousands,
@@ -4188,6 +4387,708 @@ function inferValidatedClassParent(
   return null;
 }
 
+function classifyIssuerAndSecurity(
+  stock,
+  knownSymbols
+) {
+  const symbol =
+    normalizeSymbol(
+      stock.symbol
+    );
+
+  const marketSymbol =
+    normalizeSymbol(
+      stock.tradingSymbol ||
+      stock.marketSymbol
+    );
+
+  const name =
+    String(
+      stock.companyName ||
+      ''
+    ).trim();
+
+  const sector =
+    String(
+      stock.sector ||
+      ''
+    ).trim();
+
+  const listedIn =
+    String(
+      stock.listedIn ||
+      ''
+    ).trim();
+
+  const searchable =
+    [
+      symbol,
+      marketSymbol,
+      name,
+      sector,
+      listedIn
+    ]
+      .join(' ')
+      .toUpperCase();
+
+  const validatedRightsParent =
+    inferValidatedRightsParent(
+      symbol,
+      knownSymbols
+    );
+
+  const validatedClassParent =
+    inferValidatedClassParent(
+      symbol,
+      knownSymbols
+    );
+
+  let issuerType =
+    'COMPANY';
+
+  let issuerLabel =
+    'Company';
+
+  if (
+    containsAny(
+      searchable,
+      [
+        /\bREAL ESTATE INVESTMENT TRUST\b/,
+        /\bREIT\b/
+      ]
+    )
+  ) {
+    issuerType =
+      'REIT';
+
+    issuerLabel =
+      'REIT';
+  } else if (
+    containsAny(
+      searchable,
+      [
+        /\bEXCHANGE TRADED FUND\b/,
+        /\bETF\b/
+      ]
+    )
+  ) {
+    issuerType =
+      'ETF';
+
+    issuerLabel =
+      'ETF';
+  } else if (
+    containsAny(
+      searchable,
+      [
+        /\bMODARABAS?\b/
+      ]
+    )
+  ) {
+    issuerType =
+      'MODARABA';
+
+    issuerLabel =
+      'Modaraba';
+  } else if (
+    containsAny(
+      searchable,
+      [
+        /\bMUTUAL FUND\b/,
+        /\bCLOSED[ -]END FUND\b/,
+        /\bFUND\b/
+      ]
+    )
+  ) {
+    issuerType =
+      'FUND';
+
+    issuerLabel =
+      'Fund';
+  } else if (
+    containsAny(
+      searchable,
+      [
+        /\bSPAC\b/,
+        /\bSPECIAL PURPOSE ACQUISITION\b/
+      ]
+    )
+  ) {
+    issuerType =
+      'SPAC';
+
+    issuerLabel =
+      'SPAC';
+  }
+
+  let securityType =
+    'ORDINARY_EQUITY';
+
+  let securityLabel =
+    'Ordinary equity';
+
+  let parentSymbol =
+    null;
+
+  let classificationReason =
+    'No strong special-security marker was detected.';
+
+  let classificationConfidence =
+    'medium';
+
+  if (
+    containsAny(
+      searchable,
+      [
+        /\bRIGHT ISSUE\b/,
+        /\bRIGHTS ISSUE\b/,
+        /\bRIGHTS?\b/,
+        /\bENTITLEMENT\b/
+      ]
+    ) ||
+    validatedRightsParent
+  ) {
+    securityType =
+      'RIGHTS_ENTITLEMENT';
+
+    securityLabel =
+      'Rights / entitlement';
+
+    parentSymbol =
+      validatedRightsParent;
+
+    classificationReason =
+      validatedRightsParent
+        ? (
+            'Rights-style symbol maps safely to verified parent ticker ' +
+            validatedRightsParent +
+            '.'
+          )
+        : 'Name or listing information contains a rights or entitlement marker.';
+
+    classificationConfidence =
+      validatedRightsParent
+        ? 'high'
+        : 'medium';
+  } else if (
+    containsAny(
+      searchable,
+      [
+        /\bPREFERENCE\b/,
+        /\bPREFERRED\b/,
+        /\bPREF\b/
+      ]
+    ) ||
+    validatedClassParent
+  ) {
+    securityType =
+      'PREFERENCE_CLASS';
+
+    securityLabel =
+      'Preference / special class';
+
+    parentSymbol =
+      validatedClassParent;
+
+    classificationReason =
+      validatedClassParent
+        ? (
+            'Special share-class symbol maps safely to verified parent ticker ' +
+            validatedClassParent +
+            '.'
+          )
+        : 'Name or listing information contains a preference-security marker.';
+
+    classificationConfidence =
+      validatedClassParent
+        ? 'high'
+        : 'medium';
+  } else if (
+    containsAny(
+      searchable,
+      [
+        /\bSUKUK\b/,
+        /\bTERM FINANCE CERTIFICATE\b/,
+        /\bTFC\b/,
+        /\bBOND\b/,
+        /\bDEBT\b/
+      ]
+    )
+  ) {
+    securityType =
+      'DEBT_SECURITY';
+
+    securityLabel =
+      'Debt / Sukuk';
+
+    classificationReason =
+      'Name, sector or listing field contains a debt-security marker.';
+
+    classificationConfidence =
+      'high';
+  } else if (
+    issuerType ===
+      'MODARABA'
+  ) {
+    securityType =
+      'MODARABA_CERTIFICATE';
+
+    securityLabel =
+      'Modaraba certificate';
+
+    classificationReason =
+      'Issuer or sector identifies a Modaraba.';
+
+    classificationConfidence =
+      'high';
+  } else if (
+    issuerType ===
+      'REIT'
+  ) {
+    securityType =
+      'REIT_UNIT';
+
+    securityLabel =
+      'REIT unit';
+
+    classificationReason =
+      'Issuer or sector identifies a REIT.';
+
+    classificationConfidence =
+      'high';
+  } else if (
+    issuerType ===
+      'ETF'
+  ) {
+    securityType =
+      'ETF_UNIT';
+
+    securityLabel =
+      'ETF unit';
+
+    classificationReason =
+      'Issuer or sector identifies an exchange-traded fund.';
+
+    classificationConfidence =
+      'high';
+  } else if (
+    issuerType ===
+      'FUND'
+  ) {
+    securityType =
+      'FUND_UNIT';
+
+    securityLabel =
+      'Fund unit';
+
+    classificationReason =
+      'Issuer or sector identifies a fund.';
+
+    classificationConfidence =
+      'medium';
+  } else if (
+    issuerType ===
+      'SPAC'
+  ) {
+    securityType =
+      'SPAC_EQUITY';
+
+    securityLabel =
+      'SPAC equity';
+
+    classificationReason =
+      'Issuer or symbol identifies a special purpose acquisition company.';
+
+    classificationConfidence =
+      'high';
+  }
+
+  let instrumentType =
+    'ORDINARY_OR_UNCLASSIFIED';
+
+  let instrumentLabel =
+    'Ordinary / unclassified';
+
+  if (
+    securityType ===
+      'RIGHTS_ENTITLEMENT'
+  ) {
+    instrumentType =
+      'RIGHTS_OR_ENTITLEMENT';
+
+    instrumentLabel =
+      'Rights / entitlement';
+  } else if (
+    securityType ===
+      'PREFERENCE_CLASS'
+  ) {
+    instrumentType =
+      'PREFERENCE_OR_CLASS';
+
+    instrumentLabel =
+      'Preference / special class';
+  } else if (
+    securityType ===
+      'DEBT_SECURITY'
+  ) {
+    instrumentType =
+      'DEBT_OR_SUKUK';
+
+    instrumentLabel =
+      'Debt / Sukuk';
+  } else if (
+    issuerType !==
+      'COMPANY'
+  ) {
+    instrumentType =
+      issuerType;
+
+    instrumentLabel =
+      issuerLabel;
+  }
+
+  return {
+    issuerType,
+    issuerLabel,
+    securityType,
+    securityLabel,
+    parentSymbol,
+    classificationReason,
+    classificationConfidence,
+    instrumentType,
+    instrumentLabel,
+    isSpecialSecurity:
+      securityType !==
+        'ORDINARY_EQUITY'
+  };
+}
+
+function deriveEligibility(
+  row
+) {
+  const status =
+    String(
+      row.tradingStatus ||
+      'UNKNOWN'
+    ).toUpperCase();
+
+  const securityType =
+    row.securityType ||
+    'ORDINARY_EQUITY';
+
+  const issuerType =
+    row.issuerType ||
+    'COMPANY';
+
+  const boardType =
+    row.boardType ||
+    'UNKNOWN';
+
+  if (
+    status ===
+      'DELISTED'
+  ) {
+    return {
+      eligibility:
+        'INELIGIBLE_DELISTED',
+
+      eligibilityLabel:
+        'Not eligible - delisted',
+
+      eligibilityReason:
+        'PSX identifies this historical security as delisted.'
+    };
+  }
+
+  if (
+    status ===
+      'CHANGED' ||
+    status ===
+      'MERGED' ||
+    status ===
+      'MIGRATED_OR_SYMBOL_CHANGED'
+  ) {
+    return {
+      eligibility:
+        'INELIGIBLE_HISTORICAL_SYMBOL',
+
+      eligibilityLabel:
+        'Not eligible - historical symbol',
+
+      eligibilityReason:
+        'This symbol has changed, merged or migrated and should not be used as the current trading identity.'
+    };
+  }
+
+  if (
+    status ===
+      'SUSPENDED'
+  ) {
+    return {
+      eligibility:
+        'HOLD_SUSPENDED',
+
+      eligibilityLabel:
+        'Hold - suspended',
+
+      eligibilityReason:
+        'Trading is suspended. NOMAD should not use this security for a normal buy recommendation.'
+    };
+  }
+
+  const currentLike =
+    status ===
+      'CURRENT' ||
+    status ===
+      'CURRENT_PAGE_EVIDENCE';
+
+  if (!currentLike) {
+    return {
+      eligibility:
+        'REVIEW_REQUIRED',
+
+      eligibilityLabel:
+        'Review required',
+
+      eligibilityReason:
+        'Current trading eligibility has not been established strongly enough for the recommendation universe.'
+    };
+  }
+
+  if (
+    securityType ===
+      'RIGHTS_ENTITLEMENT' ||
+    securityType ===
+      'PREFERENCE_CLASS' ||
+    securityType ===
+      'DEBT_SECURITY'
+  ) {
+    return {
+      eligibility:
+        'NON_CORE_SPECIAL_SECURITY',
+
+      eligibilityLabel:
+        'Separate special-security universe',
+
+      eligibilityReason:
+        'Tradable special security, but not part of NOMAD’s ordinary-equity recommendation universe.'
+    };
+  }
+
+  if (
+    issuerType ===
+      'MODARABA' ||
+    issuerType ===
+      'REIT' ||
+    issuerType ===
+      'ETF' ||
+    issuerType ===
+      'FUND'
+  ) {
+    return {
+      eligibility:
+        'ALTERNATIVE_LISTED_SECURITY',
+
+      eligibilityLabel:
+        'Alternative listed security',
+
+      eligibilityReason:
+        'Current listed security that should be evaluated under a separate product-specific framework.'
+    };
+  }
+
+  if (
+    issuerType ===
+      'SPAC'
+  ) {
+    return {
+      eligibility:
+        'SPECIAL_EQUITY_REVIEW',
+
+      eligibilityLabel:
+        'Special equity review',
+
+      eligibilityReason:
+        'SPAC equity requires a dedicated risk framework before recommendation use.'
+    };
+  }
+
+  if (
+    boardType ===
+      'GEM'
+  ) {
+    return {
+      eligibility:
+        'GEM_EQUITY_CANDIDATE',
+
+      eligibilityLabel:
+        'GEM equity candidate',
+
+      eligibilityReason:
+        'Current GEM Board equity. Keep separate risk/liquidity guardrails from Main Board equities.'
+    };
+  }
+
+  return {
+    eligibility:
+      'CORE_EQUITY_CANDIDATE',
+
+    eligibilityLabel:
+      'Core equity candidate',
+
+    eligibilityReason:
+      'Current ordinary equity candidate for NOMAD’s future investable universe, subject to risk/liquidity filters.'
+  };
+}
+
+function deriveIssueState(
+  row
+) {
+  const nameResolved =
+    Boolean(
+      row.nameResolved
+    );
+
+  const sectorResolved =
+    Boolean(
+      row.sectorResolved
+    );
+
+  let issueType =
+    null;
+
+  let issueLabel =
+    null;
+
+  if (
+    !nameResolved &&
+    !sectorResolved
+  ) {
+    issueType =
+      'MISSING_NAME_AND_SECTOR';
+
+    issueLabel =
+      'Name + sector missing';
+  } else if (
+    !nameResolved
+  ) {
+    issueType =
+      'MISSING_NAME';
+
+    issueLabel =
+      'Company name missing';
+  } else if (
+    !sectorResolved
+  ) {
+    issueType =
+      'MISSING_SECTOR';
+
+    issueLabel =
+      'Sector missing';
+  }
+
+  let bucket =
+    null;
+
+  let bucketLabel =
+    null;
+
+  if (issueType) {
+    if (
+      row.isSpecialSecurity
+    ) {
+      bucket =
+        'LIKELY_SPECIAL_INSTRUMENT';
+
+      bucketLabel =
+        'Special-instrument metadata gap';
+    } else if (
+      row.tradingStatus ===
+        'DELISTED' ||
+      row.tradingStatus ===
+        'CHANGED' ||
+      row.tradingStatus ===
+        'MERGED' ||
+      row.tradingStatus ===
+        'MIGRATED_OR_SYMBOL_CHANGED' ||
+      row.tradingStatus ===
+        'HISTORICAL_OR_INACTIVE'
+    ) {
+      bucket =
+        'HISTORICAL_SECURITY';
+
+      bucketLabel =
+        'Historical-security metadata gap';
+    } else if (
+      row.universeClass ===
+        'LEGACY_STALE_CANDIDATE' ||
+      row.universeClass ===
+        'REVIEW_REQUIRED'
+    ) {
+      bucket =
+        'LEGACY_STALE_CANDIDATE';
+
+      bucketLabel =
+        'Legacy / stale candidate';
+    } else {
+      bucket =
+        'LIKELY_NORMAL_COMPANY_MISSING_METADATA';
+
+      bucketLabel =
+        'Likely company metadata gap';
+    }
+  }
+
+  const statusText =
+    row.tradingStatusLabel
+      ? (
+          ' Trading status: ' +
+          row.tradingStatusLabel +
+          '.'
+        )
+      : '';
+
+  const successorText =
+    row.successorSymbol
+      ? (
+          ' Current/successor symbol: ' +
+          row.successorSymbol +
+          '.'
+        )
+      : '';
+
+  const auditReason =
+    issueType
+      ? (
+          issueLabel +
+          '. ' +
+          (
+            row.universeReason ||
+            row.classificationReason ||
+            ''
+          ) +
+          statusText +
+          successorText
+        ).trim()
+      : (
+          (
+            row.universeReason ||
+            row.classificationReason ||
+            ''
+          ) +
+          statusText +
+          successorText
+        ).trim();
+
+  return {
+    issueType,
+    issueLabel,
+    bucket,
+    bucketLabel,
+    auditReason
+  };
+}
+
 function classifyInstrumentForAudit(
   stock,
   knownSymbols
@@ -4235,272 +5136,26 @@ function classifyInstrumentForAudit(
       stock
     );
 
-  const searchable =
-    [
-      symbol,
-      marketSymbol,
-      name,
-      sector,
-      listedIn
-    ]
-      .join(' ')
-      .toUpperCase();
-
-  const validatedRightsParent =
-    inferValidatedRightsParent(
-      symbol,
+  const typeInfo =
+    classifyIssuerAndSecurity(
+      {
+        ...stock,
+        companyName:
+          name,
+        sector
+      },
       knownSymbols
     );
 
-  const validatedClassParent =
-    inferValidatedClassParent(
-      symbol,
-      knownSymbols
-    );
+  let tradingStatus =
+    evidence.hasOfficialCurrentEvidence
+      ? 'CURRENT'
+      : 'UNKNOWN';
 
-  let instrumentType =
-    'ORDINARY_OR_UNCLASSIFIED';
-
-  let instrumentLabel =
-    'Ordinary / unclassified';
-
-  let classificationReason =
-    'No strong special-security marker was detected.';
-
-  let classificationConfidence =
-    'medium';
-
-  let parentSymbol =
-    null;
-
-  if (
-    containsAny(
-      searchable,
-      [
-        /\bREAL ESTATE INVESTMENT TRUST\b/,
-        /\bREIT\b/
-      ]
-    )
-  ) {
-    instrumentType =
-      'REIT';
-
-    instrumentLabel =
-      'REIT';
-
-    classificationReason =
-      'Name or sector contains a REIT marker.';
-
-    classificationConfidence =
-      'high';
-  } else if (
-    containsAny(
-      searchable,
-      [
-        /\bEXCHANGE TRADED FUND\b/,
-        /\bETF\b/
-      ]
-    )
-  ) {
-    instrumentType =
-      'ETF';
-
-    instrumentLabel =
-      'ETF';
-
-    classificationReason =
-      'Name or sector contains an ETF marker.';
-
-    classificationConfidence =
-      'high';
-  } else if (
-    containsAny(
-      searchable,
-      [
-        /\bMUTUAL FUND\b/,
-        /\bCLOSED[ -]END FUND\b/,
-        /\bFUND\b/
-      ]
-    )
-  ) {
-    instrumentType =
-      'FUND';
-
-    instrumentLabel =
-      'Fund';
-
-    classificationReason =
-      'Name or sector contains a fund marker.';
-
-    classificationConfidence =
-      'medium';
-  } else if (
-    containsAny(
-      searchable,
-      [
-        /\bMODARABAS?\b/
-      ]
-    )
-  ) {
-    instrumentType =
-      'MODARABA';
-
-    instrumentLabel =
-      'Modaraba';
-
-    classificationReason =
-      'Name or sector identifies a Modaraba.';
-
-    classificationConfidence =
-      'high';
-  } else if (
-    containsAny(
-      searchable,
-      [
-        /\bSPAC\b/,
-        /\bSPECIAL PURPOSE ACQUISITION\b/
-      ]
-    )
-  ) {
-    instrumentType =
-      'SPAC';
-
-    instrumentLabel =
-      'SPAC';
-
-    classificationReason =
-      'Name or symbol identifies a special purpose acquisition company.';
-
-    classificationConfidence =
-      'high';
-  } else if (
-    containsAny(
-      searchable,
-      [
-        /\bSUKUK\b/,
-        /\bTERM FINANCE CERTIFICATE\b/,
-        /\bTFC\b/,
-        /\bBOND\b/,
-        /\bDEBT\b/
-      ]
-    )
-  ) {
-    instrumentType =
-      'DEBT_OR_SUKUK';
-
-    instrumentLabel =
-      'Debt / Sukuk';
-
-    classificationReason =
-      'Name, sector or listing field contains a debt-security marker.';
-
-    classificationConfidence =
-      'high';
-  } else if (
-    containsAny(
-      searchable,
-      [
-        /\bRIGHT ISSUE\b/,
-        /\bRIGHTS ISSUE\b/,
-        /\bRIGHTS?\b/,
-        /\bENTITLEMENT\b/
-      ]
-    ) ||
-    validatedRightsParent
-  ) {
-    instrumentType =
-      'RIGHTS_OR_ENTITLEMENT';
-
-    instrumentLabel =
-      'Rights / entitlement';
-
-    parentSymbol =
-      validatedRightsParent;
-
-    classificationReason =
-      validatedRightsParent
-        ? (
-            'Rights-style symbol maps safely to verified parent ticker ' +
-            validatedRightsParent +
-            '.'
-          )
-        : 'Name or listing information contains a rights or entitlement marker.';
-
-    classificationConfidence =
-      validatedRightsParent
-        ? 'high'
-        : 'medium';
-  } else if (
-    containsAny(
-      searchable,
-      [
-        /\bPREFERENCE\b/,
-        /\bPREFERRED\b/,
-        /\bPREF\b/
-      ]
-    ) ||
-    validatedClassParent
-  ) {
-    instrumentType =
-      'PREFERENCE_OR_CLASS';
-
-    instrumentLabel =
-      'Preference / special class';
-
-    parentSymbol =
-      validatedClassParent;
-
-    classificationReason =
-      validatedClassParent
-        ? (
-            'Special share-class symbol maps safely to verified parent ticker ' +
-            validatedClassParent +
-            '.'
-          )
-        : 'Name or listing information contains a preference-security marker.';
-
-    classificationConfidence =
-      validatedClassParent
-        ? 'high'
-        : 'medium';
-  }
-
-  const hasSpecialClassification =
-    instrumentType !==
-    'ORDINARY_OR_UNCLASSIFIED';
-
-  let issueType =
-    null;
-
-  let issueLabel =
-    null;
-
-  if (
-    !nameResolved &&
-    !sectorResolved
-  ) {
-    issueType =
-      'MISSING_NAME_AND_SECTOR';
-
-    issueLabel =
-      'Name + sector missing';
-  } else if (
-    !nameResolved
-  ) {
-    issueType =
-      'MISSING_NAME';
-
-    issueLabel =
-      'Company name missing';
-  } else if (
-    !sectorResolved
-  ) {
-    issueType =
-      'MISSING_SECTOR';
-
-    issueLabel =
-      'Sector missing';
-  }
+  let tradingStatusLabel =
+    evidence.hasOfficialCurrentEvidence
+      ? 'Current - official metadata evidence'
+      : 'Unresolved current status';
 
   let universeClass =
     'UNVERIFIED';
@@ -4509,10 +5164,10 @@ function classifyInstrumentForAudit(
     'Unverified';
 
   let universeReason =
-    'NOMAD could not establish current-security status from the official PSX metadata sources used by this build.';
+    'NOMAD could not establish current-security status from the official PSX metadata sources used by the fast audit.';
 
   if (
-    hasSpecialClassification
+    typeInfo.isSpecialSecurity
   ) {
     universeClass =
       'SPECIAL_INSTRUMENT';
@@ -4523,7 +5178,7 @@ function classifyInstrumentForAudit(
     universeReason =
       evidence.hasOfficialCurrentEvidence
         ? 'Special security type detected and current official PSX metadata evidence is present.'
-        : 'Special security type detected. It remains separate from the ordinary-share investable universe.';
+        : 'Special security type detected. Official company-page status will be resolved in the deep audit.';
   } else if (
     evidence.hasOfficialCurrentEvidence
   ) {
@@ -4536,8 +5191,7 @@ function classifyInstrumentForAudit(
     universeReason =
       'Current identity is supported by one or more official PSX metadata sources.';
   } else if (
-    !listedIn &&
-    !evidence.hasOfficialCurrentEvidence
+    !listedIn
   ) {
     universeClass =
       'LEGACY_STALE_CANDIDATE';
@@ -4546,91 +5200,10 @@ function classifyInstrumentForAudit(
       'Legacy / stale candidate';
 
     universeReason =
-      'The screener feed contains this symbol, but NOMAD found no current official PSX metadata evidence and no active index/listing marker. This is a candidate only, not a confirmed delisting.';
-  } else {
-    universeClass =
-      'UNVERIFIED';
-
-    universeLabel =
-      'Unverified';
-
-    universeReason =
-      'Some market/listing evidence exists, but current official identity verification is incomplete.';
+      'Fast audit found no current bulk-listing evidence. Official PSX company-page status still needs to be resolved.';
   }
 
-  let bucket =
-    null;
-
-  let bucketLabel =
-    null;
-
-  let auditReason =
-    '';
-
-  if (
-    issueType
-  ) {
-    if (
-      hasSpecialClassification
-    ) {
-      bucket =
-        'LIKELY_SPECIAL_INSTRUMENT';
-
-      bucketLabel =
-        'Likely special instrument';
-
-      auditReason =
-        issueLabel +
-        '. ' +
-        classificationReason;
-    } else if (
-      universeClass ===
-        'LEGACY_STALE_CANDIDATE'
-    ) {
-      bucket =
-        'LEGACY_STALE_CANDIDATE';
-
-      bucketLabel =
-        'Legacy / stale candidate';
-
-      auditReason =
-        issueLabel +
-        '. ' +
-        universeReason;
-    } else if (
-      nameResolved ||
-      sectorResolved
-    ) {
-      bucket =
-        'LIKELY_NORMAL_COMPANY_MISSING_METADATA';
-
-      bucketLabel =
-        'Likely company metadata gap';
-
-      auditReason =
-        issueLabel +
-        '. Some identity metadata is already resolved, so this is likely a listed security with incomplete metadata.';
-    } else {
-      bucket =
-        'UNRESOLVED';
-
-      bucketLabel =
-        'Unresolved';
-
-      auditReason =
-        'Neither company name nor sector is reliably resolved and NOMAD does not have enough evidence to identify this security safely.';
-    }
-  }
-
-  if (
-    stock.normalizedSymbol &&
-    issueType
-  ) {
-    auditReason +=
-      ' A PSX status symbol was normalized successfully, but metadata is still incomplete.';
-  }
-
-  return {
+  const base = {
     symbol,
 
     marketSymbol:
@@ -4662,23 +5235,36 @@ function classifyInstrumentForAudit(
       ),
 
     nameResolved,
-
     sectorResolved,
 
-    instrumentType,
+    ...typeInfo,
 
-    instrumentLabel,
+    tradingStatus,
+    tradingStatusLabel,
 
-    parentSymbol,
+    boardType:
+      null,
 
-    classificationReason,
+    boardLabel:
+      null,
 
-    classificationConfidence,
+    successorName:
+      null,
+
+    successorSymbol:
+      null,
+
+    companyPageUrl:
+      null,
+
+    companyPageQuoteAsOf:
+      null,
+
+    hasOfficialPageEvidence:
+      false,
 
     universeClass,
-
     universeLabel,
-
     universeReason,
 
     metadataSources:
@@ -4691,17 +5277,613 @@ function classifyInstrumentForAudit(
       evidence.supplementalSources,
 
     hasOfficialCurrentEvidence:
-      evidence.hasOfficialCurrentEvidence,
+      evidence.hasOfficialCurrentEvidence
+  };
 
-    issueType,
+  const eligibility =
+    deriveEligibility(
+      base
+    );
 
-    issueLabel,
+  const withEligibility = {
+    ...base,
+    ...eligibility
+  };
 
-    bucket,
+  const issue =
+    deriveIssueState(
+      withEligibility
+    );
 
-    bucketLabel,
+  return {
+    ...withEligibility,
+    ...issue
+  };
+}
 
-    auditReason
+function buildCurrentCompanyNameIndex(
+  market
+) {
+  const index =
+    new Map();
+
+  for (
+    const stock
+    of market.stocks
+  ) {
+    const evidence =
+      metadataEvidenceForAudit(
+        stock
+      );
+
+    if (
+      !evidence.hasOfficialCurrentEvidence ||
+      !metadataNameResolved(
+        stock
+      )
+    ) {
+      continue;
+    }
+
+    const key =
+      normalizeCompanyIdentityName(
+        stock.companyName
+      );
+
+    if (!key) {
+      continue;
+    }
+
+    const values =
+      index.get(key) ||
+      [];
+
+    values.push({
+      symbol:
+        normalizeSymbol(
+          stock.symbol
+        ),
+
+      companyName:
+        stock.companyName
+    });
+
+    index.set(
+      key,
+      values
+    );
+  }
+
+  return index;
+}
+
+function matchCurrentSymbolByCompanyName(
+  value,
+  companyNameIndex,
+  excludeSymbol
+) {
+  const key =
+    normalizeCompanyIdentityName(
+      value
+    );
+
+  if (!key) {
+    return null;
+  }
+
+  const candidates =
+    (
+      companyNameIndex.get(
+        key
+      ) ||
+      []
+    )
+      .filter(
+        item =>
+          normalizeSymbol(
+            item.symbol
+          ) !==
+          normalizeSymbol(
+            excludeSymbol
+          )
+      );
+
+  if (
+    candidates.length ===
+    1
+  ) {
+    return candidates[0]
+      .symbol;
+  }
+
+  return null;
+}
+
+function quoteAgeDays(
+  value
+) {
+  const time =
+    Date.parse(
+      value
+    );
+
+  if (
+    !Number.isFinite(
+      time
+    )
+  ) {
+    return null;
+  }
+
+  return Math.max(
+    0,
+    (
+      Date.now() -
+      time
+    ) /
+    (
+      24 *
+      60 *
+      60 *
+      1000
+    )
+  );
+}
+
+function enrichAuditRowWithSnapshot(
+  row,
+  snapshot,
+  knownSymbols,
+  companyNameIndex
+) {
+  if (!snapshot) {
+    return {
+      ...row,
+
+      tradingStatus:
+        row.tradingStatus ===
+          'CURRENT'
+          ? 'CURRENT'
+          : 'NO_COMPANY_PAGE_EVIDENCE',
+
+      tradingStatusLabel:
+        row.tradingStatus ===
+          'CURRENT'
+          ? row.tradingStatusLabel
+          : 'No PSX company-page evidence found',
+
+      universeReason:
+        row.tradingStatus ===
+          'CURRENT'
+          ? row.universeReason
+          : 'The symbol remains in the feed, but NOMAD could not retrieve a supporting PSX company page for status resolution.'
+    };
+  }
+
+  let companyName =
+    row.companyName;
+
+  let sector =
+    row.sector;
+
+  let nameResolved =
+    row.nameResolved;
+
+  let sectorResolved =
+    row.sectorResolved;
+
+  if (
+    !nameResolved &&
+    snapshot.companyName
+  ) {
+    companyName =
+      snapshot.companyName;
+
+    nameResolved =
+      Boolean(
+        normalizeCompanyIdentityName(
+          snapshot.companyName
+        )
+      );
+  }
+
+  if (
+    !sectorResolved &&
+    snapshot.sectorName
+  ) {
+    sector =
+      snapshot.sectorName;
+
+    sectorResolved =
+      true;
+  }
+
+  const pageListing =
+    snapshot.listing ||
+    {};
+
+  let tradingStatus =
+    pageListing.explicitTradingStatus ||
+    row.tradingStatus ||
+    'UNKNOWN';
+
+  let tradingStatusLabel =
+    pageListing.tradingStatusLabel ||
+    row.tradingStatusLabel ||
+    'Unresolved current status';
+
+  let successorName =
+    pageListing.successorName ||
+    null;
+
+  let successorSymbol =
+    successorName
+      ? matchCurrentSymbolByCompanyName(
+          successorName,
+          companyNameIndex,
+          row.symbol
+        )
+      : null;
+
+  if (
+    !successorSymbol &&
+    !row.hasOfficialCurrentEvidence &&
+    snapshot.companyName
+  ) {
+    successorSymbol =
+      matchCurrentSymbolByCompanyName(
+        snapshot.companyName,
+        companyNameIndex,
+        row.symbol
+      );
+  }
+
+  if (
+    successorSymbol &&
+    !pageListing.explicitTradingStatus
+  ) {
+    tradingStatus =
+      'MIGRATED_OR_SYMBOL_CHANGED';
+
+    tradingStatusLabel =
+      'Historical symbol - current symbol identified';
+  }
+
+  const ageDays =
+    quoteAgeDays(
+      snapshot.quote?.asOf
+    );
+
+  if (
+    !pageListing.explicitTradingStatus &&
+    !successorSymbol
+  ) {
+    if (
+      row.hasOfficialCurrentEvidence
+    ) {
+      tradingStatus =
+        'CURRENT';
+
+      tradingStatusLabel =
+        'Current - official listing evidence';
+    } else if (
+      ageDays !==
+        null &&
+      ageDays <= 60
+    ) {
+      tradingStatus =
+        'CURRENT_PAGE_EVIDENCE';
+
+      tradingStatusLabel =
+        'Current candidate - recent official company page';
+    } else if (
+      ageDays !==
+        null &&
+      ageDays > 365
+    ) {
+      tradingStatus =
+        'HISTORICAL_OR_INACTIVE';
+
+      tradingStatusLabel =
+        'Historical / inactive candidate';
+    } else {
+      tradingStatus =
+        'PAGE_STATUS_UNCLEAR';
+
+      tradingStatusLabel =
+        'Official page found - current status unclear';
+    }
+  }
+
+  const pageEvidenceLabel =
+    'PSX company page';
+
+  const metadataSources =
+    uniqueTextValues([
+      ...(
+        row.metadataSources ||
+        []
+      ),
+      pageEvidenceLabel
+    ]);
+
+  const officialEvidenceSources =
+    uniqueTextValues([
+      ...(
+        row.officialEvidenceSources ||
+        []
+      ),
+      pageEvidenceLabel
+    ]);
+
+  const typeInfo =
+    classifyIssuerAndSecurity(
+      {
+        ...row,
+        companyName,
+        sector
+      },
+      knownSymbols
+    );
+
+  let universeClass =
+    row.universeClass;
+
+  let universeLabel =
+    row.universeLabel;
+
+  let universeReason =
+    row.universeReason;
+
+  if (
+    tradingStatus ===
+      'DELISTED' ||
+    tradingStatus ===
+      'CHANGED' ||
+    tradingStatus ===
+      'MERGED' ||
+    tradingStatus ===
+      'MIGRATED_OR_SYMBOL_CHANGED' ||
+    tradingStatus ===
+      'HISTORICAL_OR_INACTIVE'
+  ) {
+    universeClass =
+      'HISTORICAL_OR_INACTIVE';
+
+    universeLabel =
+      'Historical / inactive';
+
+    universeReason =
+      'Official company-page evidence indicates that this is not a normal current trading identity.';
+  } else if (
+    tradingStatus ===
+      'SUSPENDED'
+  ) {
+    universeClass =
+      typeInfo.isSpecialSecurity
+        ? 'SPECIAL_INSTRUMENT'
+        : 'SUSPENDED_SECURITY';
+
+    universeLabel =
+      typeInfo.isSpecialSecurity
+        ? 'Special instrument'
+        : 'Suspended security';
+
+    universeReason =
+      'PSX company-page evidence indicates that trading is suspended.';
+  } else if (
+    tradingStatus ===
+      'CURRENT' ||
+    tradingStatus ===
+      'CURRENT_PAGE_EVIDENCE'
+  ) {
+    universeClass =
+      typeInfo.isSpecialSecurity
+        ? 'SPECIAL_INSTRUMENT'
+        : 'VERIFIED_CURRENT';
+
+    universeLabel =
+      typeInfo.isSpecialSecurity
+        ? 'Special instrument'
+        : 'Verified current';
+
+    universeReason =
+      row.hasOfficialCurrentEvidence
+        ? 'Current identity is supported by official PSX listing metadata.'
+        : 'Recent PSX company-page evidence supports a current-security candidate classification.';
+  } else {
+    universeClass =
+      'REVIEW_REQUIRED';
+
+    universeLabel =
+      'Review required';
+
+    universeReason =
+      'Official PSX company-page evidence exists, but current trading status is not strong enough for automatic recommendation-universe inclusion.';
+  }
+
+  const enriched = {
+    ...row,
+
+    companyName,
+    sector,
+    nameResolved,
+    sectorResolved,
+
+    ...typeInfo,
+
+    tradingStatus,
+    tradingStatusLabel,
+
+    boardType:
+      pageListing.boardType ||
+      row.boardType ||
+      null,
+
+    boardLabel:
+      pageListing.boardLabel ||
+      row.boardLabel ||
+      null,
+
+    successorName,
+    successorSymbol,
+
+    companyPageUrl:
+      snapshot.sourceUrl ||
+      null,
+
+    companyPageQuoteAsOf:
+      snapshot.quote?.asOf ||
+      null,
+
+    hasOfficialPageEvidence:
+      true,
+
+    metadataSources,
+    officialEvidenceSources,
+
+    universeClass,
+    universeLabel,
+    universeReason
+  };
+
+  const eligibility =
+    deriveEligibility(
+      enriched
+    );
+
+  const withEligibility = {
+    ...enriched,
+    ...eligibility
+  };
+
+  const issue =
+    deriveIssueState(
+      withEligibility
+    );
+
+  return {
+    ...withEligibility,
+    ...issue
+  };
+}
+
+async function getSecurityStatusBatch(
+  symbols
+) {
+  const requested =
+    uniqueStrings(
+      Array.isArray(
+        symbols
+      )
+        ? symbols
+        : String(
+            symbols ||
+            ''
+          ).split(',')
+    )
+      .slice(
+        0,
+        20
+      );
+
+  if (
+    !requested.length
+  ) {
+    bad(
+      'Provide at least one symbol.'
+    );
+  }
+
+  const market =
+    await loadPSXMarket();
+
+  const knownSymbols =
+    new Set(
+      market.stocks.map(
+        stock =>
+          normalizeSymbol(
+            stock.symbol
+          )
+      )
+    );
+
+  const companyNameIndex =
+    buildCurrentCompanyNameIndex(
+      market
+    );
+
+  const stockMap =
+    new Map(
+      market.stocks.map(
+        stock => [
+          normalizeSymbol(
+            stock.symbol
+          ),
+          stock
+        ]
+      )
+    );
+
+  const rows =
+    requested
+      .map(
+        symbol => {
+          const stock =
+            stockMap.get(
+              normalizeSymbol(
+                symbol
+              )
+            );
+
+          if (!stock) {
+            return null;
+          }
+
+          return classifyInstrumentForAudit(
+            stock,
+            knownSymbols
+          );
+        }
+      )
+      .filter(Boolean);
+
+  const snapshots =
+    await Promise.all(
+      rows.map(
+        row =>
+          getPSXCompanySnapshot(
+            row.symbol
+          ).catch(
+            () => null
+          )
+      )
+    );
+
+  return {
+    version:
+      VERSION,
+
+    resolvedAt:
+      new Date()
+        .toISOString(),
+
+    requested:
+      requested.length,
+
+    rows:
+      rows.map(
+        (
+          row,
+          index
+        ) =>
+          enrichAuditRowWithSnapshot(
+            row,
+            snapshots[index],
+            knownSymbols,
+            companyNameIndex
+          )
+      )
   };
 }
 
@@ -4778,36 +5960,7 @@ async function getMetadataAudit() {
   const specialInstruments =
     classified.filter(
       row =>
-        row.instrumentType !==
-        'ORDINARY_OR_UNCLASSIFIED'
-    );
-
-  const likelyNormalCompanyIssues =
-    issues.filter(
-      row =>
-        row.bucket ===
-        'LIKELY_NORMAL_COMPANY_MISSING_METADATA'
-    );
-
-  const likelySpecialIssues =
-    issues.filter(
-      row =>
-        row.bucket ===
-        'LIKELY_SPECIAL_INSTRUMENT'
-    );
-
-  const legacyIssues =
-    issues.filter(
-      row =>
-        row.bucket ===
-        'LEGACY_STALE_CANDIDATE'
-    );
-
-  const unresolvedIssues =
-    issues.filter(
-      row =>
-        row.bucket ===
-        'UNRESOLVED'
+        row.isSpecialSecurity
     );
 
   const namesResolved =
@@ -4857,7 +6010,10 @@ async function getMetadataAudit() {
           row.officialEvidenceSources.includes(
             'PSX ALLSHR'
           )
-      ).length
+      ).length,
+
+    companyPage:
+      0
   };
 
   const data = {
@@ -4872,7 +6028,10 @@ async function getMetadataAudit() {
       market.asOf,
 
     mode:
-      'READ_ONLY_SECURITY_UNIVERSE_QA',
+      'READ_ONLY_SECURITY_UNIVERSE_QA_WITH_DEEP_STATUS_RESOLVER',
+
+    deepStatusResolution:
+      'CLIENT_BATCHED_PSX_COMPANY_PAGES',
 
     summary: {
       totalCanonicalSecurities:
@@ -4899,18 +6058,6 @@ async function getMetadataAudit() {
       totalMetadataIssues:
         issues.length,
 
-      likelyNormalCompaniesMissingMetadata:
-        likelyNormalCompanyIssues.length,
-
-      likelySpecialInstrumentIssues:
-        likelySpecialIssues.length,
-
-      legacyStaleIssueCandidates:
-        legacyIssues.length,
-
-      unresolved:
-        unresolvedIssues.length,
-
       totalSpecialInstrumentsDetected:
         specialInstruments.length,
 
@@ -4927,14 +6074,32 @@ async function getMetadataAudit() {
         0,
 
       unverifiedCurrentStatus:
-        universeClasses.UNVERIFIED ||
-        0
+        (
+          universeClasses.UNVERIFIED ||
+          0
+        ) +
+        (
+          universeClasses.REVIEW_REQUIRED ||
+          0
+        )
     },
 
     sourceCoverage:
       officialEvidenceCoverage,
 
     universeClasses,
+
+    tradingStatusCounts:
+      countBy(
+        classified,
+        'tradingStatus'
+      ),
+
+    eligibilityCounts:
+      countBy(
+        classified,
+        'eligibility'
+      ),
 
     issueBuckets:
       countBy(
@@ -4948,10 +6113,16 @@ async function getMetadataAudit() {
         'issueType'
       ),
 
-    instrumentTypes:
+    securityTypes:
       countBy(
-        specialInstruments,
-        'instrumentType'
+        classified,
+        'securityType'
+      ),
+
+    issuerTypes:
+      countBy(
+        classified,
+        'issuerType'
       ),
 
     issues,
@@ -7886,13 +9057,13 @@ async function handler(
             'psxdata-api',
 
           companyMetadata:
-            'PSX canonical metadata + ALLSHR + fallbacks',
+            'PSX bulk metadata + company-page status resolver + fallbacks',
 
           symbolNormalization:
             'VALIDATED_CANONICAL_STATUS_SEPARATION',
 
           metadataAudit:
-            'READ_ONLY_SECURITY_UNIVERSE_QA',
+            'READ_ONLY_SECURITY_UNIVERSE_QA_WITH_DEEP_STATUS_RESOLVER',
 
           fundamentalsProvider:
             'PSX Data Portal company page',
@@ -7930,6 +9101,24 @@ async function handler(
       return sendJSON(
         response,
         await getMetadataAudit()
+      );
+    }
+
+
+    if (
+      request.method ===
+        'GET' &&
+      action ===
+        'security-status-batch'
+    ) {
+      return sendJSON(
+        response,
+        await getSecurityStatusBatch(
+          url.searchParams.get(
+            'symbols'
+          ) ||
+          ''
+        )
       );
     }
 
@@ -9267,7 +10456,7 @@ Metadata & Security Universe Audit
 </h2>
 
 <p class="muted">
-Read-only diagnostic. This checks metadata completeness, current-security evidence, special instruments and possible legacy/stale feed rows. It does not remove or modify any security.
+Read-only diagnostic. This checks metadata completeness, resolves official PSX company-page trading status in small batches, separates security type from issuer type, and prepares future universe eligibility. It does not remove or modify any security.
 </p>
 
 <div class="actions">
@@ -9291,6 +10480,11 @@ Download full audit JSON
 </button>
 
 </div>
+
+<p
+  id="metadataAuditProgress"
+  class="muted"
+></p>
 
 <div id="metadataAuditSummary"></div>
 
@@ -9330,7 +10524,7 @@ Search audit
 <input
   id="metadataAuditSearch"
   type="search"
-  placeholder="Symbol, company, sector, evidence or reason"
+  placeholder="Symbol, company, sector, status, successor or evidence"
 >
 
 </div>
@@ -9359,6 +10553,10 @@ Special-instrument metadata gaps
 Legacy / stale candidates
 </option>
 
+<option value="HISTORICAL_SECURITY">
+Historical-security metadata gaps
+</option>
+
 <option value="UNRESOLVED">
 Unresolved
 </option>
@@ -9370,13 +10568,13 @@ Unresolved
 <div>
 
 <label>
-Security QA
+Security class
 </label>
 
 <select id="metadataAuditUniverseClass">
 
 <option value="">
-All security QA classes
+All security classes
 </option>
 
 <option value="VERIFIED_CURRENT">
@@ -9387,8 +10585,20 @@ Verified current
 Special instrument
 </option>
 
+<option value="SUSPENDED_SECURITY">
+Suspended security
+</option>
+
+<option value="HISTORICAL_OR_INACTIVE">
+Historical / inactive
+</option>
+
 <option value="LEGACY_STALE_CANDIDATE">
 Legacy / stale candidate
+</option>
+
+<option value="REVIEW_REQUIRED">
+Review required
 </option>
 
 <option value="UNVERIFIED">
@@ -9399,8 +10609,119 @@ Unverified
 
 </div>
 
+<div>
+
+<label>
+Trading status
+</label>
+
+<select id="metadataAuditTradingStatus">
+
+<option value="">
+All trading statuses
+</option>
+
+<option value="CURRENT">
+Current - bulk PSX evidence
+</option>
+
+<option value="CURRENT_PAGE_EVIDENCE">
+Current - company page evidence
+</option>
+
+<option value="SUSPENDED">
+Suspended
+</option>
+
+<option value="DELISTED">
+Delisted
+</option>
+
+<option value="CHANGED">
+Changed / renamed
+</option>
+
+<option value="MERGED">
+Merged / amalgamated
+</option>
+
+<option value="MIGRATED_OR_SYMBOL_CHANGED">
+Migrated / symbol changed
+</option>
+
+<option value="HISTORICAL_OR_INACTIVE">
+Historical / inactive
+</option>
+
+<option value="PAGE_STATUS_UNCLEAR">
+Official page - unclear
+</option>
+
+<option value="NO_COMPANY_PAGE_EVIDENCE">
+No company-page evidence
+</option>
+
+<option value="UNKNOWN">
+Not resolved yet
+</option>
+
+</select>
+
 </div>
 
+<div>
+
+<label>
+Universe eligibility
+</label>
+
+<select id="metadataAuditEligibility">
+
+<option value="">
+All eligibility classes
+</option>
+
+<option value="CORE_EQUITY_CANDIDATE">
+Core equity candidate
+</option>
+
+<option value="GEM_EQUITY_CANDIDATE">
+GEM equity candidate
+</option>
+
+<option value="ALTERNATIVE_LISTED_SECURITY">
+Alternative listed security
+</option>
+
+<option value="NON_CORE_SPECIAL_SECURITY">
+Separate special-security universe
+</option>
+
+<option value="SPECIAL_EQUITY_REVIEW">
+Special equity review
+</option>
+
+<option value="HOLD_SUSPENDED">
+Hold - suspended
+</option>
+
+<option value="INELIGIBLE_DELISTED">
+Not eligible - delisted
+</option>
+
+<option value="INELIGIBLE_HISTORICAL_SYMBOL">
+Not eligible - historical symbol
+</option>
+
+<option value="REVIEW_REQUIRED">
+Review required
+</option>
+
+</select>
+
+</div>
+
+</div>
 <p
   id="metadataAuditInfo"
   class="muted"
@@ -12576,16 +13897,16 @@ function auditBucketClass(
     bucket ===
       'UNRESOLVED' ||
     bucket ===
-      'LEGACY_STALE_CANDIDATE'
+      'LEGACY_STALE_CANDIDATE' ||
+    bucket ===
+      'HISTORICAL_SECURITY'
   ) {
     return 'danger';
   }
 
   if (
     bucket ===
-      'LIKELY_SPECIAL_INSTRUMENT' ||
-    bucket ===
-      'SPECIAL_INSTRUMENT'
+      'LIKELY_SPECIAL_INSTRUMENT'
   ) {
     return 'warning';
   }
@@ -12596,12 +13917,24 @@ function auditBucketClass(
 function universeClassPill(
   row
 ) {
-  const className =
+  const danger =
     row.universeClass ===
-      'LEGACY_STALE_CANDIDATE'
+      'HISTORICAL_OR_INACTIVE' ||
+    row.universeClass ===
+      'LEGACY_STALE_CANDIDATE';
+
+  const warning =
+    row.universeClass ===
+      'SPECIAL_INSTRUMENT' ||
+    row.universeClass ===
+      'SUSPENDED_SECURITY' ||
+    row.universeClass ===
+      'REVIEW_REQUIRED';
+
+  const className =
+    danger
       ? 'danger'
-      : row.universeClass ===
-          'SPECIAL_INSTRUMENT'
+      : warning
         ? 'warning'
         : 'info';
 
@@ -12616,6 +13949,276 @@ function universeClassPill(
     ) +
     '</span>'
   );
+}
+
+function tradingStatusPill(
+  row
+) {
+  const status =
+    row.tradingStatus ||
+    'UNKNOWN';
+
+  const dangerStatuses = [
+    'DELISTED',
+    'CHANGED',
+    'MERGED',
+    'MIGRATED_OR_SYMBOL_CHANGED',
+    'HISTORICAL_OR_INACTIVE',
+    'NO_COMPANY_PAGE_EVIDENCE'
+  ];
+
+  const warningStatuses = [
+    'SUSPENDED',
+    'PAGE_STATUS_UNCLEAR',
+    'UNKNOWN'
+  ];
+
+  const className =
+    dangerStatuses.includes(
+      status
+    )
+      ? 'danger'
+      : warningStatuses.includes(
+          status
+        )
+        ? 'warning'
+        : 'info';
+
+  return (
+    '<span class="auditPill ' +
+    className +
+    '">' +
+    escapeHtml(
+      row.tradingStatusLabel ||
+      status
+    ) +
+    '</span>'
+  );
+}
+
+function clientCountBy(
+  rows,
+  key
+) {
+  const counts = {};
+
+  rows.forEach(
+    row => {
+      const value =
+        row?.[key];
+
+      if (!value) {
+        return;
+      }
+
+      counts[value] =
+        (
+          counts[value] ||
+          0
+        ) +
+        1;
+    }
+  );
+
+  return counts;
+}
+
+function recalculateMetadataAuditResult(
+  result
+) {
+  const universe =
+    Array.isArray(
+      result.universe
+    )
+      ? result.universe
+      : [];
+
+  const issues =
+    universe.filter(
+      row =>
+        Boolean(
+          row.issueType
+        )
+    );
+
+  const namesResolved =
+    universe.filter(
+      row =>
+        row.nameResolved
+    ).length;
+
+  const sectorsResolved =
+    universe.filter(
+      row =>
+        row.sectorResolved
+    ).length;
+
+  const universeClasses =
+    clientCountBy(
+      universe,
+      'universeClass'
+    );
+
+  const tradingStatusCounts =
+    clientCountBy(
+      universe,
+      'tradingStatus'
+    );
+
+  const eligibilityCounts =
+    clientCountBy(
+      universe,
+      'eligibility'
+    );
+
+  const sourceCoverage = {
+    ...(
+      result.sourceCoverage ||
+      {}
+    ),
+
+    companyPage:
+      universe.filter(
+        row =>
+          row.hasOfficialPageEvidence
+      ).length
+  };
+
+  return {
+    ...result,
+
+    resolvedAt:
+      new Date()
+        .toISOString(),
+
+    summary: {
+      ...(
+        result.summary ||
+        {}
+      ),
+
+      totalCanonicalSecurities:
+        universe.length,
+
+      namesResolved,
+
+      namesMissing:
+        universe.length -
+        namesResolved,
+
+      sectorsResolved,
+
+      sectorsMissing:
+        universe.length -
+        sectorsResolved,
+
+      statusSymbolsNormalized:
+        universe.filter(
+          row =>
+            row.normalizedStatus
+        ).length,
+
+      totalMetadataIssues:
+        issues.length,
+
+      totalSpecialInstrumentsDetected:
+        universe.filter(
+          row =>
+            row.isSpecialSecurity
+        ).length,
+
+      verifiedCurrentSecurities:
+        universeClasses.VERIFIED_CURRENT ||
+        0,
+
+      specialInstrumentSecurities:
+        universeClasses.SPECIAL_INSTRUMENT ||
+        0,
+
+      legacyStaleCandidates:
+        universeClasses.LEGACY_STALE_CANDIDATE ||
+        0,
+
+      historicalOrInactive:
+        universeClasses.HISTORICAL_OR_INACTIVE ||
+        0,
+
+      suspendedSecurities:
+        (
+          tradingStatusCounts.SUSPENDED ||
+          0
+        ),
+
+      delistedSecurities:
+        tradingStatusCounts.DELISTED ||
+        0,
+
+      changedOrMigratedSymbols:
+        (
+          tradingStatusCounts.CHANGED ||
+          0
+        ) +
+        (
+          tradingStatusCounts.MERGED ||
+          0
+        ) +
+        (
+          tradingStatusCounts.MIGRATED_OR_SYMBOL_CHANGED ||
+          0
+        ),
+
+      statusReviewRequired:
+        (
+          universeClasses.REVIEW_REQUIRED ||
+          0
+        ) +
+        (
+          universeClasses.UNVERIFIED ||
+          0
+        ),
+
+      coreEquityCandidates:
+        eligibilityCounts.CORE_EQUITY_CANDIDATE ||
+        0,
+
+      gemEquityCandidates:
+        eligibilityCounts.GEM_EQUITY_CANDIDATE ||
+        0
+    },
+
+    sourceCoverage,
+
+    universeClasses,
+    tradingStatusCounts,
+    eligibilityCounts,
+
+    issueBuckets:
+      clientCountBy(
+        issues,
+        'bucket'
+      ),
+
+    issueTypes:
+      clientCountBy(
+        issues,
+        'issueType'
+      ),
+
+    securityTypes:
+      clientCountBy(
+        universe,
+        'securityType'
+      ),
+
+    issuerTypes:
+      clientCountBy(
+        universe,
+        'issuerType'
+      ),
+
+    issues,
+    universe
+  };
 }
 
 function renderMetadataAuditSummary(
@@ -12647,7 +14250,7 @@ function renderMetadataAuditSummary(
           summary.verifiedCurrentSecurities,
           0
         ),
-        'Official PSX evidence'
+        'Ordinary/current security class'
       ) +
 
       metricCard(
@@ -12655,32 +14258,72 @@ function renderMetadataAuditSummary(
         formatNumber(
           summary.specialInstrumentSecurities,
           0
+        ),
+        'Rights, Modaraba, REIT, fund, preference, etc.'
+      ) +
+
+      metricCard(
+        'Delisted',
+        '<span class="negative">' +
+        formatNumber(
+          summary.delistedSecurities ||
+          0,
+          0
+        ) +
+        '</span>'
+      ) +
+
+      metricCard(
+        'Changed / migrated',
+        formatNumber(
+          summary.changedOrMigratedSymbols ||
+          0,
+          0
         )
       ) +
 
       metricCard(
-        'Legacy / stale candidates',
-        '<span class="' +
-        (
-          Number(
-            summary.legacyStaleCandidates
-          ) > 0
-            ? 'negative'
-            : 'positive'
-        ) +
-        '">' +
+        'Suspended',
         formatNumber(
-          summary.legacyStaleCandidates,
+          summary.suspendedSecurities ||
+          0,
           0
-        ) +
-        '</span>',
-        'Not confirmed delistings'
+        )
       ) +
 
       metricCard(
-        'Unverified status',
+        'Historical / inactive',
         formatNumber(
-          summary.unverifiedCurrentStatus,
+          summary.historicalOrInactive ||
+          0,
+          0
+        )
+      ) +
+
+      metricCard(
+        'Status review required',
+        formatNumber(
+          summary.statusReviewRequired ||
+          summary.unverifiedCurrentStatus ||
+          0,
+          0
+        )
+      ) +
+
+      metricCard(
+        'Core equity candidates',
+        formatNumber(
+          summary.coreEquityCandidates ||
+          0,
+          0
+        )
+      ) +
+
+      metricCard(
+        'GEM equity candidates',
+        formatNumber(
+          summary.gemEquityCandidates ||
+          0,
           0
         )
       ) +
@@ -12712,14 +14355,6 @@ function renderMetadataAuditSummary(
       ) +
 
       metricCard(
-        'Status symbols normalized',
-        formatNumber(
-          summary.statusSymbolsNormalized,
-          0
-        )
-      ) +
-
-      metricCard(
         'Metadata issues',
         formatNumber(
           summary.totalMetadataIssues,
@@ -12728,18 +14363,19 @@ function renderMetadataAuditSummary(
       ) +
 
       metricCard(
-        'Official evidence coverage',
+        'Company pages resolved',
         formatNumber(
-          sourceCoverage.verifiedByAnyOfficialSource,
+          sourceCoverage.companyPage ||
+          0,
           0
         ),
-        'PSX symbols / eligible scrips / ALLSHR'
+        'Deep PSX status checks'
       ) +
 
       '</div>' +
 
       '<div class="infoBox">' +
-      'Security QA is diagnostic only. “Legacy / stale candidate” means the screener feed contains the symbol but this audit did not find current official PSX metadata evidence; it is not automatically treated as delisted or removed.' +
+      'Build 0.6.5 separates trading status, security type, issuer type and future universe eligibility. No symbol is removed automatically. Delisted/changed/suspended classifications come from PSX company-page evidence; unclear rows remain review-required.' +
       '</div>';
 }
 
@@ -12770,6 +14406,14 @@ function getFilteredMetadataAuditRows() {
     $('metadataAuditUniverseClass')
       .value;
 
+  const tradingStatus =
+    $('metadataAuditTradingStatus')
+      .value;
+
+  const eligibility =
+    $('metadataAuditEligibility')
+      .value;
+
   return activeMetadataAuditRows()
     .filter(
       row => {
@@ -12785,7 +14429,9 @@ function getFilteredMetadataAuditRows() {
             ' ' +
             row.sector +
             ' ' +
-            row.instrumentLabel +
+            row.securityLabel +
+            ' ' +
+            row.issuerLabel +
             ' ' +
             row.issueLabel +
             ' ' +
@@ -12795,7 +14441,15 @@ function getFilteredMetadataAuditRows() {
             ' ' +
             row.universeReason +
             ' ' +
+            row.tradingStatusLabel +
+            ' ' +
+            row.eligibilityLabel +
+            ' ' +
             row.parentSymbol +
+            ' ' +
+            row.successorSymbol +
+            ' ' +
+            row.successorName +
             ' ' +
             (
               row.metadataSources ||
@@ -12827,6 +14481,16 @@ function getFilteredMetadataAuditRows() {
             !universeClass ||
             row.universeClass ===
               universeClass
+          ) &&
+          (
+            !tradingStatus ||
+            row.tradingStatus ===
+              tradingStatus
+          ) &&
+          (
+            !eligibility ||
+            row.eligibility ===
+              eligibility
           )
         );
       }
@@ -12915,14 +14579,16 @@ function renderMetadataAuditTable() {
       '<tr>' +
 
       '<th>Symbol</th>' +
-      '<th>Market symbol</th>' +
       '<th>Company</th>' +
       '<th>Sector</th>' +
-      '<th>Security QA</th>' +
-      '<th>Instrument</th>' +
+      '<th>Trading status</th>' +
+      '<th>Board</th>' +
+      '<th>Security type</th>' +
+      '<th>Issuer type</th>' +
+      '<th>Universe eligibility</th>' +
       '<th>Evidence</th>' +
       '<th>Issue</th>' +
-      '<th>Why flagged</th>' +
+      '<th>Why</th>' +
 
       '</tr>' +
 
@@ -12938,6 +14604,17 @@ function renderMetadataAuditTable() {
               ? row.officialEvidenceSources
               : row.metadataSources ||
                 [];
+
+          const successor =
+            row.successorSymbol
+              ? (
+                  '<span class="symbolSub">Successor/current: ' +
+                  escapeHtml(
+                    row.successorSymbol
+                  ) +
+                  '</span>'
+                )
+              : '';
 
           return (
             '<tr>' +
@@ -12959,13 +14636,22 @@ function renderMetadataAuditTable() {
                 : ''
             ) +
 
-            '</td>' +
-
-            '<td>' +
-            escapeHtml(
-              row.marketSymbol ||
-              row.symbol
+            (
+              row.marketSymbol &&
+              row.marketSymbol !==
+                row.symbol
+                ? (
+                    '<span class="symbolSub">Market: ' +
+                    escapeHtml(
+                      row.marketSymbol
+                    ) +
+                    '</span>'
+                  )
+                : ''
             ) +
+
+            successor +
+
             '</td>' +
 
             '<td>' +
@@ -12997,20 +14683,37 @@ function renderMetadataAuditTable() {
             '</td>' +
 
             '<td>' +
-            universeClassPill(
+            tradingStatusPill(
               row
             ) +
-            '<div class="symbolSub">' +
-            escapeHtml(
-              row.universeReason ||
-              ''
+            (
+              row.companyPageQuoteAsOf
+                ? (
+                    '<span class="symbolSub">Quote as of ' +
+                    escapeHtml(
+                      formatDate(
+                        row.companyPageQuoteAsOf
+                      )
+                    ) +
+                    '</span>'
+                  )
+                : ''
             ) +
-            '</div>' +
             '</td>' +
 
             '<td>' +
             escapeHtml(
-              row.instrumentLabel
+              row.boardLabel ||
+              row.boardType ||
+              'Unknown'
+            ) +
+            '</td>' +
+
+            '<td>' +
+            escapeHtml(
+              row.securityLabel ||
+              row.instrumentLabel ||
+              'Unknown'
             ) +
             (
               row.parentSymbol
@@ -13025,6 +14728,30 @@ function renderMetadataAuditTable() {
             ) +
             '</td>' +
 
+            '<td>' +
+            escapeHtml(
+              row.issuerLabel ||
+              row.issuerType ||
+              'Unknown'
+            ) +
+            '</td>' +
+
+            '<td>' +
+            '<strong>' +
+            escapeHtml(
+              row.eligibilityLabel ||
+              row.eligibility ||
+              'Review required'
+            ) +
+            '</strong>' +
+            '<span class="symbolSub">' +
+            escapeHtml(
+              row.eligibilityReason ||
+              ''
+            ) +
+            '</span>' +
+            '</td>' +
+
             '<td class="auditEvidence">' +
             (
               evidence.length
@@ -13037,7 +14764,7 @@ function renderMetadataAuditTable() {
                   )
                 : (
                     '<span class="negative">' +
-                    'No current official evidence' +
+                    'No official evidence yet' +
                     '</span>'
                   )
             ) +
@@ -13126,6 +14853,142 @@ function renderMetadataAuditTable() {
       pageCount;
 }
 
+function chunkArray(
+  values,
+  size
+) {
+  const chunks = [];
+
+  for (
+    let index = 0;
+    index < values.length;
+    index += size
+  ) {
+    chunks.push(
+      values.slice(
+        index,
+        index +
+        size
+      )
+    );
+  }
+
+  return chunks;
+}
+
+async function deepResolveMetadataAudit(
+  result
+) {
+  const universeMap =
+    new Map(
+      (
+        result.universe ||
+        []
+      ).map(
+        row => [
+          row.symbol,
+          row
+        ]
+      )
+    );
+
+  const targetSymbols =
+    (
+      result.universe ||
+      []
+    )
+      .filter(
+        row =>
+          Boolean(
+            row.issueType
+          ) ||
+          row.universeClass ===
+            'LEGACY_STALE_CANDIDATE' ||
+          row.universeClass ===
+            'SPECIAL_INSTRUMENT'
+      )
+      .map(
+        row =>
+          row.symbol
+      );
+
+  const batches =
+    chunkArray(
+      targetSymbols,
+      20
+    );
+
+  let successfulBatches =
+    0;
+
+  for (
+    let index = 0;
+    index < batches.length;
+    index++
+  ) {
+    $('metadataAuditProgress')
+      .textContent =
+        'Resolving official PSX company-page status ' +
+        (
+          index +
+          1
+        ) +
+        '/' +
+        batches.length +
+        '...';
+
+    try {
+      const batchResult =
+        await api(
+          'security-status-batch',
+          {
+            symbols:
+              batches[index]
+                .join(',')
+          }
+        );
+
+      (
+        batchResult.rows ||
+        []
+      ).forEach(
+        row => {
+          universeMap.set(
+            row.symbol,
+            row
+          );
+        }
+      );
+
+      successfulBatches++;
+    } catch (error) {
+      console.warn(
+        'NOMAD deep audit batch failed',
+        error
+      );
+    }
+  }
+
+  const resolved =
+    recalculateMetadataAuditResult({
+      ...result,
+      universe:
+        Array.from(
+          universeMap.values()
+        )
+    });
+
+  $('metadataAuditProgress')
+    .textContent =
+      'Official status resolution complete: ' +
+      successfulBatches +
+      '/' +
+      batches.length +
+      ' batches completed. No securities were removed.';
+
+  return resolved;
+}
+
 function csvCell(
   value
 ) {
@@ -13200,14 +15063,20 @@ function downloadMetadataAuditCSV() {
     'Company',
     'Sector',
     'Status Codes',
-    'Security QA',
-    'Instrument Type',
+    'Trading Status',
+    'Board',
+    'Security Type',
+    'Issuer Type',
     'Parent Symbol',
-    'Classification Confidence',
+    'Successor Symbol',
+    'Universe Class',
+    'Universe Eligibility',
     'Official Evidence',
     'All Metadata Sources',
     'Issue Type',
     'Issue Bucket',
+    'Company Page Quote As Of',
+    'Company Page URL',
     'Reason'
   ];
 
@@ -13231,11 +15100,28 @@ function downloadMetadataAuditCSV() {
           row.statusCodes ||
           []
         ).join(' | '),
-        row.universeLabel,
-        row.instrumentLabel,
+        row.tradingStatusLabel ||
+          row.tradingStatus ||
+          '',
+        row.boardLabel ||
+          row.boardType ||
+          '',
+        row.securityLabel ||
+          row.securityType ||
+          '',
+        row.issuerLabel ||
+          row.issuerType ||
+          '',
         row.parentSymbol ||
           '',
-        row.classificationConfidence,
+        row.successorSymbol ||
+          '',
+        row.universeLabel ||
+          row.universeClass ||
+          '',
+        row.eligibilityLabel ||
+          row.eligibility ||
+          '',
         (
           row.officialEvidenceSources ||
           []
@@ -13247,6 +15133,10 @@ function downloadMetadataAuditCSV() {
         row.issueLabel ||
           '',
         row.bucketLabel ||
+          '',
+        row.companyPageQuoteAsOf ||
+          '',
+        row.companyPageUrl ||
           '',
         row.auditReason ||
         row.universeReason ||
@@ -15104,14 +16994,18 @@ $('runMetadataAudit')
         .disabled =
           true;
 
+      $('metadataAuditProgress')
+        .textContent =
+          '';
+
       $('metadataAuditSummary')
         .innerHTML =
           '<p class="muted">' +
-          'Running read-only metadata and security-universe audit...' +
+          'Running fast metadata audit...' +
           '</p>';
 
       try {
-        const result =
+        let result =
           await api(
             'metadata-audit'
           );
@@ -15165,10 +17059,47 @@ $('runMetadataAudit')
           .value =
             '';
 
+        $('metadataAuditTradingStatus')
+          .value =
+            '';
+
+        $('metadataAuditEligibility')
+          .value =
+            '';
+
+        renderMetadataAuditTable();
+
+        result =
+          await deepResolveMetadataAudit(
+            result
+          );
+
+        lastMetadataAuditResult =
+          result;
+
+        metadataAuditRows =
+          result.issues ||
+          [];
+
+        metadataAuditUniverseRows =
+          result.universe ||
+          [];
+
+        metadataAuditPage =
+          1;
+
+        renderMetadataAuditSummary(
+          result
+        );
+
         renderMetadataAuditTable();
       } catch (error) {
         $('metadataAuditSummary')
           .innerHTML =
+            '';
+
+        $('metadataAuditProgress')
+          .textContent =
             '';
 
         $('error')
@@ -15209,6 +17140,25 @@ $('metadataAuditCategory')
     };
 
 $('metadataAuditUniverseClass')
+  .onchange =
+    () => {
+      metadataAuditPage =
+        1;
+
+      renderMetadataAuditTable();
+    };
+
+
+$('metadataAuditTradingStatus')
+  .onchange =
+    () => {
+      metadataAuditPage =
+        1;
+
+      renderMetadataAuditTable();
+    };
+
+$('metadataAuditEligibility')
   .onchange =
     () => {
       metadataAuditPage =
