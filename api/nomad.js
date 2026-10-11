@@ -13420,27 +13420,12 @@ api(
 module.exports =
   handler;
 
-if (
-  require.main ===
-  module
-) {
-  const port =
-    Number(
-      process.env.PORT ||
-      3000
-    );
+if (require.main === module) {
+  const port = Number(process.env.PORT || 3000);
 
   http
-    .createServer(
-      handler
-    )
-    .listen(
-      port,
-      '127.0.0.1',
-      () => {
-        console.log(
-          \`NOMAD Invest running at http://127.0.0.1:\${port}\`
-        );
-      }
-    );
+    .createServer(handler)
+    .listen(port, '127.0.0.1', () => {
+      console.log('NOMAD Invest running at http://127.0.0.1:' + port);
+    });
 }
