@@ -3,7 +3,7 @@
 const http = require('node:http');
 const crypto = require('node:crypto');
 
-const VERSION = '0.4.2';
+const VERSION = '0.5.0';
 
 const PSX_API_BASE =
   process.env.PSX_API_BASE ||
@@ -13,8 +13,12 @@ const PSX_META_BASE =
   process.env.PSX_META_BASE ||
   'https://psx-rest-api.onrender.com';
 
+const PSX_DPS_BASE =
+  process.env.PSX_DPS_BASE ||
+  'https://dps.psx.com.pk';
+
 const PSX_ELIGIBLE_SCRIPS_URL =
-  'https://dps.psx.com.pk/eligible-scrips';
+  `${PSX_DPS_BASE}/eligible-scrips`;
 
 const PYPSX_API_KEY_ID =
   process.env.PYPSX_API_KEY_ID ||
@@ -37,6 +41,7 @@ function getPyPSXBase() {
 let marketCache = null;
 let sectorCache = null;
 let companyCache = null;
+const companyPageCache = new Map();
 
 /* --------------------------------------------------
    HELPERS
@@ -57,12 +62,21 @@ function safeNumber(value) {
     return null;
   }
 
-  const parsed = Number(
-    String(value)
-      .replace(/,/g, '')
-      .replace(/%/g, '')
-      .trim()
-  );
+  const normalized = String(value)
+    .replace(/,/g, '')
+    .replace(/%/g, '')
+    .replace(/^\((.*)\)$/, '-$1')
+    .trim();
+
+  if (
+    !normalized ||
+    normalized === '-' ||
+    /^n\/?a$/i.test(normalized)
+  ) {
+    return null;
+  }
+
+  const parsed = Number(normalized);
 
   return Number.isFinite(parsed)
     ? parsed
@@ -83,74 +97,23 @@ function normalizeTimestamp(value) {
     : new Date().toISOString();
 }
 
-/* --------------------------------------------------
-   HTTP
--------------------------------------------------- */
+function absoluteURL(value) {
+  const raw = String(value || '').trim();
 
-async function fetchJSON(
-  url,
-  timeout = 20000,
-  headers = {}
-) {
-  const response = await fetch(url, {
-    headers: {
-      Accept: 'application/json',
-      ...headers
-    },
-    signal: AbortSignal.timeout(timeout)
-  });
-
-  if (!response.ok) {
-    let message =
-      `Data service returned HTTP ${response.status}.`;
-
-    try {
-      const body =
-        await response.json();
-
-      if (body?.error?.message) {
-        message =
-          body.error.message;
-      }
-
-      if (body?.detail) {
-        message =
-          String(body.detail);
-      }
-    } catch {}
-
-    bad(
-      message,
-      response.status
-    );
+  if (!raw) {
+    return null;
   }
 
-  return response.json();
+  try {
+    return new URL(raw, PSX_DPS_BASE).toString();
+  } catch {
+    return null;
+  }
 }
 
-async function fetchText(
-  url,
-  timeout = 20000,
-  headers = {}
-) {
-  const response = await fetch(url, {
-    headers: {
-      Accept: 'text/html,application/xhtml+xml',
-      'User-Agent':
-        'Mozilla/5.0 NOMAD-Invest/0.4.2',
-      ...headers
-    },
-    signal: AbortSignal.timeout(timeout)
-  });
-
-  if (!response.ok) {
-    bad(
-      `Data service returned HTTP ${response.status}.`,
-      response.status
-    );
-  }
-
-  return response.text();
+function escapeRegExp(value) {
+  return String(value)
+    .replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function decodeHtml(value) {
@@ -173,12 +136,1101 @@ function decodeHtml(value) {
 function cleanHtmlCell(value) {
   return decodeHtml(
     String(value || '')
-      .replace(/<script[\s\S]*?<\/script>/gi, '')
-      .replace(/<style[\s\S]*?<\/style>/gi, '')
-      .replace(/<[^>]+>/g, ' ')
+      .replace(
+        /<script[\s\S]*?<\/script>/gi,
+        ''
+      )
+      .replace(
+        /<style[\s\S]*?<\/style>/gi,
+        ''
+      )
+      .replace(
+        /<[^>]+>/g,
+        ' '
+      )
   )
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function htmlToLines(html) {
+  return decodeHtml(
+    String(html || '')
+      .replace(
+        /<script[\s\S]*?<\/script>/gi,
+        ''
+      )
+      .replace(
+        /<style[\s\S]*?<\/style>/gi,
+        ''
+      )
+      .replace(
+        /<br\s*\/?\s*>/gi,
+        '\n'
+      )
+      .replace(
+        /<\/(?:div|p|td|th|tr|li|h1|h2|h3|h4|h5|section|article)>/gi,
+        '\n'
+      )
+      .replace(
+        /<[^>]+>/g,
+        ' '
+      )
+  )
+    .split(/\r?\n/)
+    .map(value =>
+      value
+        .replace(/\s+/g, ' ')
+        .trim()
+    )
+    .filter(Boolean);
+}
+
+function findLineValue(
+  lines,
+  label,
+  occurrence = 0
+) {
+  const target =
+    String(label || '')
+      .toLowerCase();
+
+  let seen = 0;
+
+  for (
+    let index = 0;
+    index < lines.length;
+    index += 1
+  ) {
+    const line =
+      String(
+        lines[index] || ''
+      )
+        .toLowerCase();
+
+    if (
+      !line.includes(target)
+    ) {
+      continue;
+    }
+
+    if (
+      seen < occurrence
+    ) {
+      seen += 1;
+      continue;
+    }
+
+    const sameLine =
+      lines[index]
+        .replace(
+          new RegExp(
+            escapeRegExp(label),
+            'i'
+          ),
+          ''
+        )
+        .replace(
+          /^[:\s-]+/,
+          ''
+        )
+        .trim();
+
+    if (sameLine) {
+      return sameLine;
+    }
+
+    for (
+      let candidateIndex =
+        index + 1;
+
+      candidateIndex <
+        Math.min(
+          lines.length,
+          index + 5
+        );
+
+      candidateIndex += 1
+    ) {
+      const candidate =
+        lines[candidateIndex];
+
+      if (candidate) {
+        return candidate;
+      }
+    }
+  }
+
+  return null;
+}
+
+function findNumericAfterLabel(
+  lines,
+  label,
+  occurrence = 0
+) {
+  const value =
+    findLineValue(
+      lines,
+      label,
+      occurrence
+    );
+
+  if (!value) {
+    return null;
+  }
+
+  const match =
+    String(value)
+      .match(
+        /\(?-?[\d,.]+(?:\.\d+)?\)?/
+      );
+
+  return match
+    ? safeNumber(match[0])
+    : null;
+}
+
+function dateLike(value) {
+  return (
+    /^(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},\s+\d{4}/i
+      .test(
+        String(value || '')
+          .trim()
+      ) ||
+    /^\d{4}-\d{2}-\d{2}$/
+      .test(
+        String(value || '')
+          .trim()
+      )
+  );
+}
+
+function parseHTMLTables(html) {
+  const tables = [];
+
+  const tableRegex =
+    /<table\b[^>]*>([\s\S]*?)<\/table>/gi;
+
+  let tableMatch;
+
+  while (
+    (
+      tableMatch =
+        tableRegex.exec(
+          String(html || '')
+        )
+    ) !== null
+  ) {
+    const tableHtml =
+      tableMatch[1];
+
+    const rows = [];
+
+    const rowRegex =
+      /<tr\b[^>]*>([\s\S]*?)<\/tr>/gi;
+
+    let rowMatch;
+
+    while (
+      (
+        rowMatch =
+          rowRegex.exec(
+            tableHtml
+          )
+      ) !== null
+    ) {
+      const rowHtml =
+        rowMatch[1];
+
+      const cells = [];
+
+      const cellRegex =
+        /<(?:td|th)\b[^>]*>([\s\S]*?)<\/(?:td|th)>/gi;
+
+      let cellMatch;
+
+      while (
+        (
+          cellMatch =
+            cellRegex.exec(
+              rowHtml
+            )
+        ) !== null
+      ) {
+        cells.push(
+          cleanHtmlCell(
+            cellMatch[1]
+          )
+        );
+      }
+
+      if (cells.length) {
+        const anchorMatch =
+          rowHtml.match(
+            /<a\b[^>]*href=["']([^"']+)["'][^>]*>/i
+          );
+
+        rows.push({
+          cells,
+
+          href:
+            anchorMatch
+              ? absoluteURL(
+                  anchorMatch[1]
+                )
+              : null
+        });
+      }
+    }
+
+    if (rows.length) {
+      tables.push({
+        rows,
+        start:
+          tableMatch.index
+      });
+    }
+  }
+
+  return tables;
+}
+
+function tableToMatrix(table) {
+  return table.rows
+    .map(
+      row =>
+        row.cells
+    );
+}
+
+function classifyCompanyTable(
+  table
+) {
+  const matrix =
+    tableToMatrix(table);
+
+  const flattened =
+    matrix
+      .flat()
+      .join(' | ')
+      .toLowerCase();
+
+  if (
+    flattened.includes(
+      'profit after taxation'
+    ) &&
+    flattened.includes(
+      'eps'
+    )
+  ) {
+    const header =
+      matrix[0] || [];
+
+    const headerText =
+      header.join(' ');
+
+    return /^.*\bq[1-4]\b/i
+      .test(headerText)
+        ? 'financial-quarterly'
+        : 'financial-annual';
+  }
+
+  if (
+    flattened.includes(
+      'net profit margin'
+    ) ||
+    flattened.includes(
+      'eps growth'
+    ) ||
+    flattened.includes(
+      'return on equity'
+    ) ||
+    flattened.includes(
+      'roe'
+    ) ||
+    flattened.includes(
+      'price/book'
+    ) ||
+    flattened.includes(
+      'p/b'
+    ) ||
+    flattened.includes(
+      'peg'
+    )
+  ) {
+    return 'ratios';
+  }
+
+  const dateRows =
+    table.rows
+      .filter(
+        row =>
+          dateLike(
+            row.cells[0]
+          )
+      );
+
+  if (
+    dateRows.length >= 1
+  ) {
+    return 'announcements';
+  }
+
+  return 'other';
+}
+
+function normalizeFinancialTable(
+  table
+) {
+  const matrix =
+    tableToMatrix(
+      table
+    );
+
+  if (!matrix.length) {
+    return null;
+  }
+
+  const header =
+    matrix[0];
+
+  const periods =
+    header
+      .slice(1)
+      .filter(Boolean);
+
+  if (!periods.length) {
+    return null;
+  }
+
+  const rows = [];
+
+  for (
+    const row
+    of matrix.slice(1)
+  ) {
+    const label =
+      String(
+        row[0] || ''
+      ).trim();
+
+    if (!label) {
+      continue;
+    }
+
+    const values =
+      periods.map(
+        (
+          period,
+          index
+        ) => ({
+          period,
+
+          raw:
+            row[
+              index + 1
+            ] ?? '',
+
+          value:
+            safeNumber(
+              row[
+                index + 1
+              ]
+            )
+        })
+      );
+
+    rows.push({
+      label,
+      values
+    });
+  }
+
+  return {
+    periods,
+    rows
+  };
+}
+
+function normalizeRatioTable(
+  table
+) {
+  return normalizeFinancialTable(
+    table
+  );
+}
+
+function inferAnnouncementType(
+  title
+) {
+  const text =
+    String(
+      title || ''
+    )
+      .toLowerCase();
+
+  if (
+    text.includes(
+      'board meeting'
+    ) ||
+    text.includes(
+      'annual general meeting'
+    ) ||
+    text.includes(
+      'extraordinary general meeting'
+    ) ||
+    text.includes(
+      'eogm'
+    ) ||
+    text.includes(
+      'agm'
+    )
+  ) {
+    return 'Meeting';
+  }
+
+  if (
+    text.includes(
+      'financial result'
+    ) ||
+    text.includes(
+      'quarterly'
+    ) ||
+    text.includes(
+      'half year'
+    ) ||
+    text.includes(
+      'annual report'
+    ) ||
+    text.includes(
+      'financial statement'
+    ) ||
+    text.includes(
+      'transmission of'
+    )
+  ) {
+    return 'Financial';
+  }
+
+  if (
+    text.includes(
+      'dividend'
+    ) ||
+    text.includes(
+      'bonus'
+    ) ||
+    text.includes(
+      'right issue'
+    ) ||
+    text.includes(
+      'book closure'
+    )
+  ) {
+    return 'Payout';
+  }
+
+  return 'Corporate';
+}
+
+function normalizeAnnouncementRows(
+  tables
+) {
+  const announcements = [];
+
+  for (
+    const table
+    of tables
+  ) {
+    if (
+      classifyCompanyTable(
+        table
+      ) !==
+      'announcements'
+    ) {
+      continue;
+    }
+
+    for (
+      const row
+      of table.rows
+    ) {
+      if (
+        !dateLike(
+          row.cells[0]
+        )
+      ) {
+        continue;
+      }
+
+      const date =
+        row.cells[0] || '';
+
+      const title =
+        row.cells[1] ||
+        row.cells[2] ||
+        '';
+
+      if (!title) {
+        continue;
+      }
+
+      announcements.push({
+        date,
+
+        type:
+          inferAnnouncementType(
+            title
+          ),
+
+        title,
+
+        documentUrl:
+          row.href
+      });
+    }
+  }
+
+  announcements.sort(
+    (
+      a,
+      b
+    ) => {
+      const aTime =
+        Date.parse(
+          a.date
+        ) || 0;
+
+      const bTime =
+        Date.parse(
+          b.date
+        ) || 0;
+
+      return (
+        bTime -
+        aTime
+      );
+    }
+  );
+
+  const seen =
+    new Set();
+
+  return announcements
+    .filter(
+      item => {
+        const key =
+          `${item.date}|${item.title}`;
+
+        if (
+          seen.has(key)
+        ) {
+          return false;
+        }
+
+        seen.add(key);
+
+        return true;
+      }
+    );
+}
+
+function parsePSXCompanyPage(
+  html,
+  symbol
+) {
+  const lines =
+    htmlToLines(html);
+
+  const tables =
+    parseHTMLTables(
+      html
+    );
+
+  const titleMatch =
+    String(
+      html || ''
+    ).match(
+      /<title>\s*[^<]*?Stock quote for\s+(.+?)\s+-\s+Pakistan Stock Exchange/i
+    );
+
+  const companyName =
+    titleMatch
+      ? cleanHtmlCell(
+          titleMatch[1]
+        )
+      : null;
+
+  let sectorName =
+    null;
+
+  if (companyName) {
+    const companyLineIndex =
+      lines.findIndex(
+        line =>
+          String(
+            line || ''
+          )
+            .trim()
+            .toLowerCase() ===
+          companyName
+            .toLowerCase()
+      );
+
+    if (
+      companyLineIndex >= 0
+    ) {
+      for (
+        let index =
+          companyLineIndex +
+          1;
+
+        index <
+          Math.min(
+            lines.length,
+            companyLineIndex +
+              8
+          );
+
+        index += 1
+      ) {
+        const candidate =
+          String(
+            lines[index] || ''
+          ).trim();
+
+        if (
+          candidate &&
+          candidate !==
+            symbol &&
+          candidate.length <=
+            120 &&
+          candidate ===
+            candidate
+              .toUpperCase() &&
+          !/^(QUOTE|PROFILE|EQUITY|ANNOUNCEMENTS|FINANCIALS|RATIOS|PAYOUTS|REPORTS|REG|DFC|CSF|ODL)$/i
+            .test(
+              candidate
+            ) &&
+          !/^RS\.?/i
+            .test(
+              candidate
+            ) &&
+          !/^PKR\b/i
+            .test(
+              candidate
+            ) &&
+          !/^\d/
+            .test(
+              candidate
+            )
+        ) {
+          sectorName =
+            candidate;
+
+          break;
+        }
+      }
+    }
+  }
+
+  let annual =
+    null;
+
+  let quarterly =
+    null;
+
+  let ratios =
+    null;
+
+  for (
+    const table
+    of tables
+  ) {
+    const type =
+      classifyCompanyTable(
+        table
+      );
+
+    if (
+      type ===
+        'financial-annual' &&
+      !annual
+    ) {
+      annual =
+        normalizeFinancialTable(
+          table
+        );
+    }
+
+    if (
+      type ===
+        'financial-quarterly' &&
+      !quarterly
+    ) {
+      quarterly =
+        normalizeFinancialTable(
+          table
+        );
+    }
+
+    if (
+      type ===
+        'ratios' &&
+      !ratios
+    ) {
+      ratios =
+        normalizeRatioTable(
+          table
+        );
+    }
+  }
+
+  const marketCapThousands =
+    findNumericAfterLabel(
+      lines,
+      "Market Cap (000's)"
+    ) ??
+    findNumericAfterLabel(
+      lines,
+      'Market Cap'
+    );
+
+  const shares =
+    findNumericAfterLabel(
+      lines,
+      'Shares'
+    );
+
+  const firstFreeFloat =
+    findNumericAfterLabel(
+      lines,
+      'Free Float',
+      0
+    );
+
+  const secondFreeFloat =
+    findNumericAfterLabel(
+      lines,
+      'Free Float',
+      1
+    );
+
+  let freeFloatShares =
+    firstFreeFloat;
+
+  let freeFloatPercent =
+    secondFreeFloat;
+
+  if (
+    freeFloatShares !==
+      null &&
+    freeFloatShares <=
+      100 &&
+    freeFloatPercent !==
+      null &&
+    freeFloatPercent >
+      100
+  ) {
+    const swap =
+      freeFloatShares;
+
+    freeFloatShares =
+      freeFloatPercent;
+
+    freeFloatPercent =
+      swap;
+  }
+
+  if (
+    freeFloatPercent ===
+      null &&
+    freeFloatShares !==
+      null &&
+    freeFloatShares <=
+      100
+  ) {
+    freeFloatPercent =
+      freeFloatShares;
+
+    freeFloatShares =
+      null;
+  }
+
+  return {
+    symbol,
+    companyName,
+    sectorName,
+
+    sourceUrl:
+      `${PSX_DPS_BASE}/company/${encodeURIComponent(
+        symbol
+      )}`,
+
+    fetchedAt:
+      new Date()
+        .toISOString(),
+
+    equity: {
+      marketCapThousands,
+
+      marketCapPkr:
+        marketCapThousands !==
+          null
+          ? marketCapThousands *
+            1000
+          : null,
+
+      shares,
+      freeFloatShares,
+      freeFloatPercent
+    },
+
+    annual,
+    quarterly,
+    ratios,
+
+    announcements:
+      normalizeAnnouncementRows(
+        tables
+      ).slice(
+        0,
+        25
+      )
+  };
+}
+
+function rangeStartDate(
+  range
+) {
+  const now =
+    new Date();
+
+  const date =
+    new Date(
+      Date.UTC(
+        now.getUTCFullYear(),
+        now.getUTCMonth(),
+        now.getUTCDate()
+      )
+    );
+
+  switch (
+    String(
+      range || ''
+    ).toUpperCase()
+  ) {
+    case '1M':
+      date.setUTCMonth(
+        date.getUTCMonth() -
+          1
+      );
+      break;
+
+    case '6M':
+      date.setUTCMonth(
+        date.getUTCMonth() -
+          6
+      );
+      break;
+
+    case '1Y':
+      date.setUTCFullYear(
+        date.getUTCFullYear() -
+          1
+      );
+      break;
+
+    case '2Y':
+      date.setUTCFullYear(
+        date.getUTCFullYear() -
+          2
+      );
+      break;
+
+    case 'ALL':
+      return null;
+
+    default:
+      date.setUTCFullYear(
+        date.getUTCFullYear() -
+          1
+      );
+  }
+
+  return date
+    .toISOString()
+    .slice(
+      0,
+      10
+    );
+}
+
+/* --------------------------------------------------
+   HTTP
+-------------------------------------------------- */
+
+async function fetchJSON(
+  url,
+  timeout = 20000,
+  headers = {}
+) {
+  const response =
+    await fetch(
+      url,
+      {
+        headers: {
+          Accept:
+            'application/json',
+
+          ...headers
+        },
+
+        signal:
+          AbortSignal
+            .timeout(
+              timeout
+            )
+      }
+    );
+
+  if (!response.ok) {
+    let message =
+      `Data service returned HTTP ${response.status}.`;
+
+    try {
+      const body =
+        await response
+          .json();
+
+      if (
+        body?.error
+          ?.message
+      ) {
+        message =
+          body.error
+            .message;
+      }
+
+      if (
+        body?.detail
+      ) {
+        message =
+          String(
+            body.detail
+          );
+      }
+    } catch {}
+
+    bad(
+      message,
+      response.status
+    );
+  }
+
+  return response
+    .json();
+}
+
+async function fetchText(
+  url,
+  timeout = 20000,
+  headers = {}
+) {
+  const response =
+    await fetch(
+      url,
+      {
+        headers: {
+          Accept:
+            'text/html,application/xhtml+xml',
+
+          'User-Agent':
+            'Mozilla/5.0 NOMAD-Invest/0.5.0',
+
+          ...headers
+        },
+
+        signal:
+          AbortSignal
+            .timeout(
+              timeout
+            )
+      }
+    );
+
+  if (!response.ok) {
+    bad(
+      `Data service returned HTTP ${response.status}.`,
+      response.status
+    );
+  }
+
+  return response
+    .text();
+}
+
+async function getPSXCompanySnapshot(
+  stockSymbol
+) {
+  const symbol =
+    normalizeSymbol(
+      stockSymbol
+    );
+
+  if (!symbol) {
+    bad(
+      'Enter a PSX symbol.'
+    );
+  }
+
+  const cached =
+    companyPageCache
+      .get(
+        symbol
+      );
+
+  if (
+    cached &&
+    Date.now() -
+      cached.fetchedAt <
+      30 *
+      60 *
+      1000
+  ) {
+    return cached.data;
+  }
+
+  const html =
+    await fetchText(
+      `${PSX_DPS_BASE}/company/${encodeURIComponent(
+        symbol
+      )}`,
+      30000,
+      {
+        Referer:
+          `${PSX_DPS_BASE}/`
+      }
+    );
+
+  const data =
+    parsePSXCompanyPage(
+      html,
+      symbol
+    );
+
+  companyPageCache
+    .set(
+      symbol,
+      {
+        fetchedAt:
+          Date.now(),
+
+        data
+      }
+    );
+
+  return data;
 }
 
 /* --------------------------------------------------
@@ -205,24 +1257,46 @@ function pyPSXHeaders() {
   };
 }
 
-function extractPyPSXRows(result) {
-  if (Array.isArray(result)) {
+function extractPyPSXRows(
+  result
+) {
+  if (
+    Array.isArray(
+      result
+    )
+  ) {
     return result;
   }
 
-  if (Array.isArray(result?.data)) {
+  if (
+    Array.isArray(
+      result?.data
+    )
+  ) {
     return result.data;
   }
 
-  if (Array.isArray(result?.candles)) {
+  if (
+    Array.isArray(
+      result?.candles
+    )
+  ) {
     return result.candles;
   }
 
-  if (Array.isArray(result?.results)) {
+  if (
+    Array.isArray(
+      result?.results
+    )
+  ) {
     const first =
       result.results[0];
 
-    if (Array.isArray(first?.candles)) {
+    if (
+      Array.isArray(
+        first?.candles
+      )
+    ) {
       return first.candles;
     }
   }
@@ -230,26 +1304,42 @@ function extractPyPSXRows(result) {
   return [];
 }
 
-function normalizePyPSXRow(row) {
-  if (Array.isArray(row)) {
+function normalizePyPSXRow(
+  row
+) {
+  if (
+    Array.isArray(
+      row
+    )
+  ) {
     return {
       timestamp:
         row[0] || null,
 
       open:
-        safeNumber(row[1]),
+        safeNumber(
+          row[1]
+        ),
 
       high:
-        safeNumber(row[2]),
+        safeNumber(
+          row[2]
+        ),
 
       low:
-        safeNumber(row[3]),
+        safeNumber(
+          row[3]
+        ),
 
       close:
-        safeNumber(row[4]),
+        safeNumber(
+          row[4]
+        ),
 
       volume:
-        safeNumber(row[5])
+        safeNumber(
+          row[5]
+        )
     };
   }
 
@@ -296,55 +1386,78 @@ function normalizePyPSXRow(row) {
   };
 }
 
-function pyPSXTimeValue(value) {
+function pyPSXTimeValue(
+  value
+) {
   if (
-    typeof value === 'number' &&
-    Number.isFinite(value)
+    typeof value ===
+      'number' &&
+    Number.isFinite(
+      value
+    )
   ) {
-    return value > 100000000000
-      ? value
-      : value * 1000;
+    return value >
+      100000000000
+        ? value
+        : value *
+          1000;
   }
 
   const parsed =
-    Date.parse(value);
+    Date.parse(
+      value
+    );
 
-  return Number.isFinite(parsed)
-    ? parsed
-    : 0;
+  return Number
+    .isFinite(
+      parsed
+    )
+      ? parsed
+      : 0;
 }
 
-function karachiDateKey(value) {
+function karachiDateKey(
+  value
+) {
   const timestamp =
-    pyPSXTimeValue(value);
+    pyPSXTimeValue(
+      value
+    );
 
   if (!timestamp) {
     return '';
   }
 
   const parts =
-    new Intl.DateTimeFormat(
-      'en-US',
-      {
-        timeZone:
-          'Asia/Karachi',
-        year:
-          'numeric',
-        month:
-          '2-digit',
-        day:
-          '2-digit'
-      }
-    )
+    new Intl
+      .DateTimeFormat(
+        'en-US',
+        {
+          timeZone:
+            'Asia/Karachi',
+
+          year:
+            'numeric',
+
+          month:
+            '2-digit',
+
+          day:
+            '2-digit'
+        }
+      )
       .formatToParts(
-        new Date(timestamp)
+        new Date(
+          timestamp
+        )
       );
 
   const get =
     type =>
       parts.find(
         part =>
-          part.type === type
+          part.type ===
+          type
       )?.value || '';
 
   return (
@@ -370,7 +1483,8 @@ async function getPyPSXMarketStatus() {
         true,
 
       isOpen:
-        result?.is_open === true,
+        result?.is_open ===
+        true,
 
       status:
         String(
@@ -380,19 +1494,23 @@ async function getPyPSXMarketStatus() {
 
       statusText:
         String(
-          result?.status_text ||
+          result
+            ?.status_text ||
           (
-            result?.is_open === true
+            result
+              ?.is_open ===
+            true
               ? 'Market Open'
               : 'Market Closed'
           )
         ),
 
       holidayName:
-        result?.holiday_name ||
+        result
+          ?.holiday_name ||
         null
     };
-  } catch (error) {
+  } catch {
     return {
       known:
         false,
@@ -451,14 +1569,18 @@ async function getPyPSXIntraday(
       )
       .filter(
         row =>
-          row.close !== null &&
+          row.close !==
+            null &&
           row.close > 0 &&
           pyPSXTimeValue(
             row.timestamp
           ) > 0
       )
       .sort(
-        (a, b) =>
+        (
+          a,
+          b
+        ) =>
           pyPSXTimeValue(
             a.timestamp
           ) -
@@ -476,7 +1598,8 @@ async function getPyPSXIntraday(
 
   const latest =
     rows[
-      rows.length - 1
+      rows.length -
+      1
     ];
 
   const latestSessionKey =
@@ -519,7 +1642,8 @@ async function getPyPSXIntraday(
   if (
     marketStatus.known &&
     marketStatus.isOpen &&
-    ageSeconds <= 180
+    ageSeconds <=
+      180
   ) {
     feedState =
       'LIVE';
@@ -597,23 +1721,28 @@ async function getPyPSXIntraday(
           close,
 
           volume:
-            row.volume || 0
+            row.volume ||
+            0
         };
       }
     );
 
-  const volumes =
-    normalizedSessionRows.map(
-      row =>
-        row.volume || 0
-    );
-
   const totalVolume =
-    volumes.reduce(
-      (sum, value) =>
-        sum + value,
-      0
-    );
+    normalizedSessionRows
+      .map(
+        row =>
+          row.volume ||
+          0
+      )
+      .reduce(
+        (
+          sum,
+          value
+        ) =>
+          sum +
+          value,
+        0
+      );
 
   return {
     symbol,
@@ -625,9 +1754,7 @@ async function getPyPSXIntraday(
       '1-minute intraday candles',
 
     marketStatus,
-
     feedState,
-
     feedLabel,
 
     price:
@@ -645,27 +1772,35 @@ async function getPyPSXIntraday(
 
     session: {
       open:
-        normalizedSessionRows[0]?.open ??
-        normalizedSessionRows[0]?.close ??
+        normalizedSessionRows[
+          0
+        ]?.open ??
+        normalizedSessionRows[
+          0
+        ]?.close ??
         null,
 
       high:
-        normalizedSessionRows.length
+        normalizedSessionRows
+          .length
           ? Math.max(
-              ...normalizedSessionRows.map(
-                row =>
-                  row.high
-              )
+              ...normalizedSessionRows
+                .map(
+                  row =>
+                    row.high
+                )
             )
           : null,
 
       low:
-        normalizedSessionRows.length
+        normalizedSessionRows
+          .length
           ? Math.min(
-              ...normalizedSessionRows.map(
-                row =>
-                  row.low
-              )
+              ...normalizedSessionRows
+                .map(
+                  row =>
+                    row.low
+                )
             )
           : null,
 
@@ -676,7 +1811,8 @@ async function getPyPSXIntraday(
         totalVolume,
 
       candles:
-        normalizedSessionRows.length
+        normalizedSessionRows
+          .length
     },
 
     data:
@@ -685,26 +1821,107 @@ async function getPyPSXIntraday(
 }
 
 /* --------------------------------------------------
-   COMPANY NAMES
+   COMPANY / SECTOR METADATA
 -------------------------------------------------- */
+
+async function loadOfficialSymbolsMap() {
+  const map =
+    new Map();
+
+  try {
+    const response =
+      await fetchJSON(
+        `${PSX_DPS_BASE}/symbols`,
+        30000,
+        {
+          'User-Agent':
+            'Mozilla/5.0 NOMAD-Invest/0.5.0',
+
+          Referer:
+            `${PSX_DPS_BASE}/`,
+
+          'X-Requested-With':
+            'XMLHttpRequest'
+        }
+      );
+
+    const rows =
+      Array.isArray(
+        response
+      )
+        ? response
+        : Array.isArray(
+            response?.data
+          )
+          ? response.data
+          : [];
+
+    for (
+      const row
+      of rows
+    ) {
+      const symbol =
+        normalizeSymbol(
+          row?.symbol ||
+          row?.SYMBOL ||
+          row?.ticker ||
+          row?.code
+        );
+
+      const name =
+        String(
+          row?.name ||
+          row?.companyName ||
+          row?.company_name ||
+          ''
+        ).trim();
+
+      const sector =
+        String(
+          row?.sectorName ||
+          row?.sector_name ||
+          row?.sector ||
+          ''
+        ).trim();
+
+      if (!symbol) {
+        continue;
+      }
+
+      map.set(
+        symbol,
+        {
+          name:
+            name ||
+            symbol,
+
+          sector,
+
+          source:
+            'PSX symbols'
+        }
+      );
+    }
+  } catch {}
+
+  return map;
+}
 
 async function loadCompanyMap() {
   if (
     companyCache &&
     Date.now() -
       companyCache.fetchedAt <
-      6 * 60 * 60 * 1000
+      6 *
+      60 *
+      60 *
+      1000
   ) {
     return companyCache.data;
   }
 
   const map =
-    new Map();
-
-  /*
-    PRIMARY SOURCE:
-    Official PSX Market Eligible Scrips page.
-  */
+    await loadOfficialSymbolsMap();
 
   try {
     const html =
@@ -726,8 +1943,7 @@ async function loadCompanyMap() {
           )
       ) !== null
     ) {
-      const cells =
-        [];
+      const cells = [];
 
       const cellRegex =
         /<td[^>]*>([\s\S]*?)<\/td>/gi;
@@ -750,7 +1966,8 @@ async function loadCompanyMap() {
       }
 
       if (
-        cells.length < 2
+        cells.length <
+        2
       ) {
         continue;
       }
@@ -769,43 +1986,50 @@ async function loadCompanyMap() {
       if (
         !symbol ||
         !name ||
-        symbol === 'SYMBOL' ||
-        name.toLowerCase() ===
+        symbol ===
+          'SYMBOL' ||
+        name
+          .toLowerCase() ===
           'name'
       ) {
         continue;
       }
 
       if (
-        /^[A-Z0-9.-]{1,20}$/.test(
-          symbol
-        )
+        /^[A-Z0-9.-]{1,20}$/
+          .test(
+            symbol
+          )
       ) {
+        const existing =
+          map.get(
+            symbol
+          );
+
         map.set(
           symbol,
           {
-            name,
+            name:
+              existing?.name &&
+              existing.name !==
+                symbol
+                ? existing.name
+                : name,
 
             sector:
+              existing
+                ?.sector ||
               '',
 
             source:
-              'PSX official eligible scrips'
+              existing
+                ?.source ||
+              'PSX eligible scrips'
           }
         );
       }
     }
-  } catch (error) {
-    console.error(
-      'Official PSX company metadata unavailable:',
-      error.message
-    );
-  }
-
-  /*
-    SECONDARY SOURCE:
-    pyPSX /symbols.
-  */
+  } catch {}
 
   try {
     const response =
@@ -836,7 +2060,8 @@ async function loadCompanyMap() {
     ) {
       if (
         !row ||
-        typeof row === 'string'
+        typeof row ===
+          'string'
       ) {
         continue;
       }
@@ -872,33 +2097,28 @@ async function loadCompanyMap() {
         symbol,
         {
           name:
-            existing?.name ||
-            name,
+            existing?.name &&
+            existing.name !==
+              symbol
+              ? existing.name
+              : name,
 
           sector:
+            existing
+              ?.sector ||
             String(
               row.sector ||
-              existing?.sector ||
               ''
             ).trim(),
 
           source:
-            existing?.source ||
+            existing
+              ?.source ||
             'pyPSX symbols'
         }
       );
     }
-  } catch (error) {
-    console.error(
-      'pyPSX symbol metadata unavailable:',
-      error.message
-    );
-  }
-
-  /*
-    FINAL FALLBACK:
-    Community metadata service.
-  */
+  } catch {}
 
   try {
     const response =
@@ -936,35 +2156,41 @@ async function loadCompanyMap() {
           symbol
         );
 
+      const fallbackName =
+        String(
+          row.name ||
+          symbol
+        ).trim();
+
+      const fallbackSector =
+        String(
+          row.sector ||
+          ''
+        ).trim();
+
       map.set(
         symbol,
         {
           name:
-            existing?.name ||
-            String(
-              row.name ||
+            existing?.name &&
+            existing.name !==
               symbol
-            ).trim(),
+              ? existing.name
+              : fallbackName,
 
           sector:
-            existing?.sector ||
-            String(
-              row.sector ||
-              ''
-            ).trim(),
+            existing
+              ?.sector ||
+            fallbackSector,
 
           source:
-            existing?.source ||
+            existing
+              ?.source ||
             'psx-rest-api'
         }
       );
     }
-  } catch (error) {
-    console.error(
-      'Fallback company metadata unavailable:',
-      error.message
-    );
-  }
+  } catch {}
 
   companyCache = {
     fetchedAt:
@@ -977,10 +2203,6 @@ async function loadCompanyMap() {
   return map;
 }
 
-/* --------------------------------------------------
-   SECTOR MAPPING
--------------------------------------------------- */
-
 async function loadSectorMap() {
   if (
     sectorCache &&
@@ -991,83 +2213,112 @@ async function loadSectorMap() {
     return sectorCache.data;
   }
 
-  const response =
-    await fetchJSON(
-      `${PSX_API_BASE}/sectors`
-    );
-
   const map =
     new Map();
 
-  if (
-    !Array.isArray(
-      response.data
-    )
-  ) {
-    return map;
-  }
+  try {
+    const companyMap =
+      await loadCompanyMap();
 
-  for (
-    const sectorRow
-    of response.data
-  ) {
-    const sectorName =
-      String(
-        sectorRow.sector ||
-        sectorRow.name ||
-        sectorRow.sector_name ||
-        sectorRow.sectorName ||
-        ''
-      ).trim();
-
-    if (!sectorName) {
-      continue;
-    }
-
-    try {
-      const stocksResponse =
-        await fetchJSON(
-          `${PSX_API_BASE}/sectors/${encodeURIComponent(
-            sectorName
-          )}/stocks`
-        );
-
+    for (
+      const [
+        symbol,
+        metadata
+      ]
+      of companyMap.entries()
+    ) {
       if (
-        !Array.isArray(
-          stocksResponse.data
-        )
+        metadata?.sector
       ) {
-        continue;
+        map.set(
+          symbol,
+          metadata.sector
+        );
       }
+    }
+  } catch {}
 
+  try {
+    const response =
+      await fetchJSON(
+        `${PSX_API_BASE}/sectors`
+      );
+
+    if (
+      Array.isArray(
+        response.data
+      )
+    ) {
       for (
-        const item
-        of stocksResponse.data
+        const sectorRow
+        of response.data
       ) {
-        const symbol =
-          typeof item === 'string'
-            ? normalizeSymbol(
-                item
-              )
-            : normalizeSymbol(
-                item.symbol ||
-                item.SYMBOL ||
-                item.ticker
-              );
+        const sectorName =
+          String(
+            sectorRow.sector ||
+            sectorRow.name ||
+            sectorRow.sector_name ||
+            sectorRow.sectorName ||
+            ''
+          ).trim();
 
-        if (symbol) {
-          map.set(
-            symbol,
-            sectorName
-          );
+        if (!sectorName) {
+          continue;
         }
+
+        try {
+          const stocksResponse =
+            await fetchJSON(
+              `${PSX_API_BASE}/sectors/${encodeURIComponent(
+                sectorName
+              )}/stocks`
+            );
+
+          if (
+            !Array.isArray(
+              stocksResponse.data
+            )
+          ) {
+            continue;
+          }
+
+          for (
+            const item
+            of stocksResponse.data
+          ) {
+            const symbol =
+              typeof item ===
+                'string'
+                ? normalizeSymbol(
+                    item
+                  )
+                : normalizeSymbol(
+                    item.symbol ||
+                    item.SYMBOL ||
+                    item.ticker
+                  );
+
+            if (
+              symbol &&
+              !map.has(
+                symbol
+              )
+            ) {
+              map.set(
+                symbol,
+                sectorName
+              );
+            }
+          }
+        } catch {}
       }
-    } catch {}
-  }
+    }
+  } catch {}
 
   sectorCache = {
     fetchedAt:
       Date.now(),
+
     data:
       map
   };
@@ -1076,7 +2327,7 @@ async function loadSectorMap() {
 }
 
 /* --------------------------------------------------
-   SCREENER
+   SCREENER / MARKET
 -------------------------------------------------- */
 
 function normalizeScreenerRow(
@@ -1173,10 +2424,6 @@ function normalizeScreenerRow(
   };
 }
 
-/* --------------------------------------------------
-   MARKET
--------------------------------------------------- */
-
 async function loadPSXMarket() {
   if (
     marketCache &&
@@ -1216,7 +2463,9 @@ async function loadPSXMarket() {
 
   const timestamp =
     normalizeTimestamp(
-      screener?.meta?.timestamp
+      screener
+        ?.meta
+        ?.timestamp
     );
 
   const stocks =
@@ -1230,7 +2479,9 @@ async function loadPSXMarket() {
             timestamp
           )
       )
-      .filter(Boolean);
+      .filter(
+        Boolean
+      );
 
   if (!stocks.length) {
     bad(
@@ -1239,12 +2490,29 @@ async function loadPSXMarket() {
     );
   }
 
+  const companyNamesMatched =
+    stocks.filter(
+      stock =>
+        stock.companyName &&
+        stock.companyName !==
+          stock.symbol
+    ).length;
+
+  const sectorsMatched =
+    stocks.filter(
+      stock =>
+        stock.sector &&
+        stock.sector !==
+          'Unknown'
+    ).length;
+
   const result = {
     sourceName:
       'psxdata-api',
 
-    companyMetadata:
-      companyMap.size,
+    companyNamesMatched,
+
+    sectorsMatched,
 
     asOf:
       timestamp,
@@ -1258,6 +2526,7 @@ async function loadPSXMarket() {
   marketCache = {
     fetchedAt:
       Date.now(),
+
     data:
       result
   };
@@ -1266,7 +2535,7 @@ async function loadPSXMarket() {
 }
 
 /* --------------------------------------------------
-   STOCK QUOTE
+   STOCK QUOTE / DECISION OVERVIEW
 -------------------------------------------------- */
 
 async function getQuote(
@@ -1289,22 +2558,34 @@ async function getQuote(
   const historyStartDate =
     new Date(
       now.getTime() -
-      370 * 24 * 60 * 60 * 1000
+      370 *
+      24 *
+      60 *
+      60 *
+      1000
     )
       .toISOString()
-      .slice(0, 10);
+      .slice(
+        0,
+        10
+      );
 
   const historyEndDate =
     now
       .toISOString()
-      .slice(0, 10);
+      .slice(
+        0,
+        10
+      );
 
   const historyURL =
     `${PSX_API_BASE}/stocks/${encodeURIComponent(
       symbol
-    )}/historical?start=${encodeURIComponent(
+    )}/historical` +
+    `?start=${encodeURIComponent(
       historyStartDate
-    )}&end=${encodeURIComponent(
+    )}` +
+    `&end=${encodeURIComponent(
       historyEndDate
     )}`;
 
@@ -1313,7 +2594,8 @@ async function getQuote(
     companyMap,
     sectorMap,
     liveResult,
-    historyResult
+    historyResult,
+    companySnapshot
   ] =
     await Promise.all([
       fetchJSON(
@@ -1334,6 +2616,12 @@ async function getQuote(
 
       fetchJSON(
         historyURL
+      ).catch(
+        () => null
+      ),
+
+      getPSXCompanySnapshot(
+        symbol
       ).catch(
         () => null
       )
@@ -1370,13 +2658,17 @@ async function getQuote(
     );
 
   if (
-    previousClose === null &&
-    quotePrice !== null &&
-    dayChangePct !== null
+    previousClose ===
+      null &&
+    quotePrice !==
+      null &&
+    dayChangePct !==
+      null
   ) {
     const denominator =
       1 +
-      dayChangePct / 100;
+      dayChangePct /
+      100;
 
     if (
       Number.isFinite(
@@ -1384,7 +2676,8 @@ async function getQuote(
       ) &&
       Math.abs(
         denominator
-      ) > 0.000001
+      ) >
+      0.000001
     ) {
       previousClose =
         quotePrice /
@@ -1398,9 +2691,12 @@ async function getQuote(
     );
 
   if (
-    dayChange === null &&
-    currentPrice !== null &&
-    previousClose !== null
+    dayChange ===
+      null &&
+    currentPrice !==
+      null &&
+    previousClose !==
+      null
   ) {
     dayChange =
       currentPrice -
@@ -1408,16 +2704,21 @@ async function getQuote(
   }
 
   if (
-    dayChangePct === null &&
-    dayChange !== null &&
-    previousClose !== null &&
-    previousClose !== 0
+    dayChangePct ===
+      null &&
+    dayChange !==
+      null &&
+    previousClose !==
+      null &&
+    previousClose !==
+      0
   ) {
     dayChangePct =
       (
         dayChange /
         previousClose
-      ) * 100;
+      ) *
+      100;
   }
 
   const historicalRows =
@@ -1457,15 +2758,21 @@ async function getQuote(
             row =>
               row.date &&
               !row.isAnomaly &&
-              row.close !== null &&
+              row.close !==
+                null &&
               row.close > 0 &&
-              row.high !== null &&
+              row.high !==
+                null &&
               row.high > 0 &&
-              row.low !== null &&
+              row.low !==
+                null &&
               row.low > 0
           )
           .sort(
-            (a, b) =>
+            (
+              a,
+              b
+            ) =>
               a.date
                 .localeCompare(
                   b.date
@@ -1477,61 +2784,77 @@ async function getQuote(
     `${now.getUTCFullYear()}-01-01`;
 
   const ytdRows =
-    historicalRows.filter(
-      row =>
-        row.date >=
-        ytdStartKey
-    );
+    historicalRows
+      .filter(
+        row =>
+          row.date >=
+          ytdStartKey
+      );
 
   const ytdStartClose =
-    ytdRows[0]?.close ??
+    ytdRows[0]
+      ?.close ??
     null;
 
   const ytdChangePct =
-    currentPrice !== null &&
-    ytdStartClose !== null &&
-    ytdStartClose !== 0
+    currentPrice !==
+      null &&
+    ytdStartClose !==
+      null &&
+    ytdStartClose !==
+      0
       ? (
           (
             currentPrice -
             ytdStartClose
           ) /
           ytdStartClose
-        ) * 100
+        ) *
+        100
       : null;
 
   const range52StartKey =
     new Date(
       now.getTime() -
-      365 * 24 * 60 * 60 * 1000
+      365 *
+      24 *
+      60 *
+      60 *
+      1000
     )
       .toISOString()
-      .slice(0, 10);
+      .slice(
+        0,
+        10
+      );
 
   const range52Rows =
-    historicalRows.filter(
-      row =>
-        row.date >=
-        range52StartKey
-    );
+    historicalRows
+      .filter(
+        row =>
+          row.date >=
+          range52StartKey
+      );
 
   const range52High =
     range52Rows.length
       ? Math.max(
-          ...range52Rows.map(
-            row =>
-              row.high
-          )
+          ...range52Rows
+            .map(
+              row =>
+                row.high
+            )
         )
       : null;
 
   const range52Low =
     range52Rows.length
       ? Math.min(
-          ...range52Rows.map(
-            row =>
-              row.low
-          )
+          ...range52Rows
+            .map(
+              row =>
+                row.low
+            )
         )
       : null;
 
@@ -1542,39 +2865,54 @@ async function getQuote(
 
   const sessionVolume =
     safeNumber(
-      liveResult?.session?.volume
+      liveResult
+        ?.session
+        ?.volume
     );
 
   const volumeVsAveragePct =
-    sessionVolume !== null &&
-    averageVolume30d !== null &&
-    averageVolume30d > 0
+    sessionVolume !==
+      null &&
+    averageVolume30d !==
+      null &&
+    averageVolume30d >
+      0
       ? (
           sessionVolume /
           averageVolume30d
-        ) * 100
+        ) *
+        100
       : null;
+
+  const resolvedName =
+    companySnapshot
+      ?.companyName ||
+    company?.name ||
+    symbol;
+
+  const resolvedSector =
+    companySnapshot
+      ?.sectorName ||
+    company?.sector ||
+    sectorMap.get(
+      symbol
+    ) ||
+    '';
 
   return {
     symbol,
 
-    company:
-      company
-        ? {
-            ...company,
+    company: {
+      ...(company || {}),
 
-            sector:
-              company.sector ||
-              sectorMap.get(
-                symbol
-              ) ||
-              ''
-          }
-        : null,
+      name:
+        resolvedName,
 
-    data:
-      data ||
-      null,
+      sector:
+        resolvedSector
+    },
+
+    data,
 
     meta:
       result.meta ||
@@ -1582,6 +2920,23 @@ async function getQuote(
 
     live:
       liveResult,
+
+    official:
+      companySnapshot
+        ? {
+            equity:
+              companySnapshot
+                .equity,
+
+            sourceUrl:
+              companySnapshot
+                .sourceUrl,
+
+            fetchedAt:
+              companySnapshot
+                .fetchedAt
+          }
+        : null,
 
     decision: {
       price:
@@ -1594,24 +2949,31 @@ async function getQuote(
       dayChangePct,
 
       session:
-        liveResult?.session ||
+        liveResult
+          ?.session ||
         null,
 
       marketStatus:
-        liveResult?.marketStatus ||
+        liveResult
+          ?.marketStatus ||
         null,
 
       feedState:
-        liveResult?.feedState ||
+        liveResult
+          ?.feedState ||
         null,
 
       feedLabel:
-        liveResult?.feedLabel ||
+        liveResult
+          ?.feedLabel ||
         null,
 
       priceTimestamp:
-        liveResult?.timestamp ||
-        result?.meta?.timestamp ||
+        liveResult
+          ?.timestamp ||
+        result
+          ?.meta
+          ?.timestamp ||
         null,
 
       ytdChangePct,
@@ -1630,14 +2992,31 @@ async function getQuote(
       },
 
       peRatio:
-        safeNumber(
-          data.pe_ratio
-        ),
+        (() => {
+          const pe =
+            safeNumber(
+              data.pe_ratio
+            );
+
+          return (
+            pe !== null &&
+            pe > 0
+          )
+            ? pe
+            : null;
+        })(),
 
       dividendYield:
-        safeNumber(
-          data.dividend_yield
-        ),
+        data.dividend_yield ===
+          null ||
+        data.dividend_yield ===
+          undefined ||
+        data.dividend_yield ===
+          ''
+          ? null
+          : safeNumber(
+              data.dividend_yield
+            ),
 
       averageVolume30d,
 
@@ -1645,12 +3024,30 @@ async function getQuote(
 
       volumeVsAveragePct,
 
-      marketCap:
+      marketCapPkr:
+        companySnapshot
+          ?.equity
+          ?.marketCapPkr ??
         safeNumber(
           data.market_cap
         ),
 
-      freeFloat:
+      shares:
+        companySnapshot
+          ?.equity
+          ?.shares ??
+        null,
+
+      freeFloatShares:
+        companySnapshot
+          ?.equity
+          ?.freeFloatShares ??
+        null,
+
+      freeFloatPercent:
+        companySnapshot
+          ?.equity
+          ?.freeFloatPercent ??
         safeNumber(
           data.free_float
         )
@@ -1664,13 +3061,30 @@ async function getQuote(
 
 async function getHistory(
   stockSymbol,
-  start,
-  end
+  range = '1Y'
 ) {
   const symbol =
     normalizeSymbol(
       stockSymbol
     );
+
+  const normalizedRange =
+    [
+      '1M',
+      '6M',
+      '1Y',
+      '2Y',
+      'ALL'
+    ]
+      .includes(
+        String(
+          range || ''
+        ).toUpperCase()
+      )
+        ? String(
+            range
+          ).toUpperCase()
+        : '1Y';
 
   if (!symbol) {
     bad(
@@ -1681,6 +3095,19 @@ async function getHistory(
   const params =
     new URLSearchParams();
 
+  const start =
+    rangeStartDate(
+      normalizedRange
+    );
+
+  const end =
+    new Date()
+      .toISOString()
+      .slice(
+        0,
+        10
+      );
+
   if (start) {
     params.set(
       'start',
@@ -1688,12 +3115,10 @@ async function getHistory(
     );
   }
 
-  if (end) {
-    params.set(
-      'end',
-      end
-    );
-  }
+  params.set(
+    'end',
+    end
+  );
 
   const query =
     params.toString();
@@ -1726,11 +3151,8 @@ async function getHistory(
       ? result.data
       : [];
 
-  const cleaned =
-    [];
-
-  const anomalies =
-    [];
+  const cleaned = [];
+  const anomalies = [];
 
   for (
     const row
@@ -1765,7 +3187,8 @@ async function getHistory(
       );
 
     const suspicious =
-      row.is_anomaly === true ||
+      row.is_anomaly ===
+        true ||
       !date ||
       close === null ||
       close <= 0 ||
@@ -1782,8 +3205,11 @@ async function getHistory(
       high,
       low,
       close,
+
       volume:
-        volume || 0,
+        volume ||
+        0,
+
       isAnomaly:
         suspicious
     };
@@ -1800,10 +3226,17 @@ async function getHistory(
   }
 
   cleaned.sort(
-    (a, b) =>
-      String(a.date)
+    (
+      a,
+      b
+    ) =>
+      String(
+        a.date
+      )
         .localeCompare(
-          String(b.date)
+          String(
+            b.date
+          )
         )
   );
 
@@ -1811,26 +3244,35 @@ async function getHistory(
     null;
 
   if (
-    cleaned.length >= 1
+    cleaned.length >=
+    1
   ) {
     const first =
       cleaned[0];
 
     const last =
       cleaned[
-        cleaned.length - 1
+        cleaned.length -
+        1
       ];
 
-    const prices =
+    const highs =
       cleaned.map(
         row =>
-          row.close
+          row.high
+      );
+
+    const lows =
+      cleaned.map(
+        row =>
+          row.low
       );
 
     const volumes =
       cleaned.map(
         row =>
-          row.volume || 0
+          row.volume ||
+          0
       );
 
     const change =
@@ -1838,14 +3280,25 @@ async function getHistory(
       first.close;
 
     const changePct =
-      first.close !== 0
+      first.close !==
+      0
         ? (
             change /
             first.close
-          ) * 100
+          ) *
+          100
         : null;
 
     summary = {
+      range:
+        normalizedRange,
+
+      rangeLabel:
+        normalizedRange ===
+          'ALL'
+          ? 'All-time'
+          : normalizedRange,
+
       startDate:
         first.date,
 
@@ -1864,12 +3317,12 @@ async function getHistory(
 
       high:
         Math.max(
-          ...prices
+          ...highs
         ),
 
       low:
         Math.min(
-          ...prices
+          ...lows
         ),
 
       averageVolume:
@@ -1896,77 +3349,6 @@ async function getHistory(
     };
   }
 
-  return {
-    symbol,
-
-    company:
-      companyMap.get(
-        symbol
-      )
-        ? {
-            ...companyMap.get(
-              symbol
-            ),
-
-            sector:
-              companyMap.get(
-                symbol
-              ).sector ||
-              sectorMap.get(
-                symbol
-              ) ||
-              ''
-          }
-        : null,
-
-    summary,
-
-    data:
-      cleaned,
-
-    anomalies,
-
-    meta:
-      result.meta ||
-      null
-  };
-}
-
-/* --------------------------------------------------
-   FUNDAMENTALS
--------------------------------------------------- */
-
-async function getFundamentals(
-  stockSymbol
-) {
-  const symbol =
-    normalizeSymbol(
-      stockSymbol
-    );
-
-  if (!symbol) {
-    bad(
-      'Enter a PSX symbol.'
-    );
-  }
-
-  const [
-    result,
-    companyMap,
-    sectorMap
-  ] =
-    await Promise.all([
-      fetchJSON(
-        `${PSX_API_BASE}/stocks/${encodeURIComponent(
-          symbol
-        )}/fundamentals`
-      ),
-
-      loadCompanyMap(),
-
-      loadSectorMap()
-    ]);
-
   const company =
     companyMap.get(
       symbol
@@ -1989,13 +3371,273 @@ async function getFundamentals(
           }
         : null,
 
+    range:
+      normalizedRange,
+
+    summary,
+
     data:
-      result.data ||
-      null,
+      cleaned,
+
+    anomalies,
 
     meta:
       result.meta ||
       null
+  };
+}
+
+/* --------------------------------------------------
+   FUNDAMENTALS / EVENTS
+-------------------------------------------------- */
+
+async function getFundamentals(
+  stockSymbol
+) {
+  const symbol =
+    normalizeSymbol(
+      stockSymbol
+    );
+
+  if (!symbol) {
+    bad(
+      'Enter a PSX symbol.'
+    );
+  }
+
+  const [
+    companyMap,
+    sectorMap,
+    snapshot,
+    quote
+  ] =
+    await Promise.all([
+      loadCompanyMap(),
+
+      loadSectorMap(),
+
+      getPSXCompanySnapshot(
+        symbol
+      ).catch(
+        () => null
+      ),
+
+      fetchJSON(
+        `${PSX_API_BASE}/stocks/${encodeURIComponent(
+          symbol
+        )}/quote`
+      ).catch(
+        () => null
+      )
+    ]);
+
+  const company =
+    companyMap.get(
+      symbol
+    );
+
+  const quoteData =
+    quote?.data ||
+    {};
+
+  const pe =
+    safeNumber(
+      quoteData.pe_ratio
+    );
+
+  const dividendYield =
+    quoteData.dividend_yield ===
+      null ||
+    quoteData.dividend_yield ===
+      undefined ||
+    quoteData.dividend_yield ===
+      ''
+      ? null
+      : safeNumber(
+          quoteData.dividend_yield
+        );
+
+  return {
+    symbol,
+
+    company: {
+      ...(company || {}),
+
+      name:
+        snapshot
+          ?.companyName ||
+        company?.name ||
+        symbol,
+
+      sector:
+        snapshot
+          ?.sectorName ||
+        company?.sector ||
+        sectorMap.get(
+          symbol
+        ) ||
+        ''
+    },
+
+    source:
+      snapshot
+        ? 'PSX Data Portal'
+        : 'Unavailable',
+
+    sourceUrl:
+      snapshot
+        ?.sourceUrl ||
+      null,
+
+    fetchedAt:
+      snapshot
+        ?.fetchedAt ||
+      new Date()
+        .toISOString(),
+
+    valuation: {
+      peRatio:
+        pe !== null &&
+        pe > 0
+          ? pe
+          : null,
+
+      dividendYield,
+
+      marketCapPkr:
+        snapshot
+          ?.equity
+          ?.marketCapPkr ??
+        safeNumber(
+          quoteData.market_cap
+        ),
+
+      shares:
+        snapshot
+          ?.equity
+          ?.shares ??
+        null,
+
+      freeFloatShares:
+        snapshot
+          ?.equity
+          ?.freeFloatShares ??
+        null,
+
+      freeFloatPercent:
+        snapshot
+          ?.equity
+          ?.freeFloatPercent ??
+        safeNumber(
+          quoteData.free_float
+        )
+    },
+
+    annual:
+      snapshot
+        ?.annual ||
+      null,
+
+    quarterly:
+      snapshot
+        ?.quarterly ||
+      null,
+
+    ratios:
+      snapshot
+        ?.ratios ||
+      null,
+
+    available:
+      Boolean(
+        snapshot &&
+        (
+          snapshot.annual ||
+          snapshot.quarterly ||
+          snapshot.ratios
+        )
+      )
+  };
+}
+
+async function getEvents(
+  stockSymbol
+) {
+  const symbol =
+    normalizeSymbol(
+      stockSymbol
+    );
+
+  if (!symbol) {
+    bad(
+      'Enter a PSX symbol.'
+    );
+  }
+
+  const [
+    companyMap,
+    sectorMap,
+    snapshot
+  ] =
+    await Promise.all([
+      loadCompanyMap(),
+
+      loadSectorMap(),
+
+      getPSXCompanySnapshot(
+        symbol
+      ).catch(
+        () => null
+      )
+    ]);
+
+  const company =
+    companyMap.get(
+      symbol
+    );
+
+  return {
+    symbol,
+
+    company: {
+      ...(company || {}),
+
+      name:
+        snapshot
+          ?.companyName ||
+        company?.name ||
+        symbol,
+
+      sector:
+        snapshot
+          ?.sectorName ||
+        company?.sector ||
+        sectorMap.get(
+          symbol
+        ) ||
+        ''
+    },
+
+    source:
+      snapshot
+        ? 'PSX Data Portal'
+        : 'Unavailable',
+
+    sourceUrl:
+      snapshot
+        ?.sourceUrl ||
+      null,
+
+    fetchedAt:
+      snapshot
+        ?.fetchedAt ||
+      new Date()
+        .toISOString(),
+
+    events:
+      snapshot
+        ?.announcements ||
+      []
   };
 }
 
@@ -2014,7 +3656,9 @@ function safeEqual(
           'sha256'
         )
         .update(
-          String(value)
+          String(
+            value
+          )
         )
         .digest();
 
@@ -2046,21 +3690,22 @@ function authorize(
     return true;
   }
 
-  let login =
-    '';
+  let login = '';
 
   try {
     login =
       Buffer
         .from(
           (
-            request.headers
+            request
+              .headers
               .authorization ||
             ''
-          ).replace(
-            /^Basic /,
-            ''
-          ),
+          )
+            .replace(
+              /^Basic /,
+              ''
+            ),
           'base64'
         )
         .toString();
@@ -2091,7 +3736,7 @@ function authorize(
 }
 
 /* --------------------------------------------------
-   RESPONSE
+   RESPONSE / HANDLER
 -------------------------------------------------- */
 
 function sendJSON(
@@ -2113,10 +3758,6 @@ function sendJSON(
     )
   );
 }
-
-/* --------------------------------------------------
-   HANDLER
--------------------------------------------------- */
 
 async function handler(
   request,
@@ -2154,14 +3795,17 @@ async function handler(
       );
 
     const action =
-      url.searchParams.get(
-        'action'
-      ) || 'app';
+      url.searchParams
+        .get(
+          'action'
+        ) ||
+      'app';
 
     if (
       request.method ===
         'GET' &&
-      action === 'app'
+      action ===
+        'app'
     ) {
       response.setHeader(
         'Content-Type',
@@ -2189,7 +3833,10 @@ async function handler(
             'psxdata-api',
 
           companyMetadata:
-            'PSX official eligible scrips + fallbacks',
+            'PSX official metadata + fallbacks',
+
+          fundamentalsProvider:
+            'PSX Data Portal company page',
 
           pyPSXConfigured:
             Boolean(
@@ -2220,9 +3867,10 @@ async function handler(
     ) {
       const result =
         await getPyPSXIntraday(
-          url.searchParams.get(
-            'symbol'
-          )
+          url.searchParams
+            .get(
+              'symbol'
+            )
         );
 
       return sendJSON(
@@ -2273,9 +3921,10 @@ async function handler(
       return sendJSON(
         response,
         await getPyPSXIntraday(
-          url.searchParams.get(
-            'symbol'
-          )
+          url.searchParams
+            .get(
+              'symbol'
+            )
         )
       );
     }
@@ -2301,9 +3950,10 @@ async function handler(
       return sendJSON(
         response,
         await getQuote(
-          url.searchParams.get(
-            'symbol'
-          )
+          url.searchParams
+            .get(
+              'symbol'
+            )
         )
       );
     }
@@ -2317,17 +3967,16 @@ async function handler(
       return sendJSON(
         response,
         await getHistory(
-          url.searchParams.get(
-            'symbol'
-          ),
+          url.searchParams
+            .get(
+              'symbol'
+            ),
 
-          url.searchParams.get(
-            'start'
-          ),
-
-          url.searchParams.get(
-            'end'
-          )
+          url.searchParams
+            .get(
+              'range'
+            ) ||
+            '1Y'
         )
       );
     }
@@ -2341,9 +3990,27 @@ async function handler(
       return sendJSON(
         response,
         await getFundamentals(
-          url.searchParams.get(
-            'symbol'
-          )
+          url.searchParams
+            .get(
+              'symbol'
+            )
+        )
+      );
+    }
+
+    if (
+      request.method ===
+        'GET' &&
+      action ===
+        'events'
+    ) {
+      return sendJSON(
+        response,
+        await getEvents(
+          url.searchParams
+            .get(
+              'symbol'
+            )
         )
       );
     }
@@ -2365,7 +4032,7 @@ async function handler(
       },
 
       error.status ||
-        500
+      500
     );
   }
 }
@@ -2478,10 +4145,12 @@ select {
 
 .filters {
   display: grid;
+
   grid-template-columns:
     minmax(240px,2fr)
     minmax(180px,1fr)
     minmax(210px,1fr);
+
   gap: 12px;
   margin: 18px 0;
 }
@@ -2497,6 +4166,7 @@ td {
   padding: 11px;
   border-bottom: 1px solid #e5ebf0;
   text-align: left;
+  vertical-align: top;
 }
 
 th {
@@ -2532,6 +4202,11 @@ tbody tr:hover {
 
 .negative {
   color: #b52a2a;
+  font-weight: 700;
+}
+
+.neutral {
+  color: #66788a;
   font-weight: 700;
 }
 
@@ -2575,11 +4250,13 @@ tbody tr:hover {
 
 .summaryGrid {
   display: grid;
+
   grid-template-columns:
     repeat(
       auto-fit,
       minmax(150px,1fr)
     );
+
   gap: 12px;
   margin: 18px 0;
 }
@@ -2600,6 +4277,12 @@ tbody tr:hover {
 .metricValue {
   font-size: 19px;
   font-weight: 700;
+}
+
+.metricSub {
+  color: #66788a;
+  font-size: 12px;
+  margin-top: 5px;
 }
 
 .decisionHeader {
@@ -2639,12 +4322,6 @@ tbody tr:hover {
   font-weight: 750;
   margin-bottom: 10px;
   color: #31495d;
-}
-
-.metricSub {
-  color: #66788a;
-  font-size: 12px;
-  margin-top: 5px;
 }
 
 .rangeCard {
@@ -2693,15 +4370,6 @@ tbody tr:hover {
   color: #66788a;
 }
 
-.advancedNote {
-  padding: 12px 14px;
-  border-radius: 8px;
-  background: #f6f8fa;
-  color: #5f7181;
-  font-size: 13px;
-  margin-top: 16px;
-}
-
 .liveStrip {
   display: flex;
   align-items: center;
@@ -2720,6 +4388,7 @@ tbody tr:hover {
 
 .feedDot.live {
   background: #11823b;
+
   box-shadow:
     0 0 0 4px
     rgba(17,130,59,.10);
@@ -2761,16 +4430,19 @@ tbody tr:hover {
   font-weight: 750;
 }
 
-.chartModeToggle {
+.chartModeToggle,
+.rangeToggle {
   display: inline-flex;
   gap: 4px;
   padding: 4px;
   border: 1px solid #d9e2e9;
   border-radius: 9px;
   background: #f7f9fb;
+  flex-wrap: wrap;
 }
 
-.chartModeButton {
+.chartModeButton,
+.rangeButton {
   background: transparent;
   color: #44596b;
   padding: 7px 12px;
@@ -2778,7 +4450,8 @@ tbody tr:hover {
   font-size: 13px;
 }
 
-.chartModeButton.active {
+.chartModeButton.active,
+.rangeButton.active {
   background: #173f58;
   color: white;
 }
@@ -2887,12 +4560,90 @@ tbody tr:hover {
   fill: #66788a;
 }
 
-.chartPoint {
-  fill: #173f58;
+.warningBox {
+  margin-top: 14px;
+  padding: 12px;
+  border-radius: 8px;
+  background: #fff8e8;
+  color: #725217;
 }
 
-.chartPoint:hover {
-  r: 5;
+.sourceNote {
+  font-size: 12px;
+  color: #66788a;
+  margin-top: 10px;
+}
+
+.emptyState {
+  padding: 18px;
+  border: 1px dashed #cbd6de;
+  border-radius: 9px;
+  color: #66788a;
+  background: #fafcfd;
+}
+
+.dataTable {
+  overflow-x: auto;
+  border: 1px solid #e1e7ec;
+  border-radius: 9px;
+}
+
+.dataTable table {
+  min-width: 650px;
+}
+
+.dataTable tbody tr {
+  cursor: default;
+}
+
+.dataTable tbody tr:hover {
+  background: transparent;
+}
+
+.eventList {
+  display: grid;
+  gap: 10px;
+}
+
+.eventItem {
+  border: 1px solid #e1e7ec;
+  border-radius: 9px;
+  padding: 13px 14px;
+  background: white;
+}
+
+.eventMeta {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  color: #66788a;
+  font-size: 12px;
+  margin-bottom: 5px;
+}
+
+.eventTitle {
+  font-weight: 650;
+}
+
+.eventLink {
+  display: inline-block;
+  margin-top: 8px;
+  font-size: 13px;
+  color: #173f58;
+  text-decoration: none;
+}
+
+.eventLink:hover {
+  text-decoration: underline;
+}
+
+.pill {
+  display: inline-block;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: #eef3f6;
+  color: #44596b;
+  font-size: 11px;
 }
 
 details {
@@ -2911,14 +4662,6 @@ pre {
   border-radius: 8px;
   white-space: pre-wrap;
   max-height: 400px;
-}
-
-.warningBox {
-  margin-top: 14px;
-  padding: 12px;
-  border-radius: 8px;
-  background: #fff8e8;
-  color: #725217;
 }
 
 @media(max-width:800px) {
@@ -2946,6 +4689,10 @@ pre {
 
   .candleChart {
     height: 340px;
+  }
+
+  .decisionPrice {
+    font-size: 30px;
   }
 
 }
@@ -2979,13 +4726,9 @@ Build ${VERSION}
 </header>
 
 <p class="notice">
-
-Market and company metadata are connected.
-
-Predictions and investment recommendations
-remain disabled until their models are built
-and validated.
-
+Market, company metadata and research data are connected.
+Predictions and investment recommendations remain disabled
+until their models are built and validated.
 </p>
 
 <p id="status">
@@ -2993,8 +4736,6 @@ Checking connection...
 </p>
 
 <p id="error"></p>
-
-<!-- RESEARCH -->
 
 <section
   class="card"
@@ -3035,11 +4776,15 @@ Live Chart
 </button>
 
 <button id="loadHistory">
-History Chart
+History
 </button>
 
 <button id="loadFundamentals">
 Fundamentals
+</button>
+
+<button id="loadEvents">
+Events
 </button>
 
 <button id="loadMore">
@@ -3051,8 +4796,6 @@ More
 <div id="research"></div>
 
 </section>
-
-<!-- MARKET -->
 
 <section class="card">
 
@@ -3191,33 +4934,17 @@ const $ =
 
 let marketRows = [];
 
-let currentPage =
-  1;
+let currentPage = 1;
 
-const PAGE_SIZE =
-  50;
+const PAGE_SIZE = 50;
 
-let liveRefreshTimer =
-  null;
-
-let liveRefreshSymbol =
-  null;
-
-let liveView =
-  null;
-
-let liveChartMode =
-  'candles';
-
-let lastLiveChartResult =
-  null;
-
-let lastQuoteResult =
-  null;
-
-/* ---------------------------------------
-   HELPERS
---------------------------------------- */
+let liveRefreshTimer = null;
+let liveRefreshSymbol = null;
+let liveView = null;
+let liveChartMode = 'candles';
+let lastLiveChartResult = null;
+let lastQuoteResult = null;
+let selectedHistoryRange = '1Y';
 
 function escapeHtml(value) {
   return String(
@@ -3240,20 +4967,31 @@ function formatNumber(
 ) {
   if (
     value === null ||
-    value === undefined
+    value === undefined ||
+    value === ''
   ) {
     return '-';
   }
 
-  return Number(
-    value
-  ).toLocaleString(
-    'en-PK',
-    {
-      maximumFractionDigits:
-        digits
-    }
-  );
+  const number =
+    Number(value);
+
+  if (
+    !Number.isFinite(
+      number
+    )
+  ) {
+    return '-';
+  }
+
+  return number
+    .toLocaleString(
+      'en-PK',
+      {
+        maximumFractionDigits:
+          digits
+      }
+    );
 }
 
 function formatPercent(
@@ -3261,27 +4999,35 @@ function formatPercent(
 ) {
   if (
     value === null ||
-    value === undefined
+    value === undefined ||
+    value === ''
   ) {
-    return '-';
+    return 'N/A';
+  }
+
+  const number =
+    Number(value);
+
+  if (
+    !Number.isFinite(
+      number
+    )
+  ) {
+    return 'N/A';
   }
 
   return (
     formatNumber(
-      value,
+      number,
       2
     ) +
     '%'
   );
 }
 
-function formatDate(
-  value
-) {
+function formatDate(value) {
   const date =
-    new Date(
-      value
-    );
+    new Date(value);
 
   if (
     Number.isNaN(
@@ -3295,12 +5041,9 @@ function formatDate(
     .toLocaleDateString(
       'en-PK',
       {
-        day:
-          'numeric',
-        month:
-          'short',
-        year:
-          'numeric'
+        day: 'numeric',
+        month: 'short',
+        year: 'numeric'
       }
     );
 }
@@ -3309,9 +5052,7 @@ function formatDateTime(
   value
 ) {
   const date =
-    new Date(
-      value
-    );
+    new Date(value);
 
   if (
     Number.isNaN(
@@ -3319,8 +5060,7 @@ function formatDateTime(
     )
   ) {
     return String(
-      value ||
-      ''
+      value || ''
     );
   }
 
@@ -3352,13 +5092,9 @@ function formatDateTime(
     );
 }
 
-function formatTime(
-  value
-) {
+function formatTime(value) {
   const date =
-    new Date(
-      value
-    );
+    new Date(value);
 
   if (
     Number.isNaN(
@@ -3384,6 +5120,96 @@ function formatTime(
     );
 }
 
+function formatCompactPKR(
+  value
+) {
+  const number =
+    Number(value);
+
+  if (
+    !Number.isFinite(
+      number
+    )
+  ) {
+    return 'N/A';
+  }
+
+  const absolute =
+    Math.abs(number);
+
+  if (
+    absolute >=
+    1e12
+  ) {
+    return (
+      'PKR ' +
+      formatNumber(
+        number / 1e12,
+        2
+      ) +
+      'T'
+    );
+  }
+
+  if (
+    absolute >=
+    1e9
+  ) {
+    return (
+      'PKR ' +
+      formatNumber(
+        number / 1e9,
+        2
+      ) +
+      'B'
+    );
+  }
+
+  if (
+    absolute >=
+    1e6
+  ) {
+    return (
+      'PKR ' +
+      formatNumber(
+        number / 1e6,
+        2
+      ) +
+      'M'
+    );
+  }
+
+  return (
+    'PKR ' +
+    formatNumber(
+      number,
+      0
+    )
+  );
+}
+
+function finiteNumber(
+  value
+) {
+  if (
+    value === null ||
+    value === undefined ||
+    value === ''
+  ) {
+    return null;
+  }
+
+  const numeric =
+    Number(value);
+
+  return Number
+    .isFinite(
+      numeric
+    )
+      ? numeric
+      : null;
+}
+
 async function api(
   action,
   params = {}
@@ -3393,13 +5219,17 @@ async function api(
       location.href
     );
 
-  url.searchParams.set(
-    'action',
-    action
-  );
+  url.searchParams
+    .set(
+      'action',
+      action
+    );
 
   for (
-    const [key,value]
+    const [
+      key,
+      value
+    ]
     of Object.entries(
       params
     )
@@ -3409,24 +5239,21 @@ async function api(
       value !== undefined &&
       value !== ''
     ) {
-      url.searchParams.set(
-        key,
-        value
-      );
+      url.searchParams
+        .set(
+          key,
+          value
+        );
     }
   }
 
   const response =
-    await fetch(
-      url
-    );
+    await fetch(url);
 
   const result =
     await response.json();
 
-  if (
-    !response.ok
-  ) {
+  if (!response.ok) {
     throw new Error(
       result.message ||
       'Request failed.'
@@ -3456,19 +5283,13 @@ function rangePosition(
   high
 ) {
   const numericValue =
-    Number(
-      value
-    );
+    Number(value);
 
   const numericLow =
-    Number(
-      low
-    );
+    Number(low);
 
   const numericHigh =
-    Number(
-      high
-    );
+    Number(high);
 
   if (
     !Number.isFinite(
@@ -3496,7 +5317,8 @@ function rangePosition(
         numericHigh -
         numericLow
       )
-    ) * 100,
+    ) *
+    100,
     0,
     100
   );
@@ -3509,12 +5331,15 @@ function buildRangeCard(
   current
 ) {
   if (
-    low === null ||
-    low === undefined ||
-    high === null ||
-    high === undefined ||
-    current === null ||
-    current === undefined
+    [
+      low,
+      high,
+      current
+    ].some(
+      value =>
+        value === null ||
+        value === undefined
+    )
   ) {
     return '';
   }
@@ -3530,62 +5355,90 @@ function buildRangeCard(
     '<div class="rangeCard">' +
 
     '<div class="rangeHeader">' +
+
     '<strong>' +
-    escapeHtml(
-      title
-    ) +
+    escapeHtml(title) +
     '</strong>' +
+
     '<span>PKR ' +
     formatNumber(
       current
     ) +
     '</span>' +
+
     '</div>' +
 
     '<div class="rangeTrack">' +
+
     '<span class="rangeMarker" style="left:' +
     position +
     '%"></span>' +
+
     '</div>' +
 
     '<div class="rangeLabels">' +
+
     '<span>Low PKR ' +
-    formatNumber(
-      low
-    ) +
+    formatNumber(low) +
     '</span>' +
+
     '<span>High PKR ' +
-    formatNumber(
-      high
-    ) +
+    formatNumber(high) +
     '</span>' +
+
     '</div>' +
 
     '</div>'
   );
 }
 
-function finiteNumber(
+function percentClass(
   value
+) {
+  const number =
+    Number(value);
+
+  return number > 0
+    ? 'positive'
+    : number < 0
+      ? 'negative'
+      : 'neutral';
+}
+
+function metricCard(
+  label,
+  value,
+  sub = ''
 ) {
   if (
     value === null ||
     value === undefined ||
     value === ''
   ) {
-    return null;
+    return '';
   }
 
-  const numeric =
-    Number(
-      value
-    );
+  return (
+    '<div class="metric">' +
 
-  return Number.isFinite(
-    numeric
-  )
-    ? numeric
-    : null;
+    '<div class="metricLabel">' +
+    escapeHtml(label) +
+    '</div>' +
+
+    '<div class="metricValue">' +
+    value +
+    '</div>' +
+
+    (
+      sub
+        ? '<div class="metricSub">' +
+          escapeHtml(sub) +
+          '</div>'
+        : ''
+    ) +
+
+    '</div>'
+  );
 }
 
 function decisionChangeValues(
@@ -3608,17 +5461,20 @@ function decisionChangeValues(
 
   const previousClose =
     finiteNumber(
-      decision?.previousClose
+      decision
+        ?.previousClose
     );
 
   let change =
     finiteNumber(
-      decision?.dayChange
+      decision
+        ?.dayChange
     );
 
   let pct =
     finiteNumber(
-      decision?.dayChangePct
+      decision
+        ?.dayChangePct
     );
 
   if (
@@ -3628,7 +5484,8 @@ function decisionChangeValues(
     Number.isFinite(
       previousClose
     ) &&
-    previousClose !== 0
+    previousClose !==
+      0
   ) {
     change =
       price -
@@ -3638,7 +5495,8 @@ function decisionChangeValues(
       (
         change /
         previousClose
-      ) * 100;
+      ) *
+      100;
   }
 
   return {
@@ -3688,11 +5546,9 @@ function renderDecisionOverview(
     );
 
   const changeClass =
-    values.pct > 0
-      ? 'positive'
-      : values.pct < 0
-        ? 'negative'
-        : '';
+    percentClass(
+      values.pct
+    );
 
   const arrow =
     values.pct > 0
@@ -3702,44 +5558,56 @@ function renderDecisionOverview(
         : '•';
 
   const sessionLabel =
-    live?.marketStatus?.known
-      ? live.marketStatus.isOpen
+    live?.marketStatus
+      ?.known
+      ? live
+          .marketStatus
+          .isOpen
         ? 'Today'
         : 'Last session'
       : 'Session';
 
   const changeText =
-    values.change !== null &&
-    values.pct !== null
-      ? arrow +
-        ' PKR ' +
-        formatNumber(
-          Math.abs(
-            values.change
-          )
-        ) +
-        ' (' +
-        formatPercent(
-          Math.abs(
-            values.pct
-          )
-        ) +
-        ') ' +
-        sessionLabel
+    values.change !==
+      null &&
+    values.pct !==
+      null
+      ? (
+          arrow +
+          ' PKR ' +
+          formatNumber(
+            Math.abs(
+              values.change
+            )
+          ) +
+          ' (' +
+          formatPercent(
+            Math.abs(
+              values.pct
+            )
+          ) +
+          ') ' +
+          sessionLabel
+        )
       : 'Session change unavailable';
 
   const averageVolume =
-    decision.averageVolume30d;
+    decision
+      .averageVolume30d;
 
   const sessionVolume =
     session.volume ??
     decision.sessionVolume;
 
   const volumeVsAverage =
-    sessionVolume !== null &&
-    sessionVolume !== undefined &&
-    averageVolume !== null &&
-    averageVolume !== undefined &&
+    sessionVolume !==
+      null &&
+    sessionVolume !==
+      undefined &&
+    averageVolume !==
+      null &&
+    averageVolume !==
+      undefined &&
     Number(
       averageVolume
     ) > 0
@@ -3750,8 +5618,10 @@ function renderDecisionOverview(
           Number(
             averageVolume
           )
-        ) * 100
-      : decision.volumeVsAveragePct;
+        ) *
+        100
+      : decision
+          .volumeVsAveragePct;
 
   const volumeSub =
     Number.isFinite(
@@ -3759,195 +5629,224 @@ function renderDecisionOverview(
         volumeVsAverage
       )
     )
-      ? formatNumber(
-          volumeVsAverage,
-          0
-        ) +
-        '% of 30D avg'
-      : averageVolume !== null &&
-        averageVolume !== undefined
-        ? '30D avg ' +
+      ? (
           formatNumber(
-            averageVolume,
+            volumeVsAverage,
             0
+          ) +
+          '% of 30D avg'
+        )
+      : averageVolume !==
+          null &&
+        averageVolume !==
+          undefined
+        ? (
+            '30D avg ' +
+            formatNumber(
+              averageVolume,
+              0
+            )
           )
         : '';
 
-  $('research')
-    .innerHTML =
-      '<div class="decisionHeader">' +
+  let html =
+    '<div class="decisionHeader">' +
 
-      '<div>' +
-      '<div class="decisionPrice">PKR ' +
-      formatNumber(
-        values.price
-      ) +
-      '</div>' +
+    '<div>' +
 
-      '<div class="decisionChange ' +
-      changeClass +
-      '">' +
-      escapeHtml(
-        changeText
-      ) +
-      '</div>' +
+    '<div class="decisionPrice">' +
+    'PKR ' +
+    formatNumber(
+      values.price
+    ) +
+    '</div>' +
 
-      '<div class="decisionTimestamp">' +
-      escapeHtml(
-        live?.feedLabel ||
-        decision.feedLabel ||
-        'Latest available price'
-      ) +
-      (
-        live?.timestamp ||
-        decision.priceTimestamp
-          ? ' • ' +
-            formatDateTime(
-              live?.timestamp ||
-              decision.priceTimestamp
+    '<div class="decisionChange ' +
+    changeClass +
+    '">' +
+    escapeHtml(
+      changeText
+    ) +
+    '</div>' +
+
+    '<div class="decisionTimestamp">' +
+    escapeHtml(
+      live?.feedLabel ||
+      decision.feedLabel ||
+      'Latest available price'
+    ) +
+
+    (
+      live?.timestamp ||
+      decision
+        .priceTimestamp
+        ? (
+            ' &bull; ' +
+            escapeHtml(
+              formatDateTime(
+                live
+                  ?.timestamp ||
+                decision
+                  .priceTimestamp
+              )
             )
-          : ''
-      ) +
-      '</div>' +
-      '</div>' +
+          )
+        : ''
+    ) +
 
-      '</div>' +
+    '</div>' +
 
-      '<div class="decisionSection">' +
-      '<div class="decisionSectionTitle">Market context</div>' +
+    '</div>' +
 
-      '<div class="summaryGrid">' +
+    '</div>';
 
-      '<div class="metric">' +
-      '<div class="metricLabel">Open</div>' +
-      '<div class="metricValue">PKR ' +
+  html +=
+    '<div class="decisionSection">' +
+
+    '<div class="decisionSectionTitle">' +
+    'Market context' +
+    '</div>' +
+
+    '<div class="summaryGrid">' +
+
+    metricCard(
+      'Open',
+      'PKR ' +
       formatNumber(
         session.open
-      ) +
-      '</div>' +
-      '</div>' +
+      )
+    ) +
 
-      '<div class="metric">' +
-      '<div class="metricLabel">High</div>' +
-      '<div class="metricValue">PKR ' +
+    metricCard(
+      'High',
+      'PKR ' +
       formatNumber(
         session.high
-      ) +
-      '</div>' +
-      '</div>' +
+      )
+    ) +
 
-      '<div class="metric">' +
-      '<div class="metricLabel">Low</div>' +
-      '<div class="metricValue">PKR ' +
+    metricCard(
+      'Low',
+      'PKR ' +
       formatNumber(
         session.low
-      ) +
-      '</div>' +
-      '</div>' +
+      )
+    ) +
 
-      '<div class="metric">' +
-      '<div class="metricLabel">Volume</div>' +
-      '<div class="metricValue">' +
+    metricCard(
+      'Volume',
       formatNumber(
         sessionVolume,
         0
-      ) +
-      '</div>' +
-      (
-        volumeSub
-          ? '<div class="metricSub">' +
-            escapeHtml(
-              volumeSub
-            ) +
-            '</div>'
-          : ''
-      ) +
-      '</div>' +
+      ),
+      volumeSub
+    ) +
 
-      '</div>' +
+    '</div>' +
 
-      buildRangeCard(
-        'Day range',
-        session.low,
-        session.high,
-        values.price
-      ) +
-      '</div>' +
+    buildRangeCard(
+      'Day range',
+      session.low,
+      session.high,
+      values.price
+    ) +
 
-      '<div class="decisionSection">' +
-      '<div class="decisionSectionTitle">Performance</div>' +
+    '</div>';
 
-      '<div class="summaryGrid">' +
+  html +=
+    '<div class="decisionSection">' +
 
-      '<div class="metric">' +
-      '<div class="metricLabel">YTD change</div>' +
-      '<div class="metricValue ' +
-      (
-        decision.ytdChangePct > 0
-          ? 'positive'
-          : decision.ytdChangePct < 0
-            ? 'negative'
-            : ''
-      ) +
-      '">' +
-      formatPercent(
-        decision.ytdChangePct
-      ) +
-      '</div>' +
-      '</div>' +
+    '<div class="decisionSectionTitle">' +
+    'Performance' +
+    '</div>' +
 
-      '<div class="metric">' +
-      '<div class="metricLabel">1Y change</div>' +
-      '<div class="metricValue ' +
-      (
-        decision.change1yPct > 0
-          ? 'positive'
-          : decision.change1yPct < 0
-            ? 'negative'
-            : ''
-      ) +
-      '">' +
-      formatPercent(
-        decision.change1yPct
-      ) +
-      '</div>' +
-      '</div>' +
+    '<div class="summaryGrid">' +
 
-      '</div>' +
+    '<div class="metric">' +
+    '<div class="metricLabel">' +
+    'YTD change' +
+    '</div>' +
+    '<div class="metricValue ' +
+    percentClass(
+      decision.ytdChangePct
+    ) +
+    '">' +
+    formatPercent(
+      decision.ytdChangePct
+    ) +
+    '</div>' +
+    '</div>' +
 
-      buildRangeCard(
-        '52-week range',
-        decision.range52?.low,
-        decision.range52?.high,
-        values.price
-      ) +
-      '</div>' +
+    '<div class="metric">' +
+    '<div class="metricLabel">' +
+    '1Y change' +
+    '</div>' +
+    '<div class="metricValue ' +
+    percentClass(
+      decision.change1yPct
+    ) +
+    '">' +
+    formatPercent(
+      decision.change1yPct
+    ) +
+    '</div>' +
+    '</div>' +
 
-      '<div class="decisionSection">' +
-      '<div class="decisionSectionTitle">Valuation & income</div>' +
+    '</div>' +
 
-      '<div class="summaryGrid">' +
+    buildRangeCard(
+      '52-week range',
+      decision
+        .range52
+        ?.low,
+      decision
+        .range52
+        ?.high,
+      values.price
+    ) +
 
-      '<div class="metric">' +
-      '<div class="metricLabel">P/E</div>' +
-      '<div class="metricValue">' +
-      formatNumber(
-        decision.peRatio
-      ) +
-      '</div>' +
-      '</div>' +
+    '</div>';
 
-      '<div class="metric">' +
-      '<div class="metricLabel">Dividend yield</div>' +
-      '<div class="metricValue">' +
-      formatPercent(
-        decision.dividendYield
-      ) +
-      '</div>' +
-      '</div>' +
+  html +=
+    '<div class="decisionSection">' +
 
-      '</div>' +
-      '</div>';
+    '<div class="decisionSectionTitle">' +
+    'Valuation & income' +
+    '</div>' +
+
+    '<div class="summaryGrid">' +
+
+    metricCard(
+      'P/E',
+      decision.peRatio ===
+        null ||
+      decision.peRatio ===
+        undefined
+        ? 'N/A'
+        : formatNumber(
+            decision.peRatio
+          )
+    ) +
+
+    metricCard(
+      'Dividend yield',
+      decision.dividendYield ===
+        null ||
+      decision.dividendYield ===
+        undefined
+        ? 'N/A'
+        : formatPercent(
+            decision.dividendYield
+          )
+    ) +
+
+    '</div>' +
+
+    '</div>';
+
+  $('research')
+    .innerHTML =
+      html;
 }
 
 function renderMoreData(
@@ -3957,106 +5856,204 @@ function renderMoreData(
     result?.decision ||
     {};
 
-  const data =
-    result?.data ||
-    {};
+  const cards = [];
+
+  if (
+    decision.previousClose !==
+      null &&
+    decision.previousClose !==
+      undefined
+  ) {
+    cards.push(
+      metricCard(
+        'Previous close',
+        'PKR ' +
+        formatNumber(
+          decision.previousClose
+        )
+      )
+    );
+  }
+
+  if (
+    decision.averageVolume30d !==
+      null &&
+    decision.averageVolume30d !==
+      undefined
+  ) {
+    cards.push(
+      metricCard(
+        '30D avg volume',
+        formatNumber(
+          decision
+            .averageVolume30d,
+          0
+        )
+      )
+    );
+  }
+
+  if (
+    decision.marketCapPkr !==
+      null &&
+    decision.marketCapPkr !==
+      undefined
+  ) {
+    cards.push(
+      metricCard(
+        'Market cap',
+        formatCompactPKR(
+          decision
+            .marketCapPkr
+        )
+      )
+    );
+  }
+
+  if (
+    decision.shares !==
+      null &&
+    decision.shares !==
+      undefined
+  ) {
+    cards.push(
+      metricCard(
+        'Shares outstanding',
+        formatNumber(
+          decision.shares,
+          0
+        )
+      )
+    );
+  }
+
+  if (
+    decision.freeFloatShares !==
+      null &&
+    decision.freeFloatShares !==
+      undefined
+  ) {
+    cards.push(
+      metricCard(
+        'Free float shares',
+        formatNumber(
+          decision
+            .freeFloatShares,
+          0
+        )
+      )
+    );
+  }
+
+  if (
+    decision.freeFloatPercent !==
+      null &&
+    decision.freeFloatPercent !==
+      undefined
+  ) {
+    cards.push(
+      metricCard(
+        'Free float',
+        formatPercent(
+          decision
+            .freeFloatPercent
+        )
+      )
+    );
+  }
+
+  let html =
+    '<div class="decisionSectionTitle">' +
+    'Advanced market data' +
+    '</div>';
+
+  html +=
+    cards.length
+      ? (
+          '<div class="summaryGrid">' +
+          cards.join('') +
+          '</div>'
+        )
+      : (
+          '<div class="emptyState">' +
+          'No additional reliable market fields are available from the connected sources for this symbol.' +
+          '</div>'
+        );
+
+  html +=
+    '<details>' +
+
+    '<summary>' +
+    'Data & Sources' +
+    '</summary>' +
+
+    '<pre>' +
+    escapeHtml(
+      JSON.stringify(
+        {
+          quoteProvider:
+            'psxdata-api',
+
+          intradayProvider:
+            result.live
+              ? 'pyPSX'
+              : null,
+
+          companyProvider:
+            result.official
+              ? 'PSX Data Portal'
+              : null,
+
+          quoteTimestamp:
+            result
+              .meta
+              ?.timestamp ||
+            null,
+
+          liveTimestamp:
+            result
+              .live
+              ?.timestamp ||
+            null,
+
+          companyFetchedAt:
+            result
+              .official
+              ?.fetchedAt ||
+            null,
+
+          companySourceUrl:
+            result
+              .official
+              ?.sourceUrl ||
+            null
+        },
+        null,
+        2
+      )
+    ) +
+    '</pre>' +
+
+    '<pre>' +
+    escapeHtml(
+      JSON.stringify(
+        result.data ||
+        {},
+        null,
+        2
+      )
+    ) +
+    '</pre>' +
+
+    '</details>';
 
   $('research')
     .innerHTML =
-      '<div class="decisionSectionTitle">Advanced market data</div>' +
-
-      '<div class="summaryGrid">' +
-
-      '<div class="metric">' +
-      '<div class="metricLabel">Previous close</div>' +
-      '<div class="metricValue">PKR ' +
-      formatNumber(
-        decision.previousClose
-      ) +
-      '</div>' +
-      '</div>' +
-
-      '<div class="metric">' +
-      '<div class="metricLabel">30D avg volume</div>' +
-      '<div class="metricValue">' +
-      formatNumber(
-        decision.averageVolume30d,
-        0
-      ) +
-      '</div>' +
-      '</div>' +
-
-      '<div class="metric">' +
-      '<div class="metricLabel">Market cap</div>' +
-      '<div class="metricValue">' +
-      formatNumber(
-        decision.marketCap,
-        0
-      ) +
-      '</div>' +
-      '</div>' +
-
-      '<div class="metric">' +
-      '<div class="metricLabel">Free float</div>' +
-      '<div class="metricValue">' +
-      formatNumber(
-        decision.freeFloat,
-        2
-      ) +
-      '</div>' +
-      '</div>' +
-
-      '</div>' +
-
-      '<div class="advancedNote">' +
-      'NOMAD keeps fields such as bid/ask, circuit breakers, VAR and haircut out of the main decision view. They will only be added here when a reliable current source is connected.' +
-      '</div>' +
-
-      '<details>' +
-      '<summary>Data source details</summary>' +
-      '<pre>' +
-      escapeHtml(
-        JSON.stringify(
-          {
-            quoteProvider:
-              'psxdata-api',
-
-            intradayProvider:
-              result.live
-                ? 'pyPSX'
-                : null,
-
-            quoteTimestamp:
-              result.meta?.timestamp ||
-              null,
-
-            liveTimestamp:
-              result.live?.timestamp ||
-              null
-          },
-          null,
-          2
-        )
-      ) +
-      '</pre>' +
-      '</details>' +
-
-      '<details>' +
-      '<summary>View raw quote data</summary>' +
-      '<pre>' +
-      escapeHtml(
-        JSON.stringify(
-          data,
-          null,
-          2
-        )
-      ) +
-      '</pre>' +
-      '</details>';
+      html;
 }
 
 /* ---------------------------------------
-   LIVE / LATEST MARKET DATA
+   LIVE PRICE / LIVE CHART
 --------------------------------------- */
 
 function stopLiveRefresh() {
@@ -4096,11 +6093,15 @@ function renderFeedStatus(
         : 'closed';
 
   const marketNote =
-    result.marketStatus
+    result
+      .marketStatus
       ?.holidayName
-      ? ' • ' +
-        result.marketStatus
-          .holidayName
+      ? (
+          ' &bull; ' +
+          result
+            .marketStatus
+            .holidayName
+        )
       : '';
 
   $('liveStatus')
@@ -4114,6 +6115,10 @@ function renderFeedStatus(
         result.feedLabel ||
         'Latest available'
       ) +
+      ': PKR ' +
+      formatNumber(
+        result.price
+      ) +
       '</span>' +
 
       '<span class="feedMeta">' +
@@ -4123,9 +6128,7 @@ function renderFeedStatus(
           result.timestamp
         )
       ) +
-      escapeHtml(
-        marketNote
-      ) +
+      marketNote +
       '</span>';
 }
 
@@ -4133,8 +6136,12 @@ function shouldAutoRefresh(
   result
 ) {
   return Boolean(
-    result?.marketStatus?.known &&
-    result?.marketStatus?.isOpen
+    result
+      ?.marketStatus
+      ?.known &&
+    result
+      ?.marketStatus
+      ?.isOpen
   );
 }
 
@@ -4304,12 +6311,16 @@ function chartDirectionClass(
       row.close
     );
 
-  if (close > open) {
+  if (
+    close > open
+  ) {
     return prefix +
       'Up';
   }
 
-  if (close < open) {
+  if (
+    close < open
+  ) {
     return prefix +
       'Down';
   }
@@ -4327,8 +6338,7 @@ function buildPriceGrid(
   paddingTop,
   priceHeight
 ) {
-  let lines =
-    '';
+  let lines = '';
 
   for (
     let index = 0;
@@ -4336,8 +6346,7 @@ function buildPriceGrid(
     index++
   ) {
     const fraction =
-      index /
-      4;
+      index / 4;
 
     const price =
       max -
@@ -4372,10 +6381,12 @@ function buildPriceGrid(
         4
       ) +
       '" class="chartLabel">' +
+
       formatNumber(
         price,
         2
       ) +
+
       '</text>';
   }
 
@@ -4396,29 +6407,14 @@ function buildIntradayLineChart(
     );
   }
 
-  const width =
-    1000;
-
-  const height =
-    410;
-
-  const paddingLeft =
-    65;
-
-  const paddingRight =
-    20;
-
-  const paddingTop =
-    20;
-
-  const priceHeight =
-    265;
-
-  const volumeTop =
-    310;
-
-  const volumeHeight =
-    58;
+  const width = 1000;
+  const height = 410;
+  const paddingLeft = 65;
+  const paddingRight = 20;
+  const paddingTop = 20;
+  const priceHeight = 265;
+  const volumeTop = 310;
+  const volumeHeight = 58;
 
   const usableWidth =
     width -
@@ -4446,30 +6442,21 @@ function buildIntradayLineChart(
   if (
     min === max
   ) {
-    min *=
-      .995;
-
-    max *=
-      1.005;
+    min *= .995;
+    max *= 1.005;
   }
 
   const range =
-    max -
-    min;
+    max - min;
 
   const margin =
     Math.max(
-      range *
-      .08,
-      max *
-      .002
+      range * .08,
+      max * .002
     );
 
-  min -=
-    margin;
-
-  max +=
-    margin;
+  min -= margin;
+  max += margin;
 
   const x =
     index =>
@@ -4508,17 +6495,13 @@ function buildIntradayLineChart(
           row,
           index
         ) =>
-          x(
-            index
-          ) +
+          x(index) +
           ',' +
           y(
             row.close
           )
       )
-      .join(
-        ' '
-      );
+      .join(' ');
 
   const bottomY =
     paddingTop +
@@ -4559,83 +6542,83 @@ function buildIntradayLineChart(
       1,
       Math.min(
         7,
-        step *
-        .72
+        step * .72
       )
     );
 
   const volumeBars =
-    rows
-      .map(
-        (
-          row,
-          index
-        ) => {
-          const volume =
-            Number(
-              row.volume ||
-              0
-            );
-
-          const barHeight =
-            maxVolume > 0
-              ? (
-                  volume /
-                  maxVolume
-                ) *
-                volumeHeight
-              : 0;
-
-          const barX =
-            paddingLeft +
-            index *
-            step +
-            (
-              step -
-              barWidth
-            ) /
-            2;
-
-          const barY =
-            volumeTop +
-            volumeHeight -
-            barHeight;
-
-          return (
-            '<rect x="' +
-            barX +
-            '" y="' +
-            barY +
-            '" width="' +
-            barWidth +
-            '" height="' +
-            Math.max(
-              .5,
-              barHeight
-            ) +
-            '" class="' +
-            chartDirectionClass(
-              row,
-              'volume'
-            ) +
-            '"><title>' +
-            escapeHtml(
-              formatTime(
-                row.timestamp
-              ) +
-              ' • Volume ' +
-              formatNumber(
-                volume,
-                0
-              )
-            ) +
-            '</title></rect>'
+    rows.map(
+      (
+        row,
+        index
+      ) => {
+        const volume =
+          Number(
+            row.volume ||
+            0
           );
-        }
-      )
-      .join(
-        ''
-      );
+
+        const barHeight =
+          maxVolume > 0
+            ? (
+                volume /
+                maxVolume
+              ) *
+              volumeHeight
+            : 0;
+
+        const barX =
+          paddingLeft +
+          index *
+          step +
+          (
+            step -
+            barWidth
+          ) /
+          2;
+
+        const barY =
+          volumeTop +
+          volumeHeight -
+          barHeight;
+
+        return (
+          '<rect x="' +
+          barX +
+          '" y="' +
+          barY +
+          '" width="' +
+          barWidth +
+          '" height="' +
+          Math.max(
+            .5,
+            barHeight
+          ) +
+          '" class="' +
+          chartDirectionClass(
+            row,
+            'volume'
+          ) +
+          '">' +
+
+          '<title>' +
+          escapeHtml(
+            formatTime(
+              row.timestamp
+            ) +
+            ' - Volume ' +
+            formatNumber(
+              volume,
+              0
+            )
+          ) +
+          '</title>' +
+
+          '</rect>'
+        );
+      }
+    )
+    .join('');
 
   const firstTime =
     formatTime(
@@ -4665,7 +6648,7 @@ function buildIntradayLineChart(
     '<div class="chartBox">' +
 
     '<div class="chartTitle">' +
-    'Intraday line + volume • 1-minute candles' +
+    'Intraday line + volume - 1-minute candles' +
     '</div>' +
 
     '<svg class="candleChart" ' +
@@ -4719,7 +6702,9 @@ function buildIntradayLineChart(
       volumeTop +
       12
     ) +
-    '" class="chartLabel">Vol</text>' +
+    '" class="chartLabel">' +
+    'Vol' +
+    '</text>' +
 
     '<text x="' +
     paddingLeft +
@@ -4788,29 +6773,14 @@ function buildIntradayCandlestickChart(
     );
   }
 
-  const width =
-    1000;
-
-  const height =
-    430;
-
-  const paddingLeft =
-    65;
-
-  const paddingRight =
-    20;
-
-  const paddingTop =
-    20;
-
-  const priceHeight =
-    275;
-
-  const volumeTop =
-    322;
-
-  const volumeHeight =
-    64;
+  const width = 1000;
+  const height = 430;
+  const paddingLeft = 65;
+  const paddingRight = 20;
+  const paddingTop = 20;
+  const priceHeight = 275;
+  const volumeTop = 322;
+  const volumeHeight = 64;
 
   const usableWidth =
     width -
@@ -4913,30 +6883,21 @@ function buildIntradayCandlestickChart(
   if (
     min === max
   ) {
-    min *=
-      .995;
-
-    max *=
-      1.005;
+    min *= .995;
+    max *= 1.005;
   }
 
   const range =
-    max -
-    min;
+    max - min;
 
   const margin =
     Math.max(
-      range *
-      .06,
-      max *
-      .0015
+      range * .06,
+      max * .0015
     );
 
-  min -=
-    margin;
-
-  max +=
-    margin;
+  min -= margin;
+  max += margin;
 
   const y =
     price =>
@@ -4965,8 +6926,7 @@ function buildIntradayCandlestickChart(
       .8,
       Math.min(
         7,
-        step *
-        .68
+        step * .68
       )
     );
 
@@ -4980,166 +6940,164 @@ function buildIntradayCandlestickChart(
     );
 
   const candleSvg =
-    normalized
-      .map(
-        (
-          row,
-          index
-        ) => {
-          const centerX =
-            paddingLeft +
-            index *
-            step +
-            step /
-            2;
+    normalized.map(
+      (
+        row,
+        index
+      ) => {
+        const centerX =
+          paddingLeft +
+          index *
+          step +
+          step /
+          2;
 
-          const openY =
-            y(
-              row.open
-            );
-
-          const closeY =
-            y(
-              row.close
-            );
-
-          const highY =
-            y(
-              row.high
-            );
-
-          const lowY =
-            y(
-              row.low
-            );
-
-          const bodyY =
-            Math.min(
-              openY,
-              closeY
-            );
-
-          const bodyHeight =
-            Math.max(
-              1,
-              Math.abs(
-                closeY -
-                openY
-              )
-            );
-
-          const directionClass =
-            chartDirectionClass(
-              row,
-              'candle'
-            );
-
-          const volumeClass =
-            chartDirectionClass(
-              row,
-              'volume'
-            );
-
-          const volumeHeightPx =
-            (
-              row.volume /
-              maxVolume
-            ) *
-            volumeHeight;
-
-          const volumeY =
-            volumeTop +
-            volumeHeight -
-            volumeHeightPx;
-
-          const title =
-            formatTime(
-              row.timestamp
-            ) +
-            ' • O ' +
-            formatNumber(
-              row.open
-            ) +
-            ' H ' +
-            formatNumber(
-              row.high
-            ) +
-            ' L ' +
-            formatNumber(
-              row.low
-            ) +
-            ' C ' +
-            formatNumber(
-              row.close
-            ) +
-            ' • Vol ' +
-            formatNumber(
-              row.volume,
-              0
-            );
-
-          return (
-            '<g>' +
-            '<title>' +
-            escapeHtml(
-              title
-            ) +
-            '</title>' +
-
-            '<line x1="' +
-            centerX +
-            '" x2="' +
-            centerX +
-            '" y1="' +
-            highY +
-            '" y2="' +
-            lowY +
-            '" class="' +
-            directionClass +
-            '" />' +
-
-            '<rect x="' +
-            (
-              centerX -
-              bodyWidth /
-              2
-            ) +
-            '" y="' +
-            bodyY +
-            '" width="' +
-            bodyWidth +
-            '" height="' +
-            bodyHeight +
-            '" class="' +
-            directionClass +
-            '" />' +
-
-            '<rect x="' +
-            (
-              centerX -
-              bodyWidth /
-              2
-            ) +
-            '" y="' +
-            volumeY +
-            '" width="' +
-            bodyWidth +
-            '" height="' +
-            Math.max(
-              .5,
-              volumeHeightPx
-            ) +
-            '" class="' +
-            volumeClass +
-            '" />' +
-
-            '</g>'
+        const openY =
+          y(
+            row.open
           );
-        }
-      )
-      .join(
-        ''
-      );
+
+        const closeY =
+          y(
+            row.close
+          );
+
+        const highY =
+          y(
+            row.high
+          );
+
+        const lowY =
+          y(
+            row.low
+          );
+
+        const bodyY =
+          Math.min(
+            openY,
+            closeY
+          );
+
+        const bodyHeight =
+          Math.max(
+            1,
+            Math.abs(
+              closeY -
+              openY
+            )
+          );
+
+        const directionClass =
+          chartDirectionClass(
+            row,
+            'candle'
+          );
+
+        const volumeClass =
+          chartDirectionClass(
+            row,
+            'volume'
+          );
+
+        const volumeHeightPx =
+          (
+            row.volume /
+            maxVolume
+          ) *
+          volumeHeight;
+
+        const volumeY =
+          volumeTop +
+          volumeHeight -
+          volumeHeightPx;
+
+        const title =
+          formatTime(
+            row.timestamp
+          ) +
+          ' - O ' +
+          formatNumber(
+            row.open
+          ) +
+          ' H ' +
+          formatNumber(
+            row.high
+          ) +
+          ' L ' +
+          formatNumber(
+            row.low
+          ) +
+          ' C ' +
+          formatNumber(
+            row.close
+          ) +
+          ' - Vol ' +
+          formatNumber(
+            row.volume,
+            0
+          );
+
+        return (
+          '<g>' +
+
+          '<title>' +
+          escapeHtml(
+            title
+          ) +
+          '</title>' +
+
+          '<line x1="' +
+          centerX +
+          '" x2="' +
+          centerX +
+          '" y1="' +
+          highY +
+          '" y2="' +
+          lowY +
+          '" class="' +
+          directionClass +
+          '" />' +
+
+          '<rect x="' +
+          (
+            centerX -
+            bodyWidth /
+            2
+          ) +
+          '" y="' +
+          bodyY +
+          '" width="' +
+          bodyWidth +
+          '" height="' +
+          bodyHeight +
+          '" class="' +
+          directionClass +
+          '" />' +
+
+          '<rect x="' +
+          (
+            centerX -
+            bodyWidth /
+            2
+          ) +
+          '" y="' +
+          volumeY +
+          '" width="' +
+          bodyWidth +
+          '" height="' +
+          Math.max(
+            .5,
+            volumeHeightPx
+          ) +
+          '" class="' +
+          volumeClass +
+          '" />' +
+
+          '</g>'
+        );
+      }
+    )
+    .join('');
 
   const firstTime =
     formatTime(
@@ -5169,15 +7127,25 @@ function buildIntradayCandlestickChart(
     '<div class="chartBox">' +
 
     '<div class="chartTitle">' +
-    'Intraday candlesticks + volume • 1-minute candles' +
+    'Intraday candlesticks + volume - 1-minute candles' +
     '</div>' +
 
     '<div class="chartLegend">' +
-    '<span><span class="legendSwatch up"></span>' +
-    'Close ≥ open</span>' +
-    '<span><span class="legendSwatch down"></span>' +
-    'Close < open</span>' +
-    '<span>Hover a candle for OHLCV</span>' +
+
+    '<span>' +
+    '<span class="legendSwatch up"></span>' +
+    'Close >= open' +
+    '</span>' +
+
+    '<span>' +
+    '<span class="legendSwatch down"></span>' +
+    'Close < open' +
+    '</span>' +
+
+    '<span>' +
+    'Hover a candle for OHLCV' +
+    '</span>' +
+
     '</div>' +
 
     '<svg class="candleChart" ' +
@@ -5223,7 +7191,9 @@ function buildIntradayCandlestickChart(
       volumeTop +
       12
     ) +
-    '" class="chartLabel">Vol</text>' +
+    '" class="chartLabel">' +
+    'Vol' +
+    '</text>' +
 
     '<text x="' +
     paddingLeft +
@@ -5288,11 +7258,14 @@ function bindLiveChartModeButtons() {
         button.onclick =
           () => {
             const mode =
-              button.dataset.mode;
+              button.dataset
+                .mode;
 
             if (
-              mode !== 'candles' &&
-              mode !== 'line'
+              mode !==
+                'candles' &&
+              mode !==
+                'line'
             ) {
               return;
             }
@@ -5302,7 +7275,8 @@ function bindLiveChartModeButtons() {
 
             if (
               lastLiveChartResult &&
-              liveView === 'chart'
+              liveView ===
+                'chart'
             ) {
               renderLiveChart(
                 lastLiveChartResult
@@ -5325,14 +7299,15 @@ function renderLiveChart(
 
   const stateNote =
     result.feedState ===
-    'LIVE'
-      ? 'Market open • auto-refreshing every 15 seconds'
+      'LIVE'
+      ? 'Market open - auto-refreshing every 15 seconds'
       : result.feedState ===
         'DELAYED'
         ? 'Market open, but the latest pyPSX candle is delayed'
-        : result.marketStatus
+        : result
+            .marketStatus
             ?.known
-          ? 'Market closed • showing the latest trading session'
+          ? 'Market closed - showing the latest trading session'
           : 'Showing the latest available trading session';
 
   const chartMarkup =
@@ -5347,7 +7322,6 @@ function renderLiveChart(
 
   $('research')
     .innerHTML =
-
       '<div class="liveChartHeader">' +
 
       '<div>' +
@@ -5370,17 +7344,14 @@ function renderLiveChart(
         result.sessionDate ||
         ''
       ) +
-      ' • pyPSX' +
+      ' &bull; pyPSX' +
       '</div>' +
 
       '</div>' +
 
-      '<div class="chartModeToggle" ' +
-      'role="group" ' +
-      'aria-label="Chart type">' +
+      '<div class="chartModeToggle">' +
 
-      '<button type="button" ' +
-      'class="chartModeButton ' +
+      '<button type="button" class="chartModeButton ' +
       (
         liveChartMode ===
           'candles'
@@ -5391,8 +7362,7 @@ function renderLiveChart(
       'Candles' +
       '</button>' +
 
-      '<button type="button" ' +
-      'class="chartModeButton ' +
+      '<button type="button" class="chartModeButton ' +
       (
         liveChartMode ===
           'line'
@@ -5409,57 +7379,45 @@ function renderLiveChart(
 
       '<div class="summaryGrid">' +
 
-      '<div class="metric">' +
-      '<div class="metricLabel">' +
-      'Session open' +
-      '</div>' +
-      '<div class="metricValue">' +
-      'PKR ' +
-      formatNumber(
-        result.session
-          ?.open
+      metricCard(
+        'Session open',
+        'PKR ' +
+        formatNumber(
+          result
+            .session
+            ?.open
+        )
       ) +
-      '</div>' +
-      '</div>' +
 
-      '<div class="metric">' +
-      '<div class="metricLabel">' +
-      'Session high' +
-      '</div>' +
-      '<div class="metricValue">' +
-      'PKR ' +
-      formatNumber(
-        result.session
-          ?.high
+      metricCard(
+        'Session high',
+        'PKR ' +
+        formatNumber(
+          result
+            .session
+            ?.high
+        )
       ) +
-      '</div>' +
-      '</div>' +
 
-      '<div class="metric">' +
-      '<div class="metricLabel">' +
-      'Session low' +
-      '</div>' +
-      '<div class="metricValue">' +
-      'PKR ' +
-      formatNumber(
-        result.session
-          ?.low
+      metricCard(
+        'Session low',
+        'PKR ' +
+        formatNumber(
+          result
+            .session
+            ?.low
+        )
       ) +
-      '</div>' +
-      '</div>' +
 
-      '<div class="metric">' +
-      '<div class="metricLabel">' +
-      'Session volume' +
-      '</div>' +
-      '<div class="metricValue">' +
-      formatNumber(
-        result.session
-          ?.volume,
-        0
+      metricCard(
+        'Session volume',
+        formatNumber(
+          result
+            .session
+            ?.volume,
+          0
+        )
       ) +
-      '</div>' +
-      '</div>' +
 
       '</div>' +
 
@@ -5570,7 +7528,7 @@ async function startLiveChart(
 }
 
 /* ---------------------------------------
-   COMPANY DISPLAY
+   COMPANY DISPLAY / MARKET TABLE
 --------------------------------------- */
 
 function showSelectedCompany(
@@ -5607,16 +7565,53 @@ function showSelectedCompany(
       escapeHtml(
         stock.symbol
       ) +
-      ' • ' +
+      ' &bull; ' +
       escapeHtml(
         stock.sector
       ) +
       '</span>';
 }
 
-/* ---------------------------------------
-   FILTER / SORT
---------------------------------------- */
+function updateSelectedCompany(
+  result
+) {
+  if (!result) {
+    return;
+  }
+
+  const company =
+    result.company;
+
+  if (
+    company?.name
+  ) {
+    $('selectedCompany')
+      .innerHTML =
+        '<strong>' +
+        escapeHtml(
+          company.name
+        ) +
+        '</strong>' +
+
+        '<span>' +
+        escapeHtml(
+          result.symbol
+        ) +
+
+        (
+          company.sector
+            ? (
+                ' &bull; ' +
+                escapeHtml(
+                  company.sector
+                )
+              )
+            : ''
+        ) +
+
+        '</span>';
+  }
+}
 
 function getFilteredRows() {
   const query =
@@ -5632,7 +7627,6 @@ function getFilteredRows() {
   let rows =
     marketRows.filter(
       stock => {
-
         const searchable =
           (
             stock.symbol +
@@ -5643,26 +7637,21 @@ function getFilteredRows() {
           )
             .toLowerCase();
 
-        const matchesSearch =
+        return (
           searchable
             .includes(
               query
-            );
-
-        const matchesSector =
-          !sector ||
-          stock.sector ===
-            sector;
-
-        return (
-          matchesSearch &&
-          matchesSector
+            ) &&
+          (
+            !sector ||
+            stock.sector ===
+              sector
+          )
         );
       }
     );
 
-  rows =
-    [...rows];
+  rows = [...rows];
 
   switch (
     $('sort').value
@@ -5671,7 +7660,10 @@ function getFilteredRows() {
     case 'priceAsc':
 
       rows.sort(
-        (a,b) =>
+        (
+          a,
+          b
+        ) =>
           (
             a.price ??
             Infinity
@@ -5687,7 +7679,10 @@ function getFilteredRows() {
     case 'priceDesc':
 
       rows.sort(
-        (a,b) =>
+        (
+          a,
+          b
+        ) =>
           (
             b.price ??
             -Infinity
@@ -5703,7 +7698,10 @@ function getFilteredRows() {
     case 'changeDesc':
 
       rows.sort(
-        (a,b) =>
+        (
+          a,
+          b
+        ) =>
           (
             b.change1yPct ??
             -Infinity
@@ -5719,7 +7717,10 @@ function getFilteredRows() {
     case 'changeAsc':
 
       rows.sort(
-        (a,b) =>
+        (
+          a,
+          b
+        ) =>
           (
             a.change1yPct ??
             Infinity
@@ -5735,7 +7736,10 @@ function getFilteredRows() {
     case 'dividendDesc':
 
       rows.sort(
-        (a,b) =>
+        (
+          a,
+          b
+        ) =>
           (
             b.dividendYield ??
             -Infinity
@@ -5754,11 +7758,16 @@ function getFilteredRows() {
         rows
           .filter(
             row =>
-              row.peRatio !== null &&
-              row.peRatio > 0
+              row.peRatio !==
+                null &&
+              row.peRatio >
+                0
           )
           .sort(
-            (a,b) =>
+            (
+              a,
+              b
+            ) =>
               a.peRatio -
               b.peRatio
           );
@@ -5768,7 +7777,10 @@ function getFilteredRows() {
     case 'volumeDesc':
 
       rows.sort(
-        (a,b) =>
+        (
+          a,
+          b
+        ) =>
           (
             b.averageVolume30d ??
             -Infinity
@@ -5784,7 +7796,10 @@ function getFilteredRows() {
     default:
 
       rows.sort(
-        (a,b) =>
+        (
+          a,
+          b
+        ) =>
           a.symbol
             .localeCompare(
               b.symbol
@@ -5794,10 +7809,6 @@ function getFilteredRows() {
 
   return rows;
 }
-
-/* ---------------------------------------
-   MARKET TABLE
--------------------------------------------------- */
 
 function renderStocks() {
   const rows =
@@ -5881,78 +7892,81 @@ function renderStocks() {
 
       pageRows
         .map(
-          stock => {
+          stock =>
+            '<tr data-symbol="' +
+            escapeHtml(
+              stock.symbol
+            ) +
+            '">' +
 
-            const changeClass =
-              stock.change1yPct >
-              0
-                ? 'positive'
-                : stock.change1yPct <
-                  0
-                  ? 'negative'
-                  : '';
+            '<td class="symbol">' +
+            escapeHtml(
+              stock.symbol
+            ) +
+            '</td>' +
 
-            return (
-              '<tr data-symbol="' +
-              escapeHtml(
-                stock.symbol
-              ) +
-              '">' +
+            '<td class="company">' +
+            escapeHtml(
+              stock.companyName
+            ) +
+            '</td>' +
 
-              '<td class="symbol">' +
-              escapeHtml(
-                stock.symbol
-              ) +
-              '</td>' +
+            '<td>' +
+            escapeHtml(
+              stock.sector
+            ) +
+            '</td>' +
 
-              '<td class="company">' +
-              escapeHtml(
-                stock.companyName
-              ) +
-              '</td>' +
+            '<td>' +
+            formatNumber(
+              stock.price
+            ) +
+            '</td>' +
 
-              '<td>' +
-              escapeHtml(
-                stock.sector
-              ) +
-              '</td>' +
-
-              '<td>' +
-              formatNumber(
-                stock.price
-              ) +
-              '</td>' +
-
-              '<td>' +
-              formatNumber(
-                stock.peRatio
-              ) +
-              '</td>' +
-
-              '<td>' +
-              formatPercent(
-                stock.dividendYield
-              ) +
-              '</td>' +
-
-              '<td>' +
-              formatNumber(
-                stock.averageVolume30d,
+            '<td>' +
+            (
+              stock.peRatio !==
+                null &&
+              stock.peRatio >
                 0
-              ) +
-              '</td>' +
+                ? formatNumber(
+                    stock.peRatio
+                  )
+                : 'N/A'
+            ) +
+            '</td>' +
 
-              '<td class="' +
-              changeClass +
-              '">' +
-              formatPercent(
-                stock.change1yPct
-              ) +
-              '</td>' +
+            '<td>' +
+            (
+              stock.dividendYield ===
+                null ||
+              stock.dividendYield ===
+                undefined
+                ? 'N/A'
+                : formatPercent(
+                    stock.dividendYield
+                  )
+            ) +
+            '</td>' +
 
-              '</tr>'
-            );
-          }
+            '<td>' +
+            formatNumber(
+              stock.averageVolume30d,
+              0
+            ) +
+            '</td>' +
+
+            '<td class="' +
+            percentClass(
+              stock.change1yPct
+            ) +
+            '">' +
+            formatPercent(
+              stock.change1yPct
+            ) +
+            '</td>' +
+
+            '</tr>'
         )
         .join('') +
 
@@ -5961,7 +7975,8 @@ function renderStocks() {
       '</table>';
 
   const first =
-    start + 1;
+    start +
+    1;
 
   const last =
     Math.min(
@@ -5998,12 +8013,11 @@ function renderStocks() {
     )
     .forEach(
       row => {
-
         row.onclick =
           () => {
-
             const symbol =
-              row.dataset.symbol;
+              row.dataset
+                .symbol;
 
             $('stockSymbol')
               .value =
@@ -6017,6 +8031,7 @@ function renderStocks() {
               .scrollIntoView({
                 behavior:
                   'smooth',
+
                 block:
                   'start'
               });
@@ -6024,10 +8039,6 @@ function renderStocks() {
       }
     );
 }
-
-/* ---------------------------------------
-   SECTORS
---------------------------------------- */
 
 function populateSectors() {
   const sectors =
@@ -6050,7 +8061,9 @@ function populateSectors() {
 
   $('sectorFilter')
     .innerHTML =
-      '<option value="">All sectors</option>' +
+      '<option value="">' +
+      'All sectors' +
+      '</option>' +
 
       sectors
         .map(
@@ -6067,10 +8080,6 @@ function populateSectors() {
         )
         .join('');
 }
-
-/* ---------------------------------------
-   MARKET LOAD
---------------------------------------- */
 
 $('loadMarket')
   .onclick =
@@ -6094,15 +8103,20 @@ $('loadMarket')
           result.stocks ||
           [];
 
-        currentPage =
-          1;
+        currentPage = 1;
 
         $('coverage')
           .textContent =
             result.totalStocks +
-            ' usable stocks | ' +
-            result.companyMetadata +
-            ' company names loaded | Updated ' +
+            ' usable stocks | Company names matched ' +
+            result.companyNamesMatched +
+            '/' +
+            result.totalStocks +
+            ' | Sectors matched ' +
+            result.sectorsMatched +
+            '/' +
+            result.totalStocks +
+            ' | Updated ' +
             result.asOf;
 
         populateSectors();
@@ -6123,15 +8137,11 @@ $('loadMarket')
       }
     };
 
-/* ---------------------------------------
-   FILTER EVENTS
---------------------------------------- */
-
 $('search')
   .oninput =
     () => {
-      currentPage =
-        1;
+
+      currentPage = 1;
 
       renderStocks();
     };
@@ -6139,8 +8149,8 @@ $('search')
 $('sectorFilter')
   .onchange =
     () => {
-      currentPage =
-        1;
+
+      currentPage = 1;
 
       renderStocks();
     };
@@ -6148,23 +8158,18 @@ $('sectorFilter')
 $('sort')
   .onchange =
     () => {
-      currentPage =
-        1;
+
+      currentPage = 1;
 
       renderStocks();
     };
-
-/* ---------------------------------------
-   PAGINATION
---------------------------------------- */
 
 $('previousPage')
   .onclick =
     () => {
 
       if (
-        currentPage >
-        1
+        currentPage > 1
       ) {
         currentPage--;
 
@@ -6176,12 +8181,10 @@ $('nextPage')
   .onclick =
     () => {
 
-      const rows =
-        getFilteredRows();
-
       const pageCount =
         Math.ceil(
-          rows.length /
+          getFilteredRows()
+            .length /
           PAGE_SIZE
         );
 
@@ -6196,7 +8199,7 @@ $('nextPage')
     };
 
 /* ---------------------------------------
-   PRICE CHART
+   HISTORY
 --------------------------------------- */
 
 function buildPriceChart(
@@ -6204,8 +8207,7 @@ function buildPriceChart(
 ) {
   if (
     !rows ||
-    rows.length <
-      2
+    rows.length < 2
   ) {
     return (
       '<p class="muted">' +
@@ -6214,23 +8216,12 @@ function buildPriceChart(
     );
   }
 
-  const width =
-    1000;
-
-  const height =
-    330;
-
-  const paddingLeft =
-    65;
-
-  const paddingRight =
-    20;
-
-  const paddingTop =
-    20;
-
-  const paddingBottom =
-    42;
+  const width = 1000;
+  const height = 330;
+  const paddingLeft = 65;
+  const paddingRight = 20;
+  const paddingTop = 20;
+  const paddingBottom = 42;
 
   const usableWidth =
     width -
@@ -6263,25 +8254,18 @@ function buildPriceChart(
   if (
     min === max
   ) {
-    min *=
-      .98;
-
-    max *=
-      1.02;
+    min *= .98;
+    max *= 1.02;
   }
 
   const range =
     max - min;
 
   const margin =
-    range *
-    .08;
+    range * .08;
 
-  min -=
-    margin;
-
-  max +=
-    margin;
+  min -= margin;
+  max += margin;
 
   const x =
     index =>
@@ -6356,15 +8340,12 @@ function buildPriceChart(
     '';
 
   for (
-    let index =
-      0;
-    index <
-      5;
+    let index = 0;
+    index < 5;
     index++
   ) {
     const fraction =
-      index /
-      4;
+      index / 4;
 
     const price =
       max -
@@ -6380,37 +8361,31 @@ function buildPriceChart(
       usableHeight;
 
     horizontalLines +=
-      '<line ' +
-      'x1="' +
+      '<line x1="' +
       paddingLeft +
-      '" ' +
-      'x2="' +
+      '" x2="' +
       (
         width -
         paddingRight
       ) +
-      '" ' +
-      'y1="' +
+      '" y1="' +
       lineY +
-      '" ' +
-      'y2="' +
+      '" y2="' +
       lineY +
-      '" ' +
-      'class="chartAxis" />' +
+      '" class="chartAxis" />' +
 
-      '<text ' +
-      'x="5" ' +
-      'y="' +
+      '<text x="5" y="' +
       (
         lineY +
         4
       ) +
-      '" ' +
-      'class="chartLabel">' +
+      '" class="chartLabel">' +
+
       formatNumber(
         price,
         2
       ) +
+
       '</text>';
   }
 
@@ -6439,89 +8414,80 @@ function buildPriceChart(
     'Closing price history (PKR)' +
     '</div>' +
 
-    '<svg ' +
-    'class="priceChart" ' +
+    '<svg class="priceChart" ' +
     'viewBox="0 0 ' +
     width +
     ' ' +
     height +
-    '" ' +
-    'preserveAspectRatio="none">' +
+    '" preserveAspectRatio="none">' +
 
     horizontalLines +
 
-    '<polygon ' +
-    'points="' +
+    '<polygon points="' +
     areaPoints +
-    '" ' +
-    'class="chartArea" />' +
+    '" class="chartArea" />' +
 
-    '<polyline ' +
-    'points="' +
+    '<polyline points="' +
     points +
-    '" ' +
-    'class="chartLine" />' +
+    '" class="chartLine" />' +
 
-    '<text ' +
-    'x="' +
+    '<text x="' +
     paddingLeft +
-    '" ' +
-    'y="' +
+    '" y="' +
     (
       height -
       8
     ) +
-    '" ' +
-    'class="chartLabel">' +
+    '" class="chartLabel">' +
+
     escapeHtml(
       formatDate(
         firstDate
       )
     ) +
+
     '</text>' +
 
-    '<text ' +
-    'x="' +
+    '<text x="' +
     (
       width /
       2
     ) +
-    '" ' +
-    'y="' +
+    '" y="' +
     (
       height -
       8
     ) +
-    '" ' +
-    'text-anchor="middle" ' +
+    '" text-anchor="middle" ' +
     'class="chartLabel">' +
+
     escapeHtml(
       formatDate(
         middleDate
       )
     ) +
+
     '</text>' +
 
-    '<text ' +
-    'x="' +
+    '<text x="' +
     (
       width -
       paddingRight
     ) +
-    '" ' +
-    'y="' +
+    '" y="' +
     (
       height -
       8
     ) +
-    '" ' +
-    'text-anchor="end" ' +
+    '" text-anchor="end" ' +
     'class="chartLabel">' +
+
     escapeHtml(
       formatDate(
         lastDate
       )
     ) +
+
     '</text>' +
 
     '</svg>' +
@@ -6530,9 +8496,84 @@ function buildPriceChart(
   );
 }
 
-/* ---------------------------------------
-   HISTORY VIEW
---------------------------------------- */
+function historyRangeToggle(
+  activeRange
+) {
+  const ranges =
+    [
+      '1M',
+      '6M',
+      '1Y',
+      '2Y',
+      'ALL'
+    ];
+
+  return (
+    '<div class="liveChartHeader">' +
+
+    '<div>' +
+
+    '<div class="decisionSectionTitle">' +
+    'Price history' +
+    '</div>' +
+
+    '<div class="muted">' +
+    'Choose a period to recalculate performance and chart statistics.' +
+    '</div>' +
+
+    '</div>' +
+
+    '<div class="rangeToggle">' +
+
+    ranges
+      .map(
+        range =>
+          '<button type="button" class="rangeButton ' +
+          (
+            range ===
+              activeRange
+              ? 'active'
+              : ''
+          ) +
+          '" data-range="' +
+          range +
+          '">' +
+          range +
+          '</button>'
+      )
+      .join('') +
+
+    '</div>' +
+
+    '</div>'
+  );
+}
+
+function bindHistoryRangeButtons(
+  symbol
+) {
+  document
+    .querySelectorAll(
+      '.rangeButton'
+    )
+    .forEach(
+      button => {
+        button.onclick =
+          () => {
+
+            selectedHistoryRange =
+              button.dataset
+                .range ||
+              '1Y';
+
+            loadHistoryView(
+              symbol,
+              selectedHistoryRange
+            );
+          };
+      }
+    );
+}
 
 function renderHistory(
   result
@@ -6540,139 +8581,668 @@ function renderHistory(
   const summary =
     result.summary;
 
-  const companyName =
-    result.company?.name ||
-    result.symbol;
-
-  $('selectedCompany')
-    .innerHTML =
-      '<strong>' +
-      escapeHtml(
-        companyName
-      ) +
-      '</strong>' +
-
-      '<span>' +
-      escapeHtml(
-        result.symbol
-      ) +
-      (
-        result.company?.sector
-          ? ' • ' +
-            escapeHtml(
-              result.company.sector
-            )
-          : ''
-      ) +
-      '</span>';
+  updateSelectedCompany(
+    result
+  );
 
   if (!summary) {
     $('research')
       .innerHTML =
-        '<p>No valid historical price data was available.</p>';
+        historyRangeToggle(
+          result.range
+        ) +
+
+        '<div class="emptyState">' +
+        'No valid historical price data was available for this range.' +
+        '</div>';
+
+    bindHistoryRangeButtons(
+      result.symbol
+    );
 
     return;
   }
 
   const changeClass =
-    summary.changePct >
-      0
-      ? 'positive'
-      : summary.changePct <
-        0
-        ? 'negative'
-        : '';
+    percentClass(
+      summary.changePct
+    );
 
-  $('research')
-    .innerHTML =
+  let html =
+    historyRangeToggle(
+      result.range
+    );
 
-      '<div class="summaryGrid">' +
+  html +=
+    '<div class="summaryGrid">' +
 
-      '<div class="metric">' +
-      '<div class="metricLabel">Latest historical close</div>' +
-      '<div class="metricValue">PKR ' +
+    metricCard(
+      'Latest daily close',
+      'PKR ' +
       formatNumber(
         summary.endPrice
-      ) +
-      '</div>' +
-      '</div>' +
+      ),
+      summary.endDate
+    ) +
 
-      '<div class="metric">' +
-      '<div class="metricLabel">Period change</div>' +
-      '<div class="metricValue ' +
+    metricCard(
+      summary.rangeLabel +
+      ' change',
+
+      '<span class="' +
       changeClass +
       '">' +
       formatPercent(
         summary.changePct
       ) +
-      '</div>' +
-      '</div>' +
+      '</span>',
 
-      '<div class="metric">' +
-      '<div class="metricLabel">Period high</div>' +
-      '<div class="metricValue">PKR ' +
+      summary.startDate +
+      ' to ' +
+      summary.endDate
+    ) +
+
+    metricCard(
+      'Period high',
+      'PKR ' +
       formatNumber(
         summary.high
-      ) +
-      '</div>' +
-      '</div>' +
+      )
+    ) +
 
-      '<div class="metric">' +
-      '<div class="metricLabel">Period low</div>' +
-      '<div class="metricValue">PKR ' +
+    metricCard(
+      'Period low',
+      'PKR ' +
       formatNumber(
         summary.low
-      ) +
-      '</div>' +
-      '</div>' +
+      )
+    ) +
 
-      '<div class="metric">' +
-      '<div class="metricLabel">Average volume</div>' +
-      '<div class="metricValue">' +
+    metricCard(
+      'Average volume',
       formatNumber(
         summary.averageVolume,
         0
-      ) +
-      '</div>' +
-      '</div>' +
+      )
+    ) +
 
-      '</div>' +
+    '</div>';
 
-      buildPriceChart(
-        result.data
-      ) +
+  html +=
+    buildPriceChart(
+      result.data
+    );
+
+  if (
+    summary
+      .excludedAnomalies >
+    0
+  ) {
+    html +=
+      '<div class="warningBox">' +
+
+      summary
+        .excludedAnomalies +
+
+      ' suspicious historical row' +
 
       (
-        summary.excludedAnomalies >
-        0
-          ? '<div class="warningBox">' +
-            summary.excludedAnomalies +
-            ' suspicious historical rows were excluded from this chart.' +
-            '</div>'
-          : ''
+        summary
+          .excludedAnomalies ===
+        1
+          ? ' was'
+          : 's were'
       ) +
 
-      '<details>' +
+      ' excluded from this range.' +
 
-      '<summary>' +
-      'View raw historical data' +
-      '</summary>' +
+      '</div>';
+  }
 
-      '<pre>' +
+  html +=
+    '<div class="sourceNote">' +
+    'Historical daily data source: psxdata-api. ' +
+    'Latest live/session price is shown separately in Overview and Live Chart.' +
+    '</div>';
+
+  html +=
+    '<details>' +
+
+    '<summary>' +
+    'View raw historical data' +
+    '</summary>' +
+
+    '<pre>' +
+    escapeHtml(
+      JSON.stringify(
+        result.data,
+        null,
+        2
+      )
+    ) +
+    '</pre>' +
+
+    '</details>';
+
+  $('research')
+    .innerHTML =
+      html;
+
+  bindHistoryRangeButtons(
+    result.symbol
+  );
+}
+
+async function loadHistoryView(
+  symbol,
+  range = '1Y'
+) {
+  stopLiveRefresh();
+
+  $('liveStatus')
+    .innerHTML =
+      '';
+
+  showSelectedCompany(
+    symbol
+  );
+
+  $('research')
+    .innerHTML =
+      '<p class="muted">' +
+      'Loading ' +
       escapeHtml(
-        JSON.stringify(
-          result.data,
-          null,
-          2
-        )
+        range
       ) +
-      '</pre>' +
+      ' history...' +
+      '</p>';
 
-      '</details>';
+  try {
+    const result =
+      await api(
+        'history',
+        {
+          symbol,
+          range
+        }
+      );
+
+    selectedHistoryRange =
+      result.range ||
+      range;
+
+    renderHistory(
+      result
+    );
+
+  } catch (error) {
+
+    $('research')
+      .innerHTML =
+        '';
+
+    $('error')
+      .textContent =
+        error.message;
+  }
 }
 
 /* ---------------------------------------
-   OVERVIEW
+   FUNDAMENTALS
+--------------------------------------- */
+
+function financialMetricFromTable(
+  table,
+  labelMatcher
+) {
+  if (
+    !table
+      ?.rows
+      ?.length
+  ) {
+    return null;
+  }
+
+  const row =
+    table.rows
+      .find(
+        item =>
+          labelMatcher.test(
+            String(
+              item.label ||
+              ''
+            )
+          )
+      );
+
+  if (
+    !row
+      ?.values
+      ?.length
+  ) {
+    return null;
+  }
+
+  return row.values[0];
+}
+
+function renderFinancialTable(
+  title,
+  table
+) {
+  if (
+    !table
+      ?.periods
+      ?.length ||
+    !table
+      ?.rows
+      ?.length
+  ) {
+    return '';
+  }
+
+  let html =
+    '<div class="decisionSection">' +
+
+    '<div class="decisionSectionTitle">' +
+    escapeHtml(
+      title
+    ) +
+    '</div>' +
+
+    '<div class="dataTable">' +
+
+    '<table>' +
+
+    '<thead>' +
+
+    '<tr>' +
+
+    '<th>Metric</th>' +
+
+    table.periods
+      .map(
+        period =>
+          '<th>' +
+          escapeHtml(
+            period
+          ) +
+          '</th>'
+      )
+      .join('') +
+
+    '</tr>' +
+
+    '</thead>' +
+
+    '<tbody>';
+
+  for (
+    const row
+    of table.rows
+  ) {
+    html +=
+      '<tr>' +
+
+      '<td>' +
+      '<strong>' +
+      escapeHtml(
+        row.label
+      ) +
+      '</strong>' +
+      '</td>' +
+
+      row.values
+        .map(
+          item =>
+            '<td>' +
+            escapeHtml(
+              item.raw ||
+              'N/A'
+            ) +
+            '</td>'
+        )
+        .join('') +
+
+      '</tr>';
+  }
+
+  html +=
+    '</tbody>' +
+    '</table>' +
+    '</div>' +
+    '</div>';
+
+  return html;
+}
+
+function renderFundamentals(
+  result
+) {
+  updateSelectedCompany(
+    result
+  );
+
+  if (
+    !result.available
+  ) {
+    $('research')
+      .innerHTML =
+        '<div class="emptyState">' +
+
+        '<strong>' +
+        'Structured fundamentals are not available for this symbol from the connected PSX source.' +
+        '</strong>' +
+
+        '<div class="sourceNote">' +
+        'NOMAD will not invent or backfill missing financials.' +
+        '</div>' +
+
+        '</div>';
+
+    return;
+  }
+
+  const annualEPS =
+    financialMetricFromTable(
+      result.annual,
+      /^EPS$/i
+    );
+
+  const annualPAT =
+    financialMetricFromTable(
+      result.annual,
+      /profit after taxation/i
+    );
+
+  const annualIncome =
+    financialMetricFromTable(
+      result.annual,
+      /^(sales|total income|mark-up earned)$/i
+    );
+
+  const incomeRow =
+    result
+      .annual
+      ?.rows
+      ?.find(
+        item =>
+          /^(sales|total income|mark-up earned)$/i
+            .test(
+              item.label
+            )
+      );
+
+  let html =
+    '<div class="decisionSectionTitle">' +
+    'Fundamental snapshot' +
+    '</div>' +
+
+    '<div class="summaryGrid">';
+
+  html +=
+    metricCard(
+      'P/E',
+      result
+        .valuation
+        ?.peRatio ===
+          null ||
+      result
+        .valuation
+        ?.peRatio ===
+          undefined
+        ? 'N/A'
+        : formatNumber(
+            result
+              .valuation
+              .peRatio
+          )
+    );
+
+  html +=
+    metricCard(
+      'Dividend yield',
+      result
+        .valuation
+        ?.dividendYield ===
+          null ||
+      result
+        .valuation
+        ?.dividendYield ===
+          undefined
+        ? 'N/A'
+        : formatPercent(
+            result
+              .valuation
+              .dividendYield
+          )
+    );
+
+  if (annualEPS) {
+    html +=
+      metricCard(
+        'Latest annual EPS',
+        escapeHtml(
+          annualEPS.raw ||
+          'N/A'
+        ),
+        annualEPS.period
+      );
+  }
+
+  if (annualPAT) {
+    html +=
+      metricCard(
+        'Latest annual PAT',
+        escapeHtml(
+          annualPAT.raw ||
+          'N/A'
+        ) +
+        ' (000s)',
+        annualPAT.period
+      );
+  }
+
+  if (annualIncome) {
+    html +=
+      metricCard(
+        incomeRow
+          ?.label ||
+        'Latest annual income',
+
+        escapeHtml(
+          annualIncome.raw ||
+          'N/A'
+        ) +
+        ' (000s)',
+
+        annualIncome.period
+      );
+  }
+
+  if (
+    result
+      .valuation
+      ?.marketCapPkr !==
+      null &&
+    result
+      .valuation
+      ?.marketCapPkr !==
+      undefined
+  ) {
+    html +=
+      metricCard(
+        'Market cap',
+        formatCompactPKR(
+          result
+            .valuation
+            .marketCapPkr
+        )
+      );
+  }
+
+  html +=
+    '</div>';
+
+  html +=
+    renderFinancialTable(
+      'Annual financials',
+      result.annual
+    );
+
+  html +=
+    renderFinancialTable(
+      'Recent quarterly financials',
+      result.quarterly
+    );
+
+  html +=
+    renderFinancialTable(
+      'Ratios',
+      result.ratios
+    );
+
+  html +=
+    '<div class="sourceNote">' +
+    'Source: ' +
+    escapeHtml(
+      result.source
+    ) +
+
+    (
+      result.fetchedAt
+        ? (
+            ' &bull; fetched ' +
+            escapeHtml(
+              formatDateTime(
+                result.fetchedAt
+              )
+            )
+          )
+        : ''
+    ) +
+
+    '. Values are shown as published/standardized by the source; no missing values are invented.' +
+
+    '</div>';
+
+  $('research')
+    .innerHTML =
+      html;
+}
+
+/* ---------------------------------------
+   EVENTS
+--------------------------------------- */
+
+function renderEvents(
+  result
+) {
+  updateSelectedCompany(
+    result
+  );
+
+  let html =
+    '<div class="decisionSectionTitle">' +
+    'Recent company events & announcements' +
+    '</div>';
+
+  if (
+    !Array.isArray(
+      result.events
+    ) ||
+    !result.events.length
+  ) {
+    html +=
+      '<div class="emptyState">' +
+      'No recent structured announcements were available from the connected PSX source for this symbol.' +
+      '</div>';
+  } else {
+    html +=
+      '<div class="eventList">' +
+
+      result.events
+        .slice(
+          0,
+          15
+        )
+        .map(
+          item =>
+            '<div class="eventItem">' +
+
+            '<div class="eventMeta">' +
+
+            '<span>' +
+            escapeHtml(
+              item.date
+            ) +
+            '</span>' +
+
+            '<span class="pill">' +
+            escapeHtml(
+              item.type ||
+              'Corporate'
+            ) +
+            '</span>' +
+
+            '</div>' +
+
+            '<div class="eventTitle">' +
+            escapeHtml(
+              item.title
+            ) +
+            '</div>' +
+
+            (
+              item.documentUrl
+                ? (
+                    '<a class="eventLink" href="' +
+                    escapeHtml(
+                      item.documentUrl
+                    ) +
+                    '" target="_blank" rel="noopener noreferrer">' +
+                    'Open PSX document' +
+                    '</a>'
+                  )
+                : ''
+            ) +
+
+            '</div>'
+        )
+        .join('') +
+
+      '</div>';
+  }
+
+  html +=
+    '<div class="sourceNote">' +
+    'Source: ' +
+    escapeHtml(
+      result.source
+    ) +
+
+    (
+      result.fetchedAt
+        ? (
+            ' &bull; fetched ' +
+            escapeHtml(
+              formatDateTime(
+                result.fetchedAt
+              )
+            )
+          )
+        : ''
+    ) +
+
+    '.</div>';
+
+  $('research')
+    .innerHTML =
+      html;
+}
+
+/* ---------------------------------------
+   BUTTON ACTIONS
 --------------------------------------- */
 
 $('loadQuote')
@@ -6701,6 +9271,12 @@ $('loadQuote')
         symbol
       );
 
+      $('research')
+        .innerHTML =
+          '<p class="muted">' +
+          'Loading decision overview...' +
+          '</p>';
+
       try {
         const result =
           await api(
@@ -6710,34 +9286,9 @@ $('loadQuote')
             }
           );
 
-        const company =
-          result.company;
-
-        if (
-          company?.name
-        ) {
-          $('selectedCompany')
-            .innerHTML =
-              '<strong>' +
-              escapeHtml(
-                company.name
-              ) +
-              '</strong>' +
-
-              '<span>' +
-              escapeHtml(
-                result.symbol
-              ) +
-              (
-                company.sector
-                  ? ' • ' +
-                    escapeHtml(
-                      company.sector
-                    )
-                  : ''
-              ) +
-              '</span>';
-        }
+        updateSelectedCompany(
+          result
+        );
 
         lastQuoteResult =
           result;
@@ -6757,12 +9308,12 @@ $('loadQuote')
         $('error')
           .textContent =
             error.message;
+
+        $('research')
+          .innerHTML =
+            '';
       }
     };
-
-/* ---------------------------------------
-   LIVE CHART BUTTON
---------------------------------------- */
 
 $('loadLiveChart')
   .onclick =
@@ -6795,10 +9346,6 @@ $('loadLiveChart')
       );
     };
 
-/* ---------------------------------------
-   HISTORY BUTTON
---------------------------------------- */
-
 $('loadHistory')
   .onclick =
     async () => {
@@ -6821,48 +9368,12 @@ $('loadHistory')
         return;
       }
 
-      stopLiveRefresh();
-
-      $('liveStatus')
-        .innerHTML =
-          '';
-
-      showSelectedCompany(
-        symbol
+      loadHistoryView(
+        symbol,
+        selectedHistoryRange ||
+        '1Y'
       );
-
-      $('research')
-        .innerHTML =
-          '<p class="muted">Loading historical chart...</p>';
-
-      try {
-        const result =
-          await api(
-            'history',
-            {
-              symbol
-            }
-          );
-
-        renderHistory(
-          result
-        );
-
-      } catch (error) {
-
-        $('research')
-          .innerHTML =
-            '';
-
-        $('error')
-          .textContent =
-            error.message;
-      }
     };
-
-/* ---------------------------------------
-   FUNDAMENTALS
---------------------------------------- */
 
 $('loadFundamentals')
   .onclick =
@@ -6896,6 +9407,12 @@ $('loadFundamentals')
         symbol
       );
 
+      $('research')
+        .innerHTML =
+          '<p class="muted">' +
+          'Loading company fundamentals...' +
+          '</p>';
+
       try {
         const result =
           await api(
@@ -6905,53 +9422,78 @@ $('loadFundamentals')
             }
           );
 
-        if (
-          result.company?.name
-        ) {
-          $('selectedCompany')
-            .innerHTML =
-              '<strong>' +
-              escapeHtml(
-                result.company.name
-              ) +
-              '</strong>' +
+        renderFundamentals(
+          result
+        );
 
-              '<span>' +
-              escapeHtml(
-                result.symbol
-              ) +
-              (
-                result.company.sector
-                  ? ' • ' +
-                    escapeHtml(
-                      result.company.sector
-                    )
-                  : ''
-              ) +
-              '</span>';
-        }
+      } catch (error) {
 
         $('research')
           .innerHTML =
-            '<details open>' +
+            '';
 
-            '<summary>' +
-            'Fundamental information' +
-            '</summary>' +
+        $('error')
+          .textContent =
+            error.message;
+      }
+    };
 
-            '<pre>' +
-            escapeHtml(
-              JSON.stringify(
-                result.data,
-                null,
-                2
-              )
-            ) +
-            '</pre>' +
+$('loadEvents')
+  .onclick =
+    async () => {
 
-            '</details>';
+      $('error')
+        .textContent =
+          '';
+
+      const symbol =
+        $('stockSymbol')
+          .value
+          .trim()
+          .toUpperCase();
+
+      if (!symbol) {
+        $('error')
+          .textContent =
+            'Enter a PSX symbol.';
+
+        return;
+      }
+
+      stopLiveRefresh();
+
+      $('liveStatus')
+        .innerHTML =
+          '';
+
+      showSelectedCompany(
+        symbol
+      );
+
+      $('research')
+        .innerHTML =
+          '<p class="muted">' +
+          'Loading recent company events...' +
+          '</p>';
+
+      try {
+        const result =
+          await api(
+            'events',
+            {
+              symbol
+            }
+          );
+
+        renderEvents(
+          result
+        );
 
       } catch (error) {
+
+        $('research')
+          .innerHTML =
+            '';
 
         $('error')
           .textContent =
@@ -7000,6 +9542,12 @@ $('loadMore')
             : null;
 
         if (!result) {
+          $('research')
+            .innerHTML =
+              '<p class="muted">' +
+              'Loading additional market data...' +
+              '</p>';
+
           result =
             await api(
               'quote',
@@ -7012,40 +9560,23 @@ $('loadMore')
             result;
         }
 
-        if (
-          result.company?.name
-        ) {
-          $('selectedCompany')
-            .innerHTML =
-              '<strong>' +
-              escapeHtml(
-                result.company.name
-              ) +
-              '</strong>' +
-
-              '<span>' +
-              escapeHtml(
-                result.symbol
-              ) +
-              (
-                result.company.sector
-                  ? ' • ' +
-                    escapeHtml(
-                      result.company.sector
-                    )
-                  : ''
-              ) +
-              '</span>';
-        }
+        updateSelectedCompany(
+          result
+        );
 
         renderMoreData(
           result
         );
 
       } catch (error) {
+
         $('error')
           .textContent =
             error.message;
+
+        $('research')
+          .innerHTML =
+            '';
       }
     };
 
@@ -7057,6 +9588,9 @@ $('stockSymbol')
 
       lastQuoteResult =
         null;
+
+      selectedHistoryRange =
+        '1Y';
 
       $('liveStatus')
         .innerHTML =
@@ -7075,12 +9609,15 @@ api(
 
       $('status')
         .textContent =
-          'Market: connected | Company names: official PSX metadata | pyPSX: ' +
+          'Market: connected | ' +
+          'Company metadata: connected | ' +
+          'pyPSX: ' +
           (
             result.pyPSXConfigured
               ? 'configured'
               : 'not configured'
           ) +
+          ' | Fundamentals: PSX company data' +
           ' | Prediction engine: ' +
           result.predictionEngine;
     }
