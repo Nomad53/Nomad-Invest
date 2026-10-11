@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.8.3.1';
+const VERSION = '0.8.3.2';
 
 
 const SUPABASE_URL =
@@ -5156,7 +5156,14 @@ function parseCompanyListingInfo(
     statusEvidence:
       null,
 
-    ...boardInfo,
+    // Build 0.8.3.2: initialize board fields explicitly.
+    // 0.8.3.1 referenced an undefined boardInfo object here, which could
+    // break PSX company-page parsing and falsely block fundamental evidence.
+    boardType:
+      null,
+
+    boardLabel:
+      null,
 
     boardEvidence:
       null,
@@ -10893,25 +10900,67 @@ async function getFundamentals(
 
   const [
     sectorMap,
-    snapshot,
-    quote
+    snapshotResult,
+    quoteResult
   ] =
     await Promise.all([
       loadSectorMap(),
 
       getPSXCompanySnapshot(
         symbol
-      ).catch(
-        () => null
-      ),
+      )
+        .then(
+          snapshot => ({
+            value:
+              snapshot,
+            error:
+              null
+          })
+        )
+        .catch(
+          error => ({
+            value:
+              null,
+            error:
+              String(
+                error?.message ||
+                'PSX company-page request failed.'
+              )
+          })
+        ),
 
       fetchQuoteForSymbols([
         context.tradingSymbol,
         symbol
-      ]).catch(
-        () => null
-      )
+      ])
+        .then(
+          quote => ({
+            value:
+              quote,
+            error:
+              null
+          })
+        )
+        .catch(
+          error => ({
+            value:
+              null,
+            error:
+              String(
+                error?.message ||
+                'Quote request failed.'
+              )
+          })
+        )
     ]);
+
+  const snapshot =
+    snapshotResult?.value ||
+    null;
+
+  const quote =
+    quoteResult?.value ||
+    null;
 
   const quoteData =
     quote?.data ||
@@ -10933,6 +10982,43 @@ async function getFundamentals(
       : safeNumber(
           quoteData.dividend_yield
         );
+
+  const hasAnnual =
+    Boolean(
+      snapshot?.annual
+    );
+
+  const hasQuarterly =
+    Boolean(
+      snapshot?.quarterly
+    );
+
+  const hasRatios =
+    Boolean(
+      snapshot?.ratios
+    );
+
+  const structuredAvailable =
+    Boolean(
+      snapshot &&
+      (
+        hasAnnual ||
+        hasQuarterly ||
+        hasRatios
+      )
+    );
+
+  let evidenceError =
+    null;
+
+  if (!snapshot) {
+    evidenceError =
+      snapshotResult?.error ||
+      'PSX company page could not be loaded.';
+  } else if (!structuredAvailable) {
+    evidenceError =
+      'PSX company page loaded, but no structured annual, quarterly or ratio table was parsed.';
+  }
 
   return {
     symbol,
@@ -11041,14 +11127,40 @@ async function getFundamentals(
       null,
 
     available:
-      Boolean(
-        snapshot &&
-        (
-          snapshot.annual ||
-          snapshot.quarterly ||
-          snapshot.ratios
-        )
-      )
+      structuredAvailable,
+
+    evidenceError,
+
+    diagnostics: {
+      snapshotState:
+        snapshot
+          ? 'AVAILABLE'
+          : 'UNAVAILABLE',
+      snapshotError:
+        snapshotResult?.error ||
+        null,
+      quoteState:
+        quote
+          ? 'AVAILABLE'
+          : 'UNAVAILABLE',
+      quoteError:
+        quoteResult?.error ||
+        null,
+      structuredTables: {
+        annual:
+          hasAnnual,
+        quarterly:
+          hasQuarterly,
+        ratios:
+          hasRatios
+      },
+      pageIdentityValid:
+        snapshot?.pageIdentityValid ===
+          true,
+      sourceFetchedAt:
+        snapshot?.fetchedAt ||
+        null
+    }
   };
 }
 
@@ -12499,7 +12611,7 @@ async function supabaseRest(
       'application/json',
 
     'User-Agent':
-      'NOMAD-Invest-Server/0.8.3.1'
+      'NOMAD-Invest-Server/0.8.3.2'
   };
 
   if (
@@ -14850,7 +14962,7 @@ async function readJsonRequestBody(
 }
 
 /* =========================================================
-   DECISION LAB - BUILD 0.8.3.1
+   DECISION LAB - BUILD 0.8.3.2
    Experimental shadow engine. No automatic trading.
 ========================================================= */
 
@@ -16559,6 +16671,14 @@ async function decisionLoadFundamentals(
         'CACHE_FRESH',
       cachedAt:
         cache.cachedAt,
+      diagnostics: {
+        source:
+          'CACHE_FRESH',
+        cacheAgeMs:
+          cache.ageMs,
+        liveAttempted:
+          false
+      },
       error: null
     };
   }
@@ -16582,6 +16702,16 @@ async function decisionLoadFundamentals(
       'Fundamental evidence unavailable.';
   }
 
+  if (
+    fresh &&
+    !fresh.available &&
+    !freshError
+  ) {
+    freshError =
+      fresh.evidenceError ||
+      'Structured company fundamentals were not available from the PSX company page.';
+  }
+
   if (fresh?.available) {
     await saveDecisionFundamentalCache(
       symbol,
@@ -16598,6 +16728,18 @@ async function decisionLoadFundamentals(
         fresh.fetchedAt ||
         new Date()
           .toISOString(),
+      diagnostics: {
+        source:
+          'LIVE',
+        cacheAgeMs:
+          cache?.ageMs ??
+          null,
+        liveAttempted:
+          true,
+        fundamentals:
+          fresh.diagnostics ||
+          null
+      },
       error: null
     };
   }
@@ -16614,6 +16756,20 @@ async function decisionLoadFundamentals(
         'CACHE_FALLBACK',
       cachedAt:
         cache.cachedAt,
+      diagnostics: {
+        source:
+          'CACHE_FALLBACK',
+        cacheAgeMs:
+          cache.ageMs,
+        liveAttempted:
+          true,
+        liveFailure:
+          freshError ||
+          null,
+        fundamentals:
+          fresh?.diagnostics ||
+          null
+      },
       error:
         freshError ||
         'Live fundamentals were unavailable; NOMAD used recent cached company evidence.'
@@ -16626,6 +16782,21 @@ async function decisionLoadFundamentals(
     evidenceState:
       'BLOCKED',
     cachedAt: null,
+    diagnostics: {
+      source:
+        'BLOCKED',
+      cacheAgeMs:
+        cache?.ageMs ??
+        null,
+      liveAttempted:
+        true,
+      liveFailure:
+        freshError ||
+        null,
+      fundamentals:
+        fresh?.diagnostics ||
+        null
+    },
     error:
       freshError ||
       'Structured company fundamentals are unavailable.'
@@ -17103,6 +17274,12 @@ async function recordDecisionRun(
                   candidate.fundamental
                     ?.metrics ||
                   {},
+                fundamentalEvidenceState:
+                  candidate.fundamentalEvidenceState ||
+                  null,
+                fundamentalEvidenceDiagnostics:
+                  candidate.fundamentalEvidenceDiagnostics ||
+                  null,
                 narrative:
                   candidate.narrative,
                 reason:
@@ -17574,6 +17751,10 @@ async function runDecisionLab(
           fundamentalEvidenceState:
             fundamentalEvidence
               .evidenceState,
+          fundamentalEvidenceDiagnostics:
+            fundamentalEvidence
+              .diagnostics ||
+            null,
           valuation:
             item.valuation,
           entry:
@@ -17878,6 +18059,41 @@ function runDecisionEngineSelfTests() {
     4
   );
 
+  const listingInfo =
+    parseCompanyListingInfo(
+      [
+        'ABC',
+        'ABC LIMITED',
+        'QUOTE',
+        'COMMERCIAL BANKS'
+      ],
+      'ABC LIMITED',
+      'ABC'
+    );
+
+  assert.equal(
+    listingInfo.boardType,
+    null,
+    'ordinary company-page parsing must not depend on an undefined boardInfo object'
+  );
+
+  const gemListingInfo =
+    parseCompanyListingInfo(
+      [
+        'GEMABC',
+        'ABC LIMITED (GEM)',
+        'QUOTE'
+      ],
+      'ABC LIMITED (GEM)',
+      'GEMABC'
+    );
+
+  assert.equal(
+    gemListingInfo.boardType,
+    'GEM',
+    'GEM fallback board detection must remain intact'
+  );
+
   const riskBalanced =
     DECISION_RISK_POLICIES
       .balanced;
@@ -18047,7 +18263,7 @@ function runDecisionEngineSelfTests() {
 
 
 /* =========================================================
-   CONTINUOUS INTELLIGENCE SCANNER - BUILD 0.8.3.1
+   CONTINUOUS INTELLIGENCE SCANNER - BUILD 0.8.3.2
 ========================================================= */
 
 function scannerSecretConfigured() {
@@ -21509,7 +21725,7 @@ body > main > header {
 
 
 /* =========================================================
-   TRADING WORKSPACE + DECISION UI - BUILD 0.8.3.1
+   TRADING WORKSPACE + DECISION UI - BUILD 0.8.3.2
 ========================================================= */
 
 :root {
@@ -22451,7 +22667,7 @@ Build ${VERSION}
 Market, company metadata, fundamentals, symbol normalization,
 canonical universe identity, metadata, fundamentals and deterministic technical analysis are connected.
 
-Persistent intelligence memory and the market scanner are connected. Build 0.8.3.1 hardens the shadow decision engine; its outputs are recorded for validation but are not real-money eligible yet.
+Persistent intelligence memory and the market scanner are connected. Build 0.8.3.2 hardens the shadow decision engine; its outputs are recorded for validation but are not real-money eligible yet.
 
 </p>
 
@@ -22516,7 +22732,7 @@ Checking connection...
 <div><label>Risk</label><select id="decisionRisk"><option value="balanced">Balanced</option><option value="conservative">Conservative</option><option value="aggressive">Aggressive</option></select></div>
 </div>
 <button id="findBestOption" class="primaryWide">Find my best option</button>
-<div id="decisionResult" class="decisionResult">Build 0.8.3.1 runs the hardened experimental shadow decision across the eligible PSX universe. It is deliberately not real-money eligible until the model earns validation.</div>
+<div id="decisionResult" class="decisionResult">Build 0.8.3.2 runs the hardened experimental shadow decision across the eligible PSX universe. It is deliberately not real-money eligible until the model earns validation.</div>
 </div>
 
 <div class="terminalCard attentionCardNew">
@@ -23641,7 +23857,7 @@ async function apiPost(
 
 
 /* =========================================================
-   APP NAVIGATION + DECISION CENTER - BUILD 0.8.3.1
+   APP NAVIGATION + DECISION CENTER - BUILD 0.8.3.2
 ========================================================= */
 
 function openAppPage(
