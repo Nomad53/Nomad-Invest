@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.8.3.2';
+const VERSION = '0.8.4A';
 
 
 const SUPABASE_URL =
@@ -10887,6 +10887,1166 @@ async function getHistory(
    FUNDAMENTALS
 ========================================================= */
 
+/* =========================================================
+   FINANCIAL ANALYST CORE - BUILD 0.8.4A
+
+   IMPORTANT:
+   - This layer normalizes and interprets evidence already returned by PSX.
+   - It does not fabricate missing fields.
+   - It does not change BUY / WAIT / AVOID decisions in 0.8.4A.
+   - Sector-specific interpretation is deliberately deferred when a generic
+     accounting ratio could be misleading (for example, banks / insurers).
+========================================================= */
+
+const ANALYST_FINANCIAL_METRICS = {
+  revenue: {
+    sources: ['annual', 'quarterly'],
+    patterns: [
+      /^(sales|net sales|revenue|net revenue|turnover)$/i,
+      /^(total income|mark-up earned|markup earned)$/i
+    ]
+  },
+  grossProfit: {
+    sources: ['annual', 'quarterly'],
+    patterns: [
+      /^gross profit$/i
+    ]
+  },
+  operatingProfit: {
+    sources: ['annual', 'quarterly'],
+    patterns: [
+      /^(operating profit|profit from operations|operating income)$/i
+    ]
+  },
+  financeCost: {
+    sources: ['annual', 'quarterly'],
+    patterns: [
+      /^(finance cost|finance costs|financial charges|finance charges)$/i
+    ]
+  },
+  profitBeforeTax: {
+    sources: ['annual', 'quarterly'],
+    patterns: [
+      /^(profit before taxation|profit before tax|pbt)$/i
+    ]
+  },
+  profitAfterTax: {
+    sources: ['annual', 'quarterly'],
+    patterns: [
+      /^(profit after taxation|profit after tax|pat)$/i
+    ]
+  },
+  eps: {
+    sources: ['annual', 'quarterly'],
+    patterns: [
+      /^(eps|earnings per share)$/i
+    ]
+  },
+  otherIncome: {
+    sources: ['annual', 'quarterly'],
+    patterns: [
+      /^other income$/i
+    ]
+  },
+  exceptionalItems: {
+    sources: ['annual', 'quarterly'],
+    patterns: [
+      /^(exceptional items?|extraordinary items?|one[- ]off items?)$/i
+    ]
+  },
+  totalAssets: {
+    sources: ['annual'],
+    patterns: [
+      /^total assets$/i
+    ]
+  },
+  totalEquity: {
+    sources: ['annual'],
+    patterns: [
+      /^(total equity|shareholders'? equity|share holders'? equity|total shareholders'? equity)$/i
+    ]
+  },
+  borrowings: {
+    sources: ['annual'],
+    patterns: [
+      /^(total borrowings|borrowings|total debt)$/i
+    ]
+  },
+  cash: {
+    sources: ['annual'],
+    patterns: [
+      /^(cash|cash and bank balances|cash & bank balances|cash and cash equivalents|cash & cash equivalents)$/i
+    ]
+  },
+  operatingCashFlow: {
+    sources: ['annual'],
+    patterns: [
+      /^(operating cash flow|cash flow from operating activities|net cash from operating activities|net cash generated from operating activities|cash generated from operations)$/i
+    ]
+  },
+  capex: {
+    sources: ['annual'],
+    patterns: [
+      /^(capex|capital expenditure|capital expenditures|purchase of property plant and equipment|purchase of property, plant and equipment)$/i
+    ]
+  },
+  dividendPerShare: {
+    sources: ['annual', 'ratios'],
+    patterns: [
+      /^(dps|dividend per share|cash dividend per share)$/i
+    ]
+  },
+  roe: {
+    sources: ['ratios'],
+    patterns: [
+      /^(return on equity|roe)$/i
+    ]
+  },
+  netProfitMargin: {
+    sources: ['ratios'],
+    patterns: [
+      /^net profit margin$/i
+    ]
+  },
+  grossMargin: {
+    sources: ['ratios'],
+    patterns: [
+      /^(gross margin|gross profit margin)$/i
+    ]
+  },
+  operatingMargin: {
+    sources: ['ratios'],
+    patterns: [
+      /^(operating margin|operating profit margin)$/i
+    ]
+  },
+  debtToEquity: {
+    sources: ['ratios'],
+    patterns: [
+      /^(debt[ /-]?to[ /-]?equity|debt[ /-]?equity|d\/e)$/i
+    ]
+  },
+  currentRatio: {
+    sources: ['ratios'],
+    patterns: [
+      /^current ratio$/i
+    ]
+  },
+  priceToBook: {
+    sources: ['ratios'],
+    patterns: [
+      /^(price\/book|price to book|p\/b|pb ratio)$/i
+    ]
+  },
+  payoutRatio: {
+    sources: ['ratios'],
+    patterns: [
+      /^(payout ratio|dividend payout ratio)$/i
+    ]
+  }
+};
+
+function analystNormalizeMetricLabel(
+  value
+) {
+  return String(
+    value || ''
+  )
+    .replace(/\u00a0/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function analystMetricRow(
+  table,
+  definition
+) {
+  if (
+    !table ||
+    !Array.isArray(
+      table.rows
+    )
+  ) {
+    return null;
+  }
+
+  for (
+    const row
+    of table.rows
+  ) {
+    const label =
+      analystNormalizeMetricLabel(
+        row?.label
+      );
+
+    if (!label) {
+      continue;
+    }
+
+    for (
+      let index = 0;
+      index < definition.patterns.length;
+      index++
+    ) {
+      if (
+        definition.patterns[index]
+          .test(label)
+      ) {
+        return {
+          row,
+          label,
+          mappingConfidence:
+            index === 0
+              ? 'HIGH'
+              : 'MEDIUM'
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
+function analystMetricSeries(
+  table,
+  definition,
+  sourceType
+) {
+  const match =
+    analystMetricRow(
+      table,
+      definition
+    );
+
+  if (!match) {
+    return {
+      available: false,
+      sourceType,
+      sourceLabel: null,
+      mappingConfidence: null,
+      values: [],
+      latest: null,
+      previous: null,
+      changePct: null,
+      multiPeriodDirection:
+        'UNAVAILABLE'
+    };
+  }
+
+  const values =
+    (match.row.values || [])
+      .map(
+        item => ({
+          period:
+            item?.period ||
+            null,
+          raw:
+            item?.raw ??
+            null,
+          value:
+            safeNumber(
+              item?.value
+            )
+        })
+      )
+      .filter(
+        item =>
+          item.value !== null
+      );
+
+  const latest =
+    values[0] ||
+    null;
+
+  const previous =
+    values[1] ||
+    null;
+
+  let changePct =
+    null;
+
+  if (
+    latest &&
+    previous &&
+    previous.value !== 0
+  ) {
+    changePct =
+      (
+        latest.value -
+        previous.value
+      ) /
+      Math.abs(
+        previous.value
+      ) *
+      100;
+  }
+
+  let positiveMoves = 0;
+  let negativeMoves = 0;
+
+  for (
+    let index = 0;
+    index < Math.min(
+      values.length - 1,
+      4
+    );
+    index++
+  ) {
+    const newer =
+      values[index]?.value;
+
+    const older =
+      values[index + 1]?.value;
+
+    if (
+      newer === null ||
+      newer === undefined ||
+      older === null ||
+      older === undefined
+    ) {
+      continue;
+    }
+
+    if (newer > older) {
+      positiveMoves++;
+    } else if (newer < older) {
+      negativeMoves++;
+    }
+  }
+
+  let multiPeriodDirection =
+    'MIXED';
+
+  if (
+    values.length < 2
+  ) {
+    multiPeriodDirection =
+      'INSUFFICIENT_HISTORY';
+  } else if (
+    positiveMoves > 0 &&
+    negativeMoves === 0
+  ) {
+    multiPeriodDirection =
+      'IMPROVING';
+  } else if (
+    negativeMoves > 0 &&
+    positiveMoves === 0
+  ) {
+    multiPeriodDirection =
+      'DETERIORATING';
+  } else if (
+    positiveMoves === 0 &&
+    negativeMoves === 0
+  ) {
+    multiPeriodDirection =
+      'STABLE';
+  }
+
+  return {
+    available:
+      Boolean(latest),
+    sourceType,
+    sourceLabel:
+      match.label,
+    mappingConfidence:
+      match.mappingConfidence,
+    values,
+    latest,
+    previous,
+    changePct:
+      decisionRound(
+        changePct,
+        2
+      ),
+    multiPeriodDirection
+  };
+}
+
+function analystResolveMetric(
+  fundamentals,
+  metricKey
+) {
+  const definition =
+    ANALYST_FINANCIAL_METRICS[
+      metricKey
+    ];
+
+  if (!definition) {
+    return {
+      available: false,
+      sourceType: null,
+      sourceLabel: null,
+      mappingConfidence: null,
+      values: [],
+      latest: null,
+      previous: null,
+      changePct: null,
+      multiPeriodDirection:
+        'UNAVAILABLE'
+    };
+  }
+
+  for (
+    const sourceType
+    of definition.sources
+  ) {
+    const table =
+      fundamentals?.[
+        sourceType
+      ] ||
+      null;
+
+    const evidence =
+      analystMetricSeries(
+        table,
+        definition,
+        sourceType
+      );
+
+    if (evidence.available) {
+      return evidence;
+    }
+  }
+
+  return {
+    available: false,
+    sourceType:
+      definition.sources[0] ||
+      null,
+    sourceLabel: null,
+    mappingConfidence: null,
+    values: [],
+    latest: null,
+    previous: null,
+    changePct: null,
+    multiPeriodDirection:
+      'UNAVAILABLE'
+  };
+}
+
+function analystTrendView(
+  evidence,
+  options = {}
+) {
+  if (
+    !evidence?.available ||
+    !evidence.latest
+  ) {
+    return {
+      state: 'UNRELIABLE',
+      reason:
+        'Required financial evidence was not available.'
+    };
+  }
+
+  const latest =
+    safeNumber(
+      evidence.latest.value
+    );
+
+  const changePct =
+    safeNumber(
+      evidence.changePct
+    );
+
+  if (
+    options.requirePositive &&
+    latest !== null &&
+    latest <= 0
+  ) {
+    return {
+      state: 'WEAK',
+      reason:
+        'Latest reported value is not positive.'
+    };
+  }
+
+  if (changePct === null) {
+    return {
+      state: 'UNRELIABLE',
+      reason:
+        'Only one usable reporting period was available.'
+    };
+  }
+
+  if (changePct >= 10) {
+    return {
+      state: 'IMPROVING',
+      reason:
+        'Latest reported value increased materially versus the preceding period.'
+    };
+  }
+
+  if (changePct >= -5) {
+    return {
+      state: 'STABLE',
+      reason:
+        'Latest reported value is broadly stable versus the preceding period.'
+    };
+  }
+
+  return {
+    state: 'DETERIORATING',
+    reason:
+      'Latest reported value declined versus the preceding period.'
+  };
+}
+
+function analystSamePeriodRatio(
+  numerator,
+  denominator
+) {
+  const top =
+    numerator?.latest ||
+    null;
+
+  const bottom =
+    denominator?.latest ||
+    null;
+
+  if (
+    !top ||
+    !bottom ||
+    safeNumber(
+      bottom.value
+    ) === null ||
+    safeNumber(
+      bottom.value
+    ) === 0
+  ) {
+    return null;
+  }
+
+  if (
+    top.period &&
+    bottom.period &&
+    String(top.period) !==
+      String(bottom.period)
+  ) {
+    return null;
+  }
+
+  return decisionRound(
+    safeNumber(
+      top.value
+    ) /
+    Math.abs(
+      safeNumber(
+        bottom.value
+      )
+    ),
+    4
+  );
+}
+
+function analystFinancialSector(
+  fundamentals
+) {
+  const sector =
+    String(
+      fundamentals?.company?.sector ||
+      ''
+    ).toLowerCase();
+
+  return /bank|insurance|modaraba|investment compan|leasing|mutual fund|reit|financial service/
+    .test(sector);
+}
+
+function analystBalanceSheetView(
+  evidence,
+  fundamentals
+) {
+  if (
+    analystFinancialSector(
+      fundamentals
+    )
+  ) {
+    return {
+      state:
+        'SECTOR_MODEL_REQUIRED',
+      reason:
+        'Generic corporate leverage rules are not reliable for financial-sector companies.',
+      debtToEquity:
+        evidence.debtToEquity
+          ?.latest?.value ??
+        null,
+      reportedBorrowingsToEquity:
+        null
+    };
+  }
+
+  const reportedBorrowingsToEquity =
+    analystSamePeriodRatio(
+      evidence.borrowings,
+      evidence.totalEquity
+    );
+
+  if (
+    reportedBorrowingsToEquity !== null
+  ) {
+    return {
+      state:
+        'EVIDENCE_AVAILABLE',
+      reason:
+        'Reported borrowings and equity were both available for the latest matching period. Sector interpretation is still required.',
+      debtToEquity:
+        evidence.debtToEquity
+          ?.latest?.value ??
+        null,
+      reportedBorrowingsToEquity
+    };
+  }
+
+  if (
+    evidence.debtToEquity?.available
+  ) {
+    return {
+      state:
+        'EVIDENCE_AVAILABLE',
+      reason:
+        'PSX ratio evidence includes a debt-to-equity measure. Sector interpretation is still required.',
+      debtToEquity:
+        evidence.debtToEquity
+          .latest?.value ??
+        null,
+      reportedBorrowingsToEquity:
+        null
+    };
+  }
+
+  return {
+    state: 'UNRELIABLE',
+    reason:
+      'Borrowings/equity evidence was not sufficient for a leverage conclusion.',
+    debtToEquity: null,
+    reportedBorrowingsToEquity:
+      null
+  };
+}
+
+function analystCashFlowView(
+  evidence,
+  fundamentals
+) {
+  if (
+    analystFinancialSector(
+      fundamentals
+    )
+  ) {
+    return {
+      state:
+        'SECTOR_MODEL_REQUIRED',
+      reason:
+        'Generic operating-cash-flow conversion is not a suitable quality test for financial-sector companies.',
+      cashConversion:
+        null
+    };
+  }
+
+  const cashConversion =
+    analystSamePeriodRatio(
+      evidence.operatingCashFlow,
+      evidence.profitAfterTax
+    );
+
+  if (cashConversion === null) {
+    return {
+      state: 'UNRELIABLE',
+      reason:
+        'Operating cash flow and profit after tax were not both available for the same period.',
+      cashConversion:
+        null
+    };
+  }
+
+  const operatingCash =
+    safeNumber(
+      evidence.operatingCashFlow
+        ?.latest?.value
+    );
+
+  const pat =
+    safeNumber(
+      evidence.profitAfterTax
+        ?.latest?.value
+    );
+
+  if (
+    pat !== null &&
+    pat > 0 &&
+    operatingCash !== null &&
+    operatingCash <= 0
+  ) {
+    return {
+      state: 'WEAK',
+      reason:
+        'Reported profit is positive while operating cash flow is not positive.',
+      cashConversion
+    };
+  }
+
+  if (cashConversion >= 1) {
+    return {
+      state: 'STRONG',
+      reason:
+        'Operating cash flow covers or exceeds reported profit for the latest matching period.',
+      cashConversion
+    };
+  }
+
+  if (cashConversion >= 0.6) {
+    return {
+      state: 'ACCEPTABLE',
+      reason:
+        'Operating cash flow converts a meaningful portion of reported profit.',
+      cashConversion
+    };
+  }
+
+  return {
+    state: 'QUESTIONABLE',
+    reason:
+      'Operating cash conversion is weak relative to reported profit.',
+    cashConversion
+  };
+}
+
+function analystEarningsQualityView(
+  evidence,
+  fundamentals
+) {
+  if (
+    analystFinancialSector(
+      fundamentals
+    )
+  ) {
+    return {
+      state:
+        'SECTOR_MODEL_REQUIRED',
+      reason:
+        'Financial-sector earnings quality requires sector-specific balance-sheet and provisioning analysis.',
+      otherIncomeShareOfPat:
+        null,
+      exceptionalItemShareOfPat:
+        null
+    };
+  }
+
+  const otherIncomeShareOfPat =
+    analystSamePeriodRatio(
+      evidence.otherIncome,
+      evidence.profitAfterTax
+    );
+
+  const exceptionalItemShareOfPat =
+    analystSamePeriodRatio(
+      evidence.exceptionalItems,
+      evidence.profitAfterTax
+    );
+
+  const cashView =
+    analystCashFlowView(
+      evidence,
+      fundamentals
+    );
+
+  if (
+    exceptionalItemShareOfPat !== null &&
+    Math.abs(
+      exceptionalItemShareOfPat
+    ) >= 0.25
+  ) {
+    return {
+      state: 'QUESTIONABLE',
+      reason:
+        'Exceptional/extraordinary items are material relative to reported profit.',
+      otherIncomeShareOfPat,
+      exceptionalItemShareOfPat
+    };
+  }
+
+  if (
+    otherIncomeShareOfPat !== null &&
+    Math.abs(
+      otherIncomeShareOfPat
+    ) >= 0.5
+  ) {
+    return {
+      state: 'QUESTIONABLE',
+      reason:
+        'Other income is large relative to reported profit and requires manual/sector review.',
+      otherIncomeShareOfPat,
+      exceptionalItemShareOfPat
+    };
+  }
+
+  if (
+    cashView.state === 'STRONG' ||
+    cashView.state === 'ACCEPTABLE'
+  ) {
+    return {
+      state: 'ACCEPTABLE',
+      reason:
+        'No material one-off flag was detected in the available rows and cash conversion is supportive.',
+      otherIncomeShareOfPat,
+      exceptionalItemShareOfPat
+    };
+  }
+
+  if (
+    cashView.state === 'WEAK' ||
+    cashView.state === 'QUESTIONABLE'
+  ) {
+    return {
+      state: 'QUESTIONABLE',
+      reason:
+        'Available cash-flow evidence does not strongly support reported earnings.',
+      otherIncomeShareOfPat,
+      exceptionalItemShareOfPat
+    };
+  }
+
+  return {
+    state: 'UNRELIABLE',
+    reason:
+      'The currently parsed PSX rows are insufficient to validate earnings quality.',
+    otherIncomeShareOfPat,
+    exceptionalItemShareOfPat
+  };
+}
+
+function analystDividendView(
+  evidence,
+  fundamentals
+) {
+  const payout =
+    safeNumber(
+      evidence.payoutRatio
+        ?.latest?.value
+    );
+
+  if (payout !== null) {
+    return {
+      state:
+        'EVIDENCE_AVAILABLE',
+      reason:
+        'A reported payout ratio is available. Sustainability still requires earnings and cash-flow context.',
+      payoutRatio:
+        decisionRound(
+          payout,
+          2
+        ),
+      dividendYield:
+        safeNumber(
+          fundamentals?.valuation
+            ?.dividendYield
+        )
+    };
+  }
+
+  return {
+    state: 'UNRELIABLE',
+    reason:
+      'Dividend yield alone is not sufficient evidence of dividend sustainability.',
+    payoutRatio: null,
+    dividendYield:
+      safeNumber(
+        fundamentals?.valuation
+          ?.dividendYield
+      )
+  };
+}
+
+function analystOverallFinancialView(
+  evidence,
+  views,
+  coveragePct
+) {
+  if (coveragePct < 45) {
+    return {
+      state: 'UNRELIABLE',
+      reason:
+        'Core financial evidence coverage is too low for a dependable general financial verdict.'
+    };
+  }
+
+  const pat =
+    safeNumber(
+      evidence.profitAfterTax
+        ?.latest?.value
+    );
+
+  const eps =
+    safeNumber(
+      evidence.eps
+        ?.latest?.value
+    );
+
+  if (
+    pat !== null &&
+    pat <= 0
+  ) {
+    return {
+      state: 'WEAK',
+      reason:
+        'Latest reported profit after tax is not positive.'
+    };
+  }
+
+  if (
+    eps !== null &&
+    eps <= 0
+  ) {
+    return {
+      state: 'WEAK',
+      reason:
+        'Latest reported EPS is not positive.'
+    };
+  }
+
+  if (
+    views.earningsQuality.state ===
+      'QUESTIONABLE' ||
+    views.cashFlowQuality.state ===
+      'WEAK'
+  ) {
+    return {
+      state: 'MIXED',
+      reason:
+        'Headline profitability is not yet fully supported by the available earnings-quality/cash-flow evidence.'
+    };
+  }
+
+  if (
+    views.profitTrend.state ===
+      'DETERIORATING' ||
+    views.epsTrend.state ===
+      'DETERIORATING'
+  ) {
+    return {
+      state: 'MIXED',
+      reason:
+        'Latest earnings trend has deteriorated versus the preceding period.'
+    };
+  }
+
+  if (
+    views.profitTrend.state ===
+      'IMPROVING' &&
+    views.epsTrend.state ===
+      'IMPROVING' &&
+    (
+      views.earningsQuality.state ===
+        'ACCEPTABLE' ||
+      views.earningsQuality.state ===
+        'SECTOR_MODEL_REQUIRED'
+    )
+  ) {
+    return {
+      state: 'GOOD',
+      reason:
+        'Reported earnings trend is improving, subject to the stated evidence and sector-model limitations.'
+    };
+  }
+
+  return {
+    state: 'MIXED',
+    reason:
+      'Available evidence is usable, but does not support a stronger general financial conclusion yet.'
+  };
+}
+
+function buildFinancialAnalystCore(
+  fundamentals
+) {
+  const evidence = {};
+
+  for (
+    const metricKey
+    of Object.keys(
+      ANALYST_FINANCIAL_METRICS
+    )
+  ) {
+    evidence[metricKey] =
+      analystResolveMetric(
+        fundamentals,
+        metricKey
+      );
+  }
+
+  const coreKeys = [
+    'revenue',
+    'profitAfterTax',
+    'eps',
+    'totalAssets',
+    'totalEquity',
+    'financeCost',
+    'operatingCashFlow',
+    'roe',
+    'netProfitMargin'
+  ];
+
+  const observedCore =
+    coreKeys.filter(
+      key =>
+        evidence[key]
+          ?.available
+    );
+
+  const coveragePct =
+    decisionRound(
+      observedCore.length /
+      coreKeys.length *
+      100,
+      2
+    );
+
+  const views = {
+    revenueTrend:
+      analystTrendView(
+        evidence.revenue
+      ),
+    profitTrend:
+      analystTrendView(
+        evidence.profitAfterTax,
+        {
+          requirePositive: true
+        }
+      ),
+    epsTrend:
+      analystTrendView(
+        evidence.eps,
+        {
+          requirePositive: true
+        }
+      ),
+    marginTrend:
+      analystTrendView(
+        evidence.netProfitMargin
+      ),
+    balanceSheet:
+      analystBalanceSheetView(
+        evidence,
+        fundamentals
+      ),
+    cashFlowQuality:
+      analystCashFlowView(
+        evidence,
+        fundamentals
+      ),
+    earningsQuality:
+      analystEarningsQualityView(
+        evidence,
+        fundamentals
+      ),
+    dividendSustainability:
+      analystDividendView(
+        evidence,
+        fundamentals
+      )
+  };
+
+  const overallFinancialView =
+    analystOverallFinancialView(
+      evidence,
+      views,
+      coveragePct
+    );
+
+  const missingCore =
+    coreKeys.filter(
+      key =>
+        !evidence[key]
+          ?.available
+    );
+
+  const availableMetricCount =
+    Object.values(
+      evidence
+    )
+      .filter(
+        item =>
+          item?.available
+      )
+      .length;
+
+  return {
+    version:
+      'FINANCIAL-ANALYST-0.8.4A',
+    mode:
+      'SHADOW_ONLY',
+    affectsDecision:
+      false,
+    status:
+      coveragePct >= 65
+        ? 'READY_FOR_SHADOW_ANALYSIS'
+        : availableMetricCount > 0
+          ? 'PARTIAL_EVIDENCE'
+          : 'DATA_BLOCKED',
+    company: {
+      symbol:
+        fundamentals?.symbol ||
+        null,
+      name:
+        fundamentals?.company?.name ||
+        null,
+      sector:
+        fundamentals?.company?.sector ||
+        null,
+      financialSector:
+        analystFinancialSector(
+          fundamentals
+        )
+    },
+    coverage: {
+      coreCoveragePct:
+        coveragePct,
+      coreMetricsObserved:
+        observedCore,
+      coreMetricsMissing:
+        missingCore,
+      availableMetricCount,
+      totalMetricDefinitions:
+        Object.keys(
+          ANALYST_FINANCIAL_METRICS
+        ).length,
+      annualPeriods:
+        fundamentals?.annual
+          ?.periods ||
+        [],
+      quarterlyPeriods:
+        fundamentals?.quarterly
+          ?.periods ||
+        [],
+      ratioPeriods:
+        fundamentals?.ratios
+          ?.periods ||
+        []
+    },
+    evidence,
+    views,
+    overallFinancialView,
+    provenance: {
+      source:
+        fundamentals?.source ||
+        null,
+      sourceUrl:
+        fundamentals?.sourceUrl ||
+        null,
+      retrievedAt:
+        fundamentals?.fetchedAt ||
+        null
+    },
+    limitations: [
+      'This build only interprets financial rows that PSX already exposes through NOMAD\'s current company-page parser.',
+      'Missing metrics remain missing; NOMAD does not infer zero values or manufacture financial evidence.',
+      'Cash-flow, leverage and earnings-quality conclusions are limited when PSX does not expose matching rows.',
+      'Sector-specific accounting models are not yet implemented in 0.8.4A.',
+      'This shadow analyst output does not alter the existing 0.8.3.2 decision thresholds or allocations.'
+    ]
+  };
+}
+
 async function getFundamentals(
   stockSymbol
 ) {
@@ -11020,7 +12180,7 @@ async function getFundamentals(
       'PSX company page loaded, but no structured annual, quarterly or ratio table was parsed.';
   }
 
-  return {
+  const fundamentalsResult = {
     symbol,
 
     identity: {
@@ -11162,6 +12322,13 @@ async function getFundamentals(
         null
     }
   };
+
+  fundamentalsResult.analystCore =
+    buildFinancialAnalystCore(
+      fundamentalsResult
+    );
+
+  return fundamentalsResult;
 }
 
 /* =========================================================
@@ -17274,6 +18441,9 @@ async function recordDecisionRun(
                   candidate.fundamental
                     ?.metrics ||
                   {},
+                analystCore:
+                  candidate.analystCore ||
+                  null,
                 fundamentalEvidenceState:
                   candidate.fundamentalEvidenceState ||
                   null,
@@ -17748,6 +18918,9 @@ async function runDecisionLab(
           historicalContext:
             item.historicalContext,
           fundamental,
+          analystCore:
+            fundamentals?.analystCore ||
+            null,
           fundamentalEvidenceState:
             fundamentalEvidence
               .evidenceState,
@@ -18092,6 +19265,168 @@ function runDecisionEngineSelfTests() {
     gemListingInfo.boardType,
     'GEM',
     'GEM fallback board detection must remain intact'
+  );
+
+  const analystSynthetic =
+    buildFinancialAnalystCore({
+      symbol: 'SYNTH',
+      company: {
+        name: 'Synthetic Manufacturing',
+        sector: 'Engineering'
+      },
+      source: 'Synthetic test',
+      sourceUrl: null,
+      fetchedAt:
+        new Date()
+          .toISOString(),
+      valuation: {
+        dividendYield: 5
+      },
+      annual: {
+        periods: [
+          '2026',
+          '2025',
+          '2024'
+        ],
+        rows: [
+          {
+            label: 'Sales',
+            values: [
+              { period: '2026', value: 1200 },
+              { period: '2025', value: 1000 },
+              { period: '2024', value: 900 }
+            ]
+          },
+          {
+            label: 'Profit After Taxation',
+            values: [
+              { period: '2026', value: 150 },
+              { period: '2025', value: 120 },
+              { period: '2024', value: 100 }
+            ]
+          },
+          {
+            label: 'EPS',
+            values: [
+              { period: '2026', value: 15 },
+              { period: '2025', value: 12 },
+              { period: '2024', value: 10 }
+            ]
+          },
+          {
+            label: 'Total Assets',
+            values: [
+              { period: '2026', value: 2000 },
+              { period: '2025', value: 1800 }
+            ]
+          },
+          {
+            label: 'Total Equity',
+            values: [
+              { period: '2026', value: 1000 },
+              { period: '2025', value: 900 }
+            ]
+          },
+          {
+            label: 'Borrowings',
+            values: [
+              { period: '2026', value: 300 },
+              { period: '2025', value: 350 }
+            ]
+          },
+          {
+            label: 'Finance Cost',
+            values: [
+              { period: '2026', value: 40 },
+              { period: '2025', value: 50 }
+            ]
+          },
+          {
+            label: 'Cash Flow From Operating Activities',
+            values: [
+              { period: '2026', value: 180 },
+              { period: '2025', value: 130 }
+            ]
+          },
+          {
+            label: 'Other Income',
+            values: [
+              { period: '2026', value: 10 },
+              { period: '2025', value: 8 }
+            ]
+          }
+        ]
+      },
+      quarterly: null,
+      ratios: {
+        periods: [
+          '2026',
+          '2025'
+        ],
+        rows: [
+          {
+            label: 'Return on Equity',
+            values: [
+              { period: '2026', value: 18 },
+              { period: '2025', value: 15 }
+            ]
+          },
+          {
+            label: 'Net Profit Margin',
+            values: [
+              { period: '2026', value: 12.5 },
+              { period: '2025', value: 12 }
+            ]
+          }
+        ]
+      }
+    });
+
+  assert.equal(
+    analystSynthetic.evidence
+      .revenue.latest.value,
+    1200
+  );
+
+  assert.equal(
+    analystSynthetic.views
+      .profitTrend.state,
+    'IMPROVING'
+  );
+
+  assert.equal(
+    analystSynthetic.views
+      .cashFlowQuality.state,
+    'STRONG'
+  );
+
+  assert.equal(
+    analystSynthetic.affectsDecision,
+    false
+  );
+
+  const analystMissing =
+    buildFinancialAnalystCore({
+      symbol: 'EMPTY',
+      company: {
+        name: 'Empty Evidence',
+        sector: 'Engineering'
+      },
+      annual: null,
+      quarterly: null,
+      ratios: null,
+      valuation: {}
+    });
+
+  assert.equal(
+    analystMissing.status,
+    'DATA_BLOCKED'
+  );
+
+  assert.equal(
+    analystMissing.evidence
+      .operatingCashFlow.available,
+    false
   );
 
   const riskBalanced =
@@ -32691,6 +34026,31 @@ function renderShadowDecision(
                 ?.risks?.[0] ||
               '';
 
+            const analystView =
+              candidate.analystCore
+                ?.overallFinancialView
+                ?.state ||
+              'UNAVAILABLE';
+
+            const analystCoverage =
+              candidate.analystCore
+                ?.coverage
+                ?.coreCoveragePct;
+
+            const earningsQuality =
+              candidate.analystCore
+                ?.views
+                ?.earningsQuality
+                ?.state ||
+              'UNAVAILABLE';
+
+            const cashFlowQuality =
+              candidate.analystCore
+                ?.views
+                ?.cashFlowQuality
+                ?.state ||
+              'UNAVAILABLE';
+
             return (
               '<div class="decisionCandidateRow">' +
               '<div class="decisionSymbol">' +
@@ -32727,6 +34087,28 @@ function renderShadowDecision(
               formatNumber(
                 candidate.dataQuality?.score,
                 0
+              ) +
+              '</div><div class="decisionMinor">Analyst ' +
+              escapeHtml(
+                analystView
+              ) +
+              ' · Core evidence ' +
+              (
+                analystCoverage !== null &&
+                analystCoverage !== undefined
+                  ? formatNumber(
+                      analystCoverage,
+                      0
+                    ) + '%'
+                  : 'N/A'
+              ) +
+              ' · Earnings ' +
+              escapeHtml(
+                earningsQuality
+              ) +
+              ' · Cash ' +
+              escapeHtml(
+                cashFlowQuality
               ) +
               '</div><div class="decisionMinor">' +
               escapeHtml(
