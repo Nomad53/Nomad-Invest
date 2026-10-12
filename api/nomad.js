@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.8.4B.1';
+const VERSION = '0.8.4B.2';
 
 
 const SUPABASE_URL =
@@ -60,6 +60,9 @@ const PSX_ALLSHR_URL =
 
 const PSX_MARKET_WATCH_URL =
   `${PSX_DPS_BASE}/market-watch`;
+
+const PSX_SCREENER_URL =
+  `${PSX_DPS_BASE}/screener/`;
 
 const PSX_CORPORATE_BASE =
   process.env.PSX_CORPORATE_BASE ||
@@ -4264,6 +4267,335 @@ async function loadMarketWatchSnapshot(
   return result;
 }
 
+
+function normalizeOfficialScreenerHeader(
+  value
+) {
+  return String(
+    value || ''
+  )
+    .replace(/\*/g, '')
+    .replace(/\s+/g, ' ')
+    .replace(/\.$/, '')
+    .trim()
+    .toUpperCase();
+}
+
+function officialScreenerColumnIndex(
+  headers,
+  matcher
+) {
+  for (
+    let index = 0;
+    index < headers.length;
+    index += 1
+  ) {
+    if (
+      matcher(
+        normalizeOfficialScreenerHeader(
+          headers[index]
+        )
+      )
+    ) {
+      return index;
+    }
+  }
+
+  return -1;
+}
+
+function parseOfficialPSXScreenerRows(
+  html
+) {
+  const tables =
+    parseHTMLTables(
+      html
+    );
+
+  for (
+    const table
+    of tables
+  ) {
+    const matrix =
+      tableToMatrix(
+        table
+      );
+
+    if (
+      matrix.length < 2
+    ) {
+      continue;
+    }
+
+    const header =
+      matrix[0] || [];
+
+    const symbolIndex =
+      officialScreenerColumnIndex(
+        header,
+        value =>
+          value === 'SYMBOL'
+      );
+
+    const priceIndex =
+      officialScreenerColumnIndex(
+        header,
+        value =>
+          value === 'PRICE'
+      );
+
+    const changeIndex =
+      officialScreenerColumnIndex(
+        header,
+        value =>
+          value === 'CHANGE (%)' ||
+          value === 'CHANGE %' ||
+          value === '% CHANGE' ||
+          value === 'CHANGE'
+      );
+
+    if (
+      symbolIndex < 0 ||
+      priceIndex < 0 ||
+      changeIndex < 0
+    ) {
+      continue;
+    }
+
+    const sectorIndex =
+      officialScreenerColumnIndex(
+        header,
+        value =>
+          value === 'SECTOR'
+      );
+
+    const listedIndex =
+      officialScreenerColumnIndex(
+        header,
+        value =>
+          value === 'LISTED IN'
+      );
+
+    const rows = [];
+
+    for (
+      const sourceRow
+      of matrix.slice(1)
+    ) {
+      const rawSymbol =
+        normalizeRawMarketSymbol(
+          sourceRow[
+            symbolIndex
+          ] || ''
+        );
+
+      const price =
+        safeNumber(
+          sourceRow[
+            priceIndex
+          ]
+        );
+
+      const changePct =
+        safeNumber(
+          sourceRow[
+            changeIndex
+          ]
+        );
+
+      if (
+        !rawSymbol ||
+        price === null ||
+        price <= 0 ||
+        changePct === null
+      ) {
+        continue;
+      }
+
+      rows.push({
+        symbol:
+          rawSymbol,
+        price,
+        changePct,
+        sector:
+          sectorIndex >= 0
+            ? String(
+                sourceRow[
+                  sectorIndex
+                ] || ''
+              ).trim()
+            : '',
+        listedIn:
+          listedIndex >= 0
+            ? String(
+                sourceRow[
+                  listedIndex
+                ] || ''
+              ).trim()
+            : ''
+      });
+    }
+
+    if (
+      rows.length
+    ) {
+      return rows;
+    }
+  }
+
+  return [];
+}
+
+function parseOfficialPSXScreenerAsOf(
+  html
+) {
+  const text =
+    htmlToLines(
+      html
+    )
+      .join(' ');
+
+  const match =
+    text.match(
+      /\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},\s+\d{4}\s+\d{1,2}:\d{2}\s+(?:AM|PM)\b/i
+    );
+
+  if (!match) {
+    return new Date()
+      .toISOString();
+  }
+
+  const parsed =
+    Date.parse(
+      `${match[0]} GMT+0500`
+    );
+
+  return Number.isFinite(
+    parsed
+  )
+    ? new Date(
+        parsed
+      ).toISOString()
+    : new Date()
+        .toISOString();
+}
+
+async function loadOfficialPSXScreenerSnapshot(
+  companyMap
+) {
+  const html =
+    await fetchText(
+      PSX_SCREENER_URL,
+      30000,
+      {
+        Referer:
+          `${PSX_DPS_BASE}/`
+      }
+    );
+
+  const rawRows =
+    parseOfficialPSXScreenerRows(
+      html
+    );
+
+  if (
+    !rawRows.length
+  ) {
+    bad(
+      'Official PSX screener returned no current-session rows.',
+      502
+    );
+  }
+
+  const canonicalRows =
+    new Map();
+
+  for (
+    const row
+    of rawRows
+  ) {
+    const identity =
+      resolveSymbolIdentity(
+        row.symbol,
+        companyMap
+      );
+
+    const symbol =
+      identity.canonicalSymbol ||
+      primaryMarketToken(
+        row.symbol
+      );
+
+    if (!symbol) {
+      continue;
+    }
+
+    const master =
+      getUniverseMasterEntry(
+        symbol
+      );
+
+    const company =
+      companyMap.get(
+        symbol
+      ) || {};
+
+    canonicalRows.set(
+      symbol,
+      {
+        symbol,
+        tradingSymbol:
+          identity.tradingSymbol ||
+          row.symbol,
+        companyName:
+          company.name ||
+          master?.companyName ||
+          symbol,
+        sector:
+          company.sector ||
+          master?.sector ||
+          row.sector ||
+          'Unknown',
+        listedIn:
+          row.listedIn ||
+          master?.listedIn ||
+          '',
+        recommendationEligible:
+          master?.recommendationEligible ===
+          true,
+        price:
+          row.price,
+        changePct:
+          row.changePct
+      }
+    );
+  }
+
+  const rows =
+    [...canonicalRows.values()];
+
+  if (
+    !rows.length
+  ) {
+    bad(
+      'Official PSX screener rows could not be mapped to the NOMAD universe.',
+      502
+    );
+  }
+
+  return {
+    asOf:
+      parseOfficialPSXScreenerAsOf(
+        html
+      ),
+    source:
+      'PSX Data Portal screener',
+    total:
+      rows.length,
+    rows
+  };
+}
+
 async function enrichFromPyPSX(
   map
 ) {
@@ -7182,9 +7514,87 @@ async function loadPSXMarket() {
           )
       );
 
+  let officialScreener =
+    null;
+
   let marketWatch =
     null;
 
+  // The official DPS screener is the primary current-session source for
+  // price and % change. The legacy /market-watch route has changed over
+  // time and must not be allowed to zero-out Home market breadth.
+  try {
+    officialScreener =
+      await loadOfficialPSXScreenerSnapshot(
+        companyMap
+      );
+
+    const officialMap =
+      new Map(
+        (
+          officialScreener.rows ||
+          []
+        ).map(
+          row => [
+            normalizeSymbol(
+              row.symbol
+            ),
+            row
+          ]
+        )
+      );
+
+    for (
+      const stock
+      of stocks
+    ) {
+      const live =
+        officialMap.get(
+          normalizeSymbol(
+            stock.symbol
+          )
+        );
+
+      if (!live) {
+        continue;
+      }
+
+      if (
+        safeNumber(
+          live.price
+        ) !== null &&
+        safeNumber(
+          live.price
+        ) > 0
+      ) {
+        stock.price =
+          safeNumber(
+            live.price
+          );
+      }
+
+      if (
+        safeNumber(
+          live.changePct
+        ) !== null
+      ) {
+        stock.dayChangePct =
+          safeNumber(
+            live.changePct
+          );
+      }
+
+      stock.marketWatchAsOf =
+        officialScreener.asOf;
+
+      stock.sessionChangeSource =
+        officialScreener.source;
+    }
+  } catch {}
+
+  // Keep the legacy market-watch parser as a secondary source for OHLCV
+  // whenever PSX exposes that route. Never overwrite a valid screener
+  // change percentage with null.
   try {
     marketWatch =
       await loadMarketWatchSnapshot(
@@ -7245,10 +7655,16 @@ async function loadPSXMarket() {
           watch.change
         );
 
-      stock.dayChangePct =
+      if (
         safeNumber(
           watch.changePct
-        );
+        ) !== null
+      ) {
+        stock.dayChangePct =
+          safeNumber(
+            watch.changePct
+          );
+      }
 
       stock.sessionOpen =
         safeNumber(
@@ -7272,6 +7688,9 @@ async function loadPSXMarket() {
 
       stock.marketWatchAsOf =
         marketWatch.asOf;
+
+      stock.sessionChangeSource =
+        'PSX market watch';
     }
   } catch {}
 
@@ -7326,7 +7745,23 @@ async function loadPSXMarket() {
 
     marketWatchAsOf:
       marketWatch?.asOf ||
+      officialScreener?.asOf ||
       null,
+
+    sessionChangeSource:
+      marketWatch?.rows?.length
+        ? 'PSX market watch'
+        : officialScreener?.rows?.length
+          ? 'PSX Data Portal screener'
+          : 'screener API fallback',
+
+    sessionChangeCoverage:
+      stocks.filter(
+        stock =>
+          safeNumber(
+            stock.dayChangePct
+          ) !== null
+      ).length,
 
     totalStocks:
       stocks.length,
@@ -22212,29 +22647,32 @@ async function getIntelligenceFeed() {
           moverShape
         );
 
-    const breadth = {
-      advancers:
-        eligible.filter(
-          row =>
-            safeNumber(
-              row.dayChangePct
-            ) > 0
-        ).length,
-      decliners:
-        eligible.filter(
-          row =>
-            safeNumber(
-              row.dayChangePct
-            ) < 0
-        ).length,
-      unchanged:
-        eligible.filter(
-          row =>
-            safeNumber(
-              row.dayChangePct
-            ) === 0
-        ).length
-    };
+    const breadth =
+      eligible.length
+        ? {
+            advancers:
+              eligible.filter(
+                row =>
+                  safeNumber(
+                    row.dayChangePct
+                  ) > 0
+              ).length,
+            decliners:
+              eligible.filter(
+                row =>
+                  safeNumber(
+                    row.dayChangePct
+                  ) < 0
+              ).length,
+            unchanged:
+              eligible.filter(
+                row =>
+                  safeNumber(
+                    row.dayChangePct
+                  ) === 0
+              ).length
+          }
+        : null;
 
     marketPulse = {
       asOf:
@@ -22243,6 +22681,11 @@ async function getIntelligenceFeed() {
       gainers,
       losers,
       breadth,
+      sessionChangeRows:
+        eligible.length,
+      sessionChangeSource:
+        market.sessionChangeSource ||
+        null,
       marketStatus:
         marketStatus ||
         null
@@ -25610,7 +26053,7 @@ Build ${VERSION}
 Market, company metadata, fundamentals, symbol normalization,
 canonical universe identity, metadata, fundamentals and deterministic technical analysis are connected.
 
-Persistent intelligence memory and the market scanner are connected. Build 0.8.4B introduces the dedicated Decision Center, strict analyst-evidence gating, budget-independent opportunity ranking and a separate whole-share allocator. It remains shadow-only.
+Persistent intelligence memory and the market scanner are connected. Build 0.8.4B.2 adds official PSX screener session-change fallback and feed-health transparency while preserving the Decision Center, analyst-evidence gates and shadow-only allocator.
 
 </p>
 
@@ -27118,7 +27561,7 @@ function renderMarketBreadth(
 
   if (!breadth) {
     target.innerHTML =
-      '<div class="terminalEmpty small">Breadth unavailable.</div>';
+      '<div class="terminalEmpty small">Live session change feed unavailable. NOMAD will not display false zero breadth.</div>';
     return;
   }
 
@@ -27142,7 +27585,26 @@ function renderMarketBreadth(
       0
     ) +
     '</strong></div>' +
-    '</div>';
+    '</div>' +
+    (
+      pulse?.sessionChangeSource
+        ? '<div class="sourceNote">Source: ' +
+          escapeHtml(
+            pulse.sessionChangeSource
+          ) +
+          (
+            pulse?.asOf
+              ? ' · ' +
+                escapeHtml(
+                  relativeTime(
+                    pulse.asOf
+                  )
+                )
+              : ''
+          ) +
+          '</div>'
+        : ''
+    );
 }
 
 function portfolioMoney(
