@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.8.5B.2';
+const VERSION = '0.8.5B.3';
 
 
 const SUPABASE_URL =
@@ -26436,6 +26436,48 @@ tbody tr:hover {
   min-width: 230px;
 }
 
+#stocks .exploreTable {
+  font-size: 13px;
+}
+
+#stocks .exploreTable th,
+#stocks .exploreTable td {
+  padding: 9px 10px;
+}
+
+#stocks .exploreTable th {
+  font-size: 11px;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  color: #6d8294;
+}
+
+#stocks .exploreTable .company {
+  min-width: 190px;
+  max-width: 250px;
+}
+
+#stocks .exploreTable td:not(.company) {
+  white-space: nowrap;
+}
+
+.volumeCell {
+  min-width: 92px;
+}
+
+.metricPrimary {
+  display: block;
+  font-weight: 650;
+}
+
+.metricSecondary {
+  display: block;
+  margin-top: 2px;
+  font-size: 10px;
+  color: #718394;
+  font-weight: 400;
+}
+
 .scroll {
   overflow-x: auto;
 }
@@ -29307,7 +29349,7 @@ Search
 <input
   id="search"
   type="search"
-  placeholder="Company, symbol or sector"
+  placeholder="Company or symbol"
 >
 
 </div>
@@ -29358,10 +29400,6 @@ Top losers today
 
 <option value="sessionVolumeDesc">
 Highest live volume
-</option>
-
-<option value="marketCapDesc">
-Largest market cap
 </option>
 
 <option value="changeDesc">
@@ -34411,7 +34449,7 @@ function renderStocks() {
 
   $('stocks')
     .innerHTML =
-      '<table>' +
+      '<table class="exploreTable">' +
 
       '<thead>' +
 
@@ -34419,15 +34457,12 @@ function renderStocks() {
 
       '<th>Symbol</th>' +
       '<th>Company</th>' +
-      '<th>Sector</th>' +
-      '<th>Live Price</th>' +
+      '<th>Price</th>' +
       '<th>Today</th>' +
-      '<th>Live Volume</th>' +
-      '<th>Market Cap</th>' +
+      '<th>Volume</th>' +
       '<th>P/E</th>' +
-      '<th>Dividend Yield</th>' +
-      '<th>30D Avg Volume</th>' +
-      '<th>1Y Change</th>' +
+      '<th>Div Yield</th>' +
+      '<th>1Y</th>' +
 
       '</tr>' +
 
@@ -34488,12 +34523,6 @@ function renderStocks() {
             ) +
             '</td>' +
 
-            '<td>' +
-            escapeHtml(
-              stock.sector
-            ) +
-            '</td>' +
-
             '<td class="' +
             (
               explorePreviousPrices.has(
@@ -34532,42 +34561,41 @@ function renderStocks() {
             (
               stock.dayChangePct === null ||
               stock.dayChangePct === undefined
-                ? 'N/A'
+                ? '—'
                 : formatPercent(
                     stock.dayChangePct
                   )
             ) +
             '</td>' +
 
-            '<td>' +
+            '<td class="volumeCell">' +
+            '<span class="metricPrimary">' +
             (
               stock.sessionVolume === null ||
               stock.sessionVolume === undefined
-                ? 'N/A'
-                : formatNumber(
-                    stock.sessionVolume,
-                    0
+                ? '—'
+                : formatCompactNumber(
+                    stock.sessionVolume
                   )
             ) +
-            '</td>' +
-
-            '<td>' +
+            '</span>' +
+            '<span class="metricSecondary">30D ' +
             (
-              stock.marketCap === null ||
-              stock.marketCap === undefined
-                ? 'N/A'
-                : 'PKR ' +
-                  formatCompactNumber(
-                    stock.marketCap
+              stock.averageVolume30d === null ||
+              stock.averageVolume30d === undefined
+                ? '—'
+                : formatCompactNumber(
+                    stock.averageVolume30d
                   )
             ) +
+            '</span>' +
             '</td>' +
 
             '<td>' +
             (
               stock.peRatio ===
                 null
-                ? 'N/A'
+                ? '—'
                 : formatNumber(
                     stock.peRatio
                   )
@@ -34578,17 +34606,10 @@ function renderStocks() {
             (
               stock.dividendYield ===
                 null
-                ? 'N/A'
+                ? '—'
                 : formatPercent(
                     stock.dividendYield
                   )
-            ) +
-            '</td>' +
-
-            '<td>' +
-            formatNumber(
-              stock.averageVolume30d,
-              0
             ) +
             '</td>' +
 
@@ -38355,18 +38376,13 @@ async function loadExploreMarket(
 
     $('coverage')
       .textContent =
-        result.totalStocks +
-        ' feed securities | Live source: ' +
-        (
-          result.sessionChangeSource ||
-          'PSX market feed'
-        ) +
-        ' | Session coverage ' +
         (
           result.sessionChangeCoverage ||
           0
         ) +
-        ' | Auto-refresh 10 sec | Updated ' +
+        '/' +
+        result.totalStocks +
+        ' live · 10 sec refresh · Updated ' +
         (
           relativeTime(
             result.marketWatchAsOf ||
@@ -41231,4 +41247,3 @@ if (require.main === module) {
       );
   }
 }
-
