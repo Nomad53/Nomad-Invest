@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.8.4B.2';
+const VERSION = '0.8.5A.1';
 
 
 const SUPABASE_URL =
@@ -14291,7 +14291,7 @@ async function supabaseRest(
       'application/json',
 
     'User-Agent':
-      'NOMAD-Invest-Server/0.8.4B'
+      'NOMAD-Invest-Server/0.8.5A'
   };
 
   if (
@@ -16015,6 +16015,854 @@ async function readPortfolioHoldings() {
   }
 }
 
+
+async function readPortfolioTransactions() {
+  try {
+    const rows =
+      await supabaseRest(
+        'portfolio_transactions?select=*&order=trade_date.asc,created_at.asc'
+      );
+
+    return {
+      configured: true,
+      rows:
+        Array.isArray(rows)
+          ? rows
+          : []
+    };
+  } catch (error) {
+    if (
+      String(
+        error.message ||
+        ''
+      )
+        .toLowerCase()
+        .includes(
+          'portfolio_transactions'
+        )
+    ) {
+      return {
+        configured: false,
+        rows: []
+      };
+    }
+
+    throw error;
+  }
+}
+
+function normalizePortfolioTransactionSide(
+  value
+) {
+  const side =
+    String(
+      value ||
+      ''
+    )
+      .trim()
+      .toUpperCase();
+
+  if (
+    [
+      'BUY',
+      'SELL',
+      'DIVIDEND',
+      'OPENING'
+    ].includes(
+      side
+    )
+  ) {
+    return side;
+  }
+
+  return null;
+}
+
+function portfolioTransactionDateValue(
+  row
+) {
+  const primary =
+    Date.parse(
+      row?.trade_date ||
+      ''
+    );
+
+  const secondary =
+    Date.parse(
+      row?.created_at ||
+      ''
+    );
+
+  return [
+    Number.isFinite(primary)
+      ? primary
+      : 0,
+    Number.isFinite(secondary)
+      ? secondary
+      : 0
+  ];
+}
+
+function computePortfolioTransactionLedger(
+  rows
+) {
+  const source =
+    Array.isArray(rows)
+      ? rows
+        .slice()
+        .sort(
+          (
+            a,
+            b
+          ) => {
+            const aDate =
+              portfolioTransactionDateValue(
+                a
+              );
+            const bDate =
+              portfolioTransactionDateValue(
+                b
+              );
+
+            if (
+              aDate[0] !==
+              bDate[0]
+            ) {
+              return aDate[0] -
+                bDate[0];
+            }
+
+            return aDate[1] -
+              bDate[1];
+          }
+        )
+      : [];
+
+  const bySymbol =
+    new Map();
+
+  const invalid = [];
+
+  let realizedPnl = 0;
+  let dividends = 0;
+  let totalFees = 0;
+
+  for (
+    const row
+    of source
+  ) {
+    const symbol =
+      normalizeSymbol(
+        row?.symbol
+      );
+
+    const side =
+      normalizePortfolioTransactionSide(
+        row?.side ||
+        row?.type ||
+        row?.action
+      );
+
+    if (!symbol || !side) {
+      continue;
+    }
+
+    const quantity =
+      Math.max(
+        0,
+        safeNumber(
+          row?.quantity
+        ) ||
+        0
+      );
+
+    const price =
+      Math.max(
+        0,
+        safeNumber(
+          row?.price
+        ) ||
+        0
+      );
+
+    const fees =
+      Math.max(
+        0,
+        safeNumber(
+          row?.fees
+        ) ||
+        0
+      );
+
+    const cashAmount =
+      Math.max(
+        0,
+        safeNumber(
+          row?.cash_amount ??
+          row?.cashAmount
+        ) ||
+        0
+      );
+
+    totalFees +=
+      fees;
+
+    const state =
+      bySymbol.get(
+        symbol
+      ) || {
+        symbol,
+        quantity: 0,
+        costBasis: 0,
+        averageCost: 0,
+        realizedPnl: 0,
+        dividends: 0,
+        fees: 0,
+        openDate: null,
+        transactionCount: 0
+      };
+
+    state.transactionCount +=
+      1;
+
+    state.fees +=
+      fees;
+
+    if (
+      side === 'BUY' ||
+      side === 'OPENING'
+    ) {
+      if (
+        quantity <= 0 ||
+        price < 0
+      ) {
+        invalid.push({
+          symbol,
+          id: row?.id || null,
+          reason:
+            'Buy/opening transaction requires positive quantity and a non-negative price.'
+        });
+        continue;
+      }
+
+      if (
+        state.quantity <=
+        0.00000001
+      ) {
+        state.openDate =
+          row?.trade_date ||
+          state.openDate ||
+          null;
+      }
+
+      state.quantity +=
+        quantity;
+
+      state.costBasis +=
+        quantity *
+        price +
+        fees;
+
+      state.averageCost =
+        state.quantity > 0
+          ? state.costBasis /
+            state.quantity
+          : 0;
+    } else if (
+      side === 'SELL'
+    ) {
+      if (
+        quantity <= 0 ||
+        price < 0
+      ) {
+        invalid.push({
+          symbol,
+          id: row?.id || null,
+          reason:
+            'Sell transaction requires positive quantity and a non-negative price.'
+        });
+        continue;
+      }
+
+      if (
+        quantity -
+          state.quantity >
+        0.00000001
+      ) {
+        invalid.push({
+          symbol,
+          id: row?.id || null,
+          reason:
+            'Sell quantity exceeds the shares available in the NOMAD ledger.'
+        });
+        continue;
+      }
+
+      const averageCost =
+        state.quantity > 0
+          ? state.costBasis /
+            state.quantity
+          : 0;
+
+      const realized =
+        quantity *
+        price -
+        quantity *
+        averageCost -
+        fees;
+
+      state.realizedPnl +=
+        realized;
+
+      realizedPnl +=
+        realized;
+
+      state.quantity -=
+        quantity;
+
+      state.costBasis -=
+        averageCost *
+        quantity;
+
+      if (
+        state.quantity <=
+        0.00000001
+      ) {
+        state.quantity = 0;
+        state.costBasis = 0;
+        state.averageCost = 0;
+        state.openDate = null;
+      } else {
+        state.averageCost =
+          state.costBasis /
+          state.quantity;
+      }
+    } else if (
+      side === 'DIVIDEND'
+    ) {
+      if (
+        cashAmount <= 0
+      ) {
+        invalid.push({
+          symbol,
+          id: row?.id || null,
+          reason:
+            'Dividend transaction requires a positive cash amount.'
+        });
+        continue;
+      }
+
+      state.dividends +=
+        cashAmount;
+
+      dividends +=
+        cashAmount;
+    }
+
+    bySymbol.set(
+      symbol,
+      state
+    );
+  }
+
+  return {
+    bySymbol,
+    invalid,
+    realizedPnl:
+      roundMemoryNumber(
+        realizedPnl,
+        2
+      ) || 0,
+    dividends:
+      roundMemoryNumber(
+        dividends,
+        2
+      ) || 0,
+    totalFees:
+      roundMemoryNumber(
+        totalFees,
+        2
+      ) || 0,
+    transactionCount:
+      source.length
+  };
+}
+
+async function seedOpeningHoldingIntoTransactionLedger(
+  symbol,
+  transactionRows
+) {
+  const normalized =
+    normalizeSymbol(
+      symbol
+    );
+
+  const hasLedgerRows =
+    (transactionRows || [])
+      .some(
+        row =>
+          normalizeSymbol(
+            row?.symbol
+          ) ===
+          normalized
+      );
+
+  if (hasLedgerRows) {
+    return transactionRows;
+  }
+
+  const holdings =
+    await readPortfolioHoldings();
+
+  if (!holdings.configured) {
+    return transactionRows;
+  }
+
+  const existing =
+    holdings.rows.find(
+      row =>
+        normalizeSymbol(
+          row?.symbol
+        ) ===
+        normalized
+    );
+
+  if (!existing) {
+    return transactionRows;
+  }
+
+  const quantity =
+    safeNumber(
+      existing.quantity
+    );
+
+  const averageCost =
+    safeNumber(
+      existing.average_cost
+    );
+
+  if (
+    quantity === null ||
+    quantity <= 0 ||
+    averageCost === null ||
+    averageCost < 0
+  ) {
+    return transactionRows;
+  }
+
+  const rows =
+    await supabaseRest(
+      'portfolio_transactions?select=*',
+      {
+        method: 'POST',
+        prefer:
+          'return=representation',
+        body: {
+          symbol:
+            normalized,
+          side:
+            'OPENING',
+          quantity,
+          price:
+            averageCost,
+          trade_date:
+            existing.purchase_date ||
+            new Date()
+              .toISOString()
+              .slice(0, 10),
+          fees:
+            Math.max(
+              0,
+              safeNumber(
+                existing.fees
+              ) ||
+              0
+            ),
+          cash_amount: 0,
+          notes:
+            'Opening position migrated from the legacy NOMAD holdings table.'
+        }
+      }
+    );
+
+  return [
+    ...(transactionRows || []),
+    ...(
+      Array.isArray(rows)
+        ? rows
+        : []
+    )
+  ];
+}
+
+async function rebuildPortfolioHoldingFromTransactions(
+  symbol
+) {
+  const normalized =
+    normalizeSymbol(
+      symbol
+    );
+
+  const transactions =
+    await readPortfolioTransactions();
+
+  if (!transactions.configured) {
+    return null;
+  }
+
+  const ledger =
+    computePortfolioTransactionLedger(
+      transactions.rows
+    );
+
+  const state =
+    ledger.bySymbol.get(
+      normalized
+    ) ||
+    null;
+
+  if (
+    !state ||
+    state.quantity <= 0
+  ) {
+    try {
+      await deletePortfolioHolding(
+        normalized
+      );
+    } catch {}
+
+    return null;
+  }
+
+  const rows =
+    await supabaseRest(
+      'portfolio_holdings?on_conflict=symbol&select=*',
+      {
+        method: 'POST',
+        prefer:
+          'resolution=merge-duplicates,return=representation',
+        body: {
+          symbol:
+            normalized,
+          quantity:
+            roundMemoryNumber(
+              state.quantity,
+              6
+            ),
+          average_cost:
+            roundMemoryNumber(
+              state.averageCost,
+              6
+            ),
+          purchase_date:
+            state.openDate ||
+            null,
+          fees: 0,
+          notes:
+            'Derived from NOMAD transaction ledger.'
+        }
+      }
+    );
+
+  return Array.isArray(rows)
+    ? rows[0] || null
+    : null;
+}
+
+async function savePortfolioTransaction(
+  input
+) {
+  const transactionResult =
+    await readPortfolioTransactions();
+
+  if (!transactionResult.configured) {
+    bad(
+      'Portfolio transaction ledger is not configured. Run the 0.8.5A portfolio ledger SQL migration in Supabase first.',
+      503
+    );
+  }
+
+  const symbol =
+    normalizeSymbol(
+      input?.symbol
+    );
+
+  const side =
+    normalizePortfolioTransactionSide(
+      input?.side ||
+      input?.type ||
+      input?.action
+    );
+
+  if (!symbol) {
+    bad(
+      'Enter a PSX symbol.'
+    );
+  }
+
+  if (!getUniverseMasterEntry(symbol)) {
+    bad(
+      'Symbol is not present in the canonical NOMAD universe.',
+      404
+    );
+  }
+
+  if (
+    !side ||
+    side === 'OPENING'
+  ) {
+    bad(
+      'Transaction type must be BUY, SELL or DIVIDEND.'
+    );
+  }
+
+  const quantity =
+    Math.max(
+      0,
+      safeNumber(
+        input?.quantity
+      ) ||
+      0
+    );
+
+  const price =
+    Math.max(
+      0,
+      safeNumber(
+        input?.price
+      ) ||
+      0
+    );
+
+  const fees =
+    Math.max(
+      0,
+      safeNumber(
+        input?.fees
+      ) ||
+      0
+    );
+
+  const cashAmount =
+    Math.max(
+      0,
+      safeNumber(
+        input?.cash_amount ??
+        input?.cashAmount
+      ) ||
+      0
+    );
+
+  if (
+    (
+      side === 'BUY' ||
+      side === 'SELL'
+    ) &&
+    (
+      quantity <= 0 ||
+      price <= 0
+    )
+  ) {
+    bad(
+      'BUY and SELL transactions require a positive quantity and price.'
+    );
+  }
+
+  if (
+    side === 'DIVIDEND' &&
+    cashAmount <= 0
+  ) {
+    bad(
+      'Dividend transaction requires a positive cash amount.'
+    );
+  }
+
+  const tradeDate =
+    String(
+      input?.trade_date ||
+      input?.tradeDate ||
+      new Date()
+        .toISOString()
+        .slice(0, 10)
+    )
+      .trim();
+
+  let transactionRows =
+    await seedOpeningHoldingIntoTransactionLedger(
+      symbol,
+      transactionResult.rows
+    );
+
+  const proposed = {
+    id: '__PROPOSED__',
+    symbol,
+    side,
+    quantity,
+    price,
+    trade_date:
+      tradeDate,
+    fees,
+    cash_amount:
+      cashAmount,
+    created_at:
+      new Date()
+        .toISOString()
+  };
+
+  const validationLedger =
+    computePortfolioTransactionLedger([
+      ...transactionRows,
+      proposed
+    ]);
+
+  const proposedInvalid =
+    validationLedger.invalid.find(
+      item =>
+        item.id ===
+        '__PROPOSED__'
+    );
+
+  if (proposedInvalid) {
+    bad(
+      proposedInvalid.reason
+    );
+  }
+
+  const rows =
+    await supabaseRest(
+      'portfolio_transactions?select=*',
+      {
+        method: 'POST',
+        prefer:
+          'return=representation',
+        body: {
+          symbol,
+          side,
+          quantity:
+            side === 'DIVIDEND'
+              ? 0
+              : quantity,
+          price:
+            side === 'DIVIDEND'
+              ? 0
+              : price,
+          trade_date:
+            tradeDate,
+          fees,
+          cash_amount:
+            side === 'DIVIDEND'
+              ? cashAmount
+              : 0,
+          notes:
+            String(
+              input?.notes ||
+              ''
+            ).trim() ||
+            null
+        }
+      }
+    );
+
+  const saved =
+    Array.isArray(rows)
+      ? rows[0] || null
+      : null;
+
+  const holding =
+    await rebuildPortfolioHoldingFromTransactions(
+      symbol
+    );
+
+  return {
+    transaction:
+      saved,
+    holding
+  };
+}
+
+async function deletePortfolioTransaction(
+  transactionId
+) {
+  const id =
+    String(
+      transactionId ||
+      ''
+    ).trim();
+
+  if (!id) {
+    bad(
+      'Transaction ID is required.'
+    );
+  }
+
+  const rows =
+    await supabaseRest(
+      'portfolio_transactions?id=eq.' +
+      encodeURIComponent(id) +
+      '&select=*'
+    );
+
+  const row =
+    Array.isArray(rows)
+      ? rows[0] || null
+      : null;
+
+  if (!row) {
+    bad(
+      'Portfolio transaction was not found.',
+      404
+    );
+  }
+
+  if (
+    normalizePortfolioTransactionSide(
+      row.side
+    ) === 'OPENING'
+  ) {
+    bad(
+      'Opening-balance transactions cannot be deleted directly. Edit/remove the opening holding instead.'
+    );
+  }
+
+  await supabaseRest(
+    'portfolio_transactions?id=eq.' +
+    encodeURIComponent(id),
+    {
+      method: 'DELETE',
+      prefer: 'return=minimal'
+    }
+  );
+
+  await rebuildPortfolioHoldingFromTransactions(
+    row.symbol
+  );
+
+  return {
+    status: 'OK',
+    id,
+    symbol:
+      normalizeSymbol(
+        row.symbol
+      )
+  };
+}
+
+async function readLatestDecisionResult() {
+  try {
+    const rows =
+      await supabaseRest(
+        'decision_runs?select=raw_result,created_at&order=created_at.desc&limit=1'
+      );
+
+    return Array.isArray(rows) &&
+      rows.length
+        ? rows[0]
+        : null;
+  } catch {
+    return null;
+  }
+}
+
 async function savePortfolioHolding(
   input
 ) {
@@ -16251,24 +17099,129 @@ async function refreshHistoricalSituation(
 }
 
 async function getPortfolioSnapshot() {
-  const holdingsResult =
-    await readPortfolioHoldings();
+  const [
+    holdingsResult,
+    transactionResult,
+    latestDecision
+  ] =
+    await Promise.all([
+      readPortfolioHoldings(),
+      readPortfolioTransactions(),
+      readLatestDecisionResult()
+    ]);
 
   if (!holdingsResult.configured) {
     return {
       configured: false,
+      ledgerConfigured:
+        transactionResult.configured,
       holdings: [],
-      summary: null
+      transactions: [],
+      summary: null,
+      health: null
     };
   }
 
+  const ledger =
+    transactionResult.configured
+      ? computePortfolioTransactionLedger(
+          transactionResult.rows
+        )
+      : {
+          bySymbol:
+            new Map(),
+          invalid: [],
+          realizedPnl: 0,
+          dividends: 0,
+          totalFees: 0,
+          transactionCount: 0
+        };
+
+  const holdingMap =
+    new Map();
+
+  for (
+    const holding
+    of holdingsResult.rows
+  ) {
+    const symbol =
+      normalizeSymbol(
+        holding.symbol
+      );
+
+    if (!symbol) {
+      continue;
+    }
+
+    holdingMap.set(
+      symbol,
+      {
+        ...holding,
+        ledgerBacked: false
+      }
+    );
+  }
+
+  if (transactionResult.configured) {
+    for (
+      const [
+        symbol,
+        state
+      ]
+      of ledger.bySymbol.entries()
+    ) {
+      if (
+        state.quantity <= 0
+      ) {
+        continue;
+      }
+
+      holdingMap.set(
+        symbol,
+        {
+          id:
+            holdingMap.get(
+              symbol
+            )?.id ||
+            null,
+          symbol,
+          quantity:
+            state.quantity,
+          average_cost:
+            state.averageCost,
+          purchase_date:
+            state.openDate,
+          fees: 0,
+          notes:
+            'Derived from NOMAD transaction ledger.',
+          ledgerBacked: true
+        }
+      );
+    }
+  }
+
   const holdings =
-    holdingsResult.rows;
+    Array.from(
+      holdingMap.values()
+    );
 
   if (!holdings.length) {
     return {
       configured: true,
+      ledgerConfigured:
+        transactionResult.configured,
+      ledgerMode:
+        transactionResult.configured
+          ? 'TRANSACTION_LEDGER'
+          : 'HOLDINGS_ONLY',
       holdings: [],
+      transactions:
+        transactionResult.configured
+          ? transactionResult.rows
+            .slice()
+            .reverse()
+            .slice(0, 20)
+          : [],
       summary: {
         holdings: 0,
         currentValue: 0,
@@ -16276,7 +17229,30 @@ async function getPortfolioSnapshot() {
         totalPnl: 0,
         totalPnlPct: null,
         dayPnl: 0,
-        dayPnlPct: null
+        dayPnlPct: null,
+        realizedPnl:
+          ledger.realizedPnl || 0,
+        dividends:
+          ledger.dividends || 0,
+        netPnl:
+          (
+            ledger.realizedPnl ||
+            0
+          ) +
+          (
+            ledger.dividends ||
+            0
+          ),
+        transactionCount:
+          ledger.transactionCount || 0
+      },
+      health: {
+        state: 'EMPTY',
+        concentration: 'N/A',
+        largestPositionPct: null,
+        largestPositionSymbol: null,
+        sectorCount: 0,
+        sectors: []
       }
     };
   }
@@ -16310,6 +17286,78 @@ async function getPortfolioSnapshot() {
         ]
       )
     );
+
+  const decisionMap =
+    new Map();
+
+  const decisionRaw =
+    latestDecision?.raw_result ||
+    null;
+
+  if (decisionRaw?.opportunityBoard) {
+    const groups = [
+      [
+        'PRIORITY_1',
+        decisionRaw.opportunityBoard.priority1 || []
+      ],
+      [
+        'PRIORITY_2',
+        decisionRaw.opportunityBoard.priority2 || []
+      ],
+      [
+        'RESEARCH_REQUIRED',
+        decisionRaw.opportunityBoard.researchRequired || []
+      ],
+      [
+        'AVOID',
+        decisionRaw.opportunityBoard.avoid || []
+      ]
+    ];
+
+    for (
+      const [bucket, rows]
+      of groups
+    ) {
+      for (
+        const row
+        of rows
+      ) {
+        const symbol =
+          normalizeSymbol(
+            row.symbol
+          );
+
+        if (!symbol) {
+          continue;
+        }
+
+        decisionMap.set(
+          symbol,
+          {
+            bucket,
+            view:
+              row.decisionCenterView ||
+              row.action ||
+              (
+                bucket === 'PRIORITY_2'
+                  ? 'WATCH'
+                  : bucket === 'AVOID'
+                    ? 'AVOID'
+                    : bucket === 'RESEARCH_REQUIRED'
+                      ? 'RESEARCH_REQUIRED'
+                      : 'MONITOR'
+              ),
+            reason:
+              row.reason ||
+              null,
+            asOf:
+              latestDecision.created_at ||
+              null
+          }
+        );
+      }
+    }
+  }
 
   const enriched = [];
 
@@ -16385,10 +17433,12 @@ async function getPortfolioSnapshot() {
       0;
 
     const fees =
-      safeNumber(
-        holding.fees
-      ) ||
-      0;
+      holding.ledgerBacked
+        ? 0
+        : safeNumber(
+            holding.fees
+          ) ||
+          0;
 
     const currentPrice =
       safeNumber(
@@ -16435,6 +17485,30 @@ async function getPortfolioSnapshot() {
           quantity
         : null;
 
+    const dayPnlPct =
+      previousClose !== null &&
+      previousClose > 0 &&
+      currentPrice !== null
+        ? (
+            currentPrice -
+            previousClose
+          ) /
+          previousClose *
+          100
+        : null;
+
+    const ledgerState =
+      ledger.bySymbol.get(
+        symbol
+      ) ||
+      null;
+
+    const decisionState =
+      decisionMap.get(
+        symbol
+      ) ||
+      null;
+
     enriched.push({
       id:
         holding.id,
@@ -16451,16 +17525,39 @@ async function getPortfolioSnapshot() {
           symbol
         )?.sector ||
         'Unknown',
-      quantity,
-      averageCost,
-      fees,
+      quantity:
+        roundMemoryNumber(
+          quantity,
+          6
+        ),
+      averageCost:
+        roundMemoryNumber(
+          averageCost,
+          4
+        ),
+      fees:
+        roundMemoryNumber(
+          fees,
+          2
+        ),
       purchaseDate:
         holding.purchase_date ||
+        ledgerState?.openDate ||
         null,
-      currentPrice,
+      currentPrice:
+        roundMemoryNumber(
+          currentPrice,
+          4
+        ),
+      previousClose:
+        roundMemoryNumber(
+          previousClose,
+          4
+        ),
       dayChangePct:
         roundMemoryNumber(
-          marketRow?.dayChangePct,
+          marketRow?.dayChangePct ??
+          dayPnlPct,
           2
         ),
       investedCost:
@@ -16488,11 +17585,45 @@ async function getPortfolioSnapshot() {
           dayPnl,
           2
         ),
+      dayPnlPct:
+        roundMemoryNumber(
+          dayPnlPct,
+          2
+        ),
       historicalContext:
         historicalContext ||
         null,
       currentView:
         memory?.current_view ||
+        null,
+      ledgerBacked:
+        holding.ledgerBacked === true,
+      transactionCount:
+        ledgerState?.transactionCount ||
+        0,
+      realizedPnl:
+        roundMemoryNumber(
+          ledgerState?.realizedPnl,
+          2
+        ) ||
+        0,
+      dividends:
+        roundMemoryNumber(
+          ledgerState?.dividends,
+          2
+        ) ||
+        0,
+      nomadView:
+        decisionState?.view ||
+        'MONITOR',
+      nomadBucket:
+        decisionState?.bucket ||
+        null,
+      nomadReason:
+        decisionState?.reason ||
+        null,
+      nomadDecisionAsOf:
+        decisionState?.asOf ||
         null
     });
   }
@@ -16535,7 +17666,16 @@ async function getPortfolioSnapshot() {
         investedCost: 0,
         currentValue: 0,
         totalPnl: 0,
-        dayPnl: 0
+        dayPnl: 0,
+        realizedPnl:
+          ledger.realizedPnl ||
+          0,
+        dividends:
+          ledger.dividends ||
+          0,
+        transactionCount:
+          ledger.transactionCount ||
+          0
       }
     );
 
@@ -16557,6 +17697,11 @@ async function getPortfolioSnapshot() {
         100
       : null;
 
+  summary.netPnl =
+    summary.totalPnl +
+    summary.realizedPnl +
+    summary.dividends;
+
   for (
     const key
     of [
@@ -16565,7 +17710,10 @@ async function getPortfolioSnapshot() {
       'totalPnl',
       'dayPnl',
       'totalPnlPct',
-      'dayPnlPct'
+      'dayPnlPct',
+      'realizedPnl',
+      'dividends',
+      'netPnl'
     ]
   ) {
     summary[key] =
@@ -16575,14 +17723,203 @@ async function getPortfolioSnapshot() {
       );
   }
 
+  const sectorMap =
+    new Map();
+
+  for (
+    const item
+    of enriched
+  ) {
+    const value =
+      safeNumber(
+        item.currentValue
+      ) ||
+      0;
+
+    item.weightPct =
+      summary.currentValue > 0
+        ? roundMemoryNumber(
+            value /
+            summary.currentValue *
+            100,
+            2
+          )
+        : null;
+
+    sectorMap.set(
+      item.sector,
+      (
+        sectorMap.get(
+          item.sector
+        ) ||
+        0
+      ) +
+      value
+    );
+  }
+
+  const sectors =
+    Array.from(
+      sectorMap.entries()
+    )
+      .map(
+        ([sector, value]) => ({
+          sector,
+          value:
+            roundMemoryNumber(
+              value,
+              2
+            ),
+          weightPct:
+            summary.currentValue > 0
+              ? roundMemoryNumber(
+                  value /
+                  summary.currentValue *
+                  100,
+                  2
+                )
+              : 0
+        })
+      )
+      .sort(
+        (
+          a,
+          b
+        ) =>
+          b.weightPct -
+          a.weightPct
+      );
+
+  const largest =
+    enriched
+      .slice()
+      .sort(
+        (
+          a,
+          b
+        ) =>
+          (
+            b.weightPct ||
+            0
+          ) -
+          (
+            a.weightPct ||
+            0
+          )
+      )[0] ||
+    null;
+
+  const largestSector =
+    sectors[0] ||
+    null;
+
+  let concentration =
+    'GOOD';
+
+  if (
+    (
+      largest?.weightPct ||
+      0
+    ) > 45 ||
+    (
+      largestSector?.weightPct ||
+      0
+    ) > 60
+  ) {
+    concentration =
+      'HIGH';
+  } else if (
+    (
+      largest?.weightPct ||
+      0
+    ) > 30 ||
+    (
+      largestSector?.weightPct ||
+      0
+    ) > 45
+  ) {
+    concentration =
+      'WATCH';
+  }
+
+  const health = {
+    state:
+      concentration === 'HIGH'
+        ? 'MEDIUM-HIGH RISK'
+        : concentration === 'WATCH'
+          ? 'MEDIUM RISK'
+          : 'BALANCED',
+    concentration,
+    largestPositionPct:
+      largest?.weightPct ??
+      null,
+    largestPositionSymbol:
+      largest?.symbol ||
+      null,
+    largestSector:
+      largestSector?.sector ||
+      null,
+    largestSectorPct:
+      largestSector?.weightPct ??
+      null,
+    sectorCount:
+      sectors.length,
+    sectors
+  };
+
+  const recentTransactions =
+    transactionResult.configured
+      ? transactionResult.rows
+        .slice()
+        .sort(
+          (
+            a,
+            b
+          ) => {
+            const aDate =
+              portfolioTransactionDateValue(
+                a
+              );
+            const bDate =
+              portfolioTransactionDateValue(
+                b
+              );
+
+            if (
+              aDate[0] !==
+              bDate[0]
+            ) {
+              return bDate[0] -
+                aDate[0];
+            }
+
+            return bDate[1] -
+              aDate[1];
+          }
+        )
+        .slice(0, 25)
+      : [];
+
   return {
     configured: true,
+    ledgerConfigured:
+      transactionResult.configured,
+    ledgerMode:
+      transactionResult.configured
+        ? 'TRANSACTION_LEDGER'
+        : 'HOLDINGS_ONLY',
+    ledgerWarnings:
+      ledger.invalid ||
+      [],
     asOf:
       market.marketWatchAsOf ||
       market.asOf,
     summary,
+    health,
     holdings:
-      enriched
+      enriched,
+    transactions:
+      recentTransactions
   };
 }
 
@@ -16642,7 +17979,7 @@ async function readJsonRequestBody(
 }
 
 /* =========================================================
-   DECISION LAB + DECISION CENTER - BUILD 0.8.4B.1
+   DECISION LAB + DECISION CENTER + PORTFOLIO AWARENESS - BUILD 0.8.5A
    Experimental shadow engine. No automatic trading.
 ========================================================= */
 
@@ -18502,10 +19839,139 @@ function buildDecisionOpportunityBoard(
   };
 }
 
+
+async function buildDecisionPortfolioContext(
+  market
+) {
+  try {
+    const holdings =
+      await readPortfolioHoldings();
+
+    if (
+      !holdings.configured ||
+      !holdings.rows.length
+    ) {
+      return {
+        configured:
+          holdings.configured,
+        holdingCount: 0,
+        currentValuePkr: 0,
+        symbolValues: {},
+        sectorValues: {}
+      };
+    }
+
+    const marketMap =
+      new Map(
+        (market?.stocks || [])
+          .map(
+            row => [
+              normalizeSymbol(
+                row.symbol
+              ),
+              row
+            ]
+          )
+      );
+
+    const symbolValues = {};
+    const sectorValues = {};
+    let currentValuePkr = 0;
+
+    for (
+      const holding
+      of holdings.rows
+    ) {
+      const symbol =
+        normalizeSymbol(
+          holding.symbol
+        );
+
+      const quantity =
+        safeNumber(
+          holding.quantity
+        ) ||
+        0;
+
+      const marketRow =
+        marketMap.get(
+          symbol
+        ) ||
+        null;
+
+      const price =
+        safeNumber(
+          marketRow?.price
+        );
+
+      if (
+        !symbol ||
+        quantity <= 0 ||
+        price === null ||
+        price <= 0
+      ) {
+        continue;
+      }
+
+      const value =
+        quantity *
+        price;
+
+      const sector =
+        marketRow?.sector ||
+        getUniverseMasterEntry(
+          symbol
+        )?.sector ||
+        'Unknown';
+
+      symbolValues[symbol] =
+        (
+          symbolValues[symbol] ||
+          0
+        ) +
+        value;
+
+      sectorValues[sector] =
+        (
+          sectorValues[sector] ||
+          0
+        ) +
+        value;
+
+      currentValuePkr +=
+        value;
+    }
+
+    return {
+      configured: true,
+      holdingCount:
+        Object.keys(
+          symbolValues
+        ).length,
+      currentValuePkr:
+        decisionRound(
+          currentValuePkr,
+          2
+        ),
+      symbolValues,
+      sectorValues
+    };
+  } catch {
+    return {
+      configured: false,
+      holdingCount: 0,
+      currentValuePkr: 0,
+      symbolValues: {},
+      sectorValues: {}
+    };
+  }
+}
+
 function allocateDecisionCenterOpportunities(
   opportunityBoard,
   amount,
-  riskPolicy
+  riskPolicy,
+  portfolioContext = null
 ) {
   const budgetPaisa =
     Math.max(
@@ -18521,6 +19987,33 @@ function allocateDecisionCenterOpportunities(
       budgetPaisa *
       DECISION_CENTER_MAX_DEPLOYMENT_PCT
     );
+
+  const existingPortfolioValuePaisa =
+    Math.max(
+      0,
+      Math.round(
+        (
+          safeNumber(
+            portfolioContext
+              ?.currentValuePkr
+          ) ||
+          0
+        ) *
+        100
+      )
+    );
+
+  const postFundingCapitalBasePaisa =
+    existingPortfolioValuePaisa +
+    budgetPaisa;
+
+  const existingSymbolValues =
+    portfolioContext?.symbolValues ||
+    {};
+
+  const existingSectorValues =
+    portfolioContext?.sectorValues ||
+    {};
 
   const candidates =
     (opportunityBoard?.all || [])
@@ -18561,6 +20054,16 @@ function allocateDecisionCenterOpportunities(
       deploymentCapPct:
         DECISION_CENTER_MAX_DEPLOYMENT_PCT *
         100,
+      portfolioAware:
+        Boolean(
+          portfolioContext?.holdingCount
+        ),
+      existingPortfolioValuePkr:
+        decisionRound(
+          existingPortfolioValuePaisa /
+          100,
+          2
+        ),
       unfundedPriorityOne: []
     };
   }
@@ -18638,9 +20141,22 @@ function allocateDecisionCenterOpportunities(
         strengthTotal
       );
 
-    const stockCap =
+    const existingStockValuePaisa =
+      Math.round(
+        (
+          safeNumber(
+            existingSymbolValues[
+              candidate.symbol
+            ]
+          ) ||
+          0
+        ) *
+        100
+      );
+
+    const stockTotalCap =
       Math.floor(
-        budgetPaisa *
+        postFundingCapitalBasePaisa *
         riskPolicy.maxStockPct *
         (
           candidate.decisionCenterView ===
@@ -18650,16 +20166,40 @@ function allocateDecisionCenterOpportunities(
         )
       );
 
+    const stockCap =
+      Math.max(
+        0,
+        stockTotalCap -
+        existingStockValuePaisa
+      );
+
     const existingSectorSpent =
       sectorSpent.get(
         candidate.sector
       ) ||
       0;
 
+    const existingSectorValuePaisa =
+      Math.round(
+        (
+          safeNumber(
+            existingSectorValues[
+              candidate.sector
+            ]
+          ) ||
+          0
+        ) *
+        100
+      );
+
     const sectorCap =
-      Math.floor(
-        budgetPaisa *
-        riskPolicy.maxSectorPct
+      Math.max(
+        0,
+        Math.floor(
+          postFundingCapitalBasePaisa *
+          riskPolicy.maxSectorPct
+        ) -
+        existingSectorValuePaisa
       );
 
     const allowed =
@@ -18798,9 +20338,22 @@ function allocateDecisionCenterOpportunities(
             )
           : 0;
 
-      const stockCap =
+      const existingStockValuePaisa =
+        Math.round(
+          (
+            safeNumber(
+              existingSymbolValues[
+                candidate.symbol
+              ]
+            ) ||
+            0
+          ) *
+          100
+        );
+
+      const stockTotalCap =
         Math.floor(
-          budgetPaisa *
+          postFundingCapitalBasePaisa *
           riskPolicy.maxStockPct *
           (
             candidate.decisionCenterView ===
@@ -18810,16 +20363,40 @@ function allocateDecisionCenterOpportunities(
           )
         );
 
+      const stockCap =
+        Math.max(
+          0,
+          stockTotalCap -
+          existingStockValuePaisa
+        );
+
       const sectorCurrent =
         sectorSpent.get(
           candidate.sector
         ) ||
         0;
 
+      const existingSectorValuePaisa =
+        Math.round(
+          (
+            safeNumber(
+              existingSectorValues[
+                candidate.sector
+              ]
+            ) ||
+            0
+          ) *
+          100
+        );
+
       const sectorCap =
-        Math.floor(
-          budgetPaisa *
-          riskPolicy.maxSectorPct
+        Math.max(
+          0,
+          Math.floor(
+            postFundingCapitalBasePaisa *
+            riskPolicy.maxSectorPct
+          ) -
+          existingSectorValuePaisa
         );
 
       if (
@@ -18947,7 +20524,9 @@ function allocateDecisionCenterOpportunities(
           price:
             candidate.price,
           reason:
-            'Priority 1 remains valid, but the entered amount and current position/sector caps could not fit one whole share.'
+            Boolean(portfolioContext?.holdingCount)
+              ? 'Priority 1 remains valid, but the entered amount plus your existing stock/sector exposure could not fit one whole share within portfolio limits.'
+              : 'Priority 1 remains valid, but the entered amount and current position/sector caps could not fit one whole share.'
       }));
 
   return {
@@ -18980,6 +20559,16 @@ function allocateDecisionCenterOpportunities(
     deploymentCapPct:
       DECISION_CENTER_MAX_DEPLOYMENT_PCT *
       100,
+    portfolioAware:
+      Boolean(
+        portfolioContext?.holdingCount
+      ),
+    existingPortfolioValuePkr:
+      decisionRound(
+        existingPortfolioValuePaisa /
+        100,
+        2
+      ),
     unfundedPriorityOne
   };
 }
@@ -20490,11 +22079,17 @@ async function runDecisionLab(
       candidates
     );
 
+  const portfolioContext =
+    await buildDecisionPortfolioContext(
+      market
+    );
+
   const allocation =
     allocateDecisionCenterOpportunities(
       opportunityBoard,
       amount,
-      riskPolicy
+      riskPolicy,
+      portfolioContext
     );
 
   let action = 'WATCH';
@@ -20725,8 +22320,22 @@ async function runDecisionLab(
     allocationDiagnostics: {
       deploymentCapPct:
         allocation.deploymentCapPct,
+      portfolioAware:
+        allocation.portfolioAware ===
+          true,
+      existingPortfolioValuePkr:
+        allocation.existingPortfolioValuePkr ||
+        0,
       unfundedPriorityOne:
         allocation.unfundedPriorityOne
+    },
+    portfolioContext: {
+      holdingCount:
+        portfolioContext.holdingCount ||
+        0,
+      currentValuePkr:
+        portfolioContext.currentValuePkr ||
+        0
     },
     candidates,
     exclusions: {
@@ -21351,6 +22960,78 @@ function runDecisionEngineSelfTests() {
         item.shares > 0
     ),
     'Decision Center allocation must use positive whole shares'
+  );
+
+  const ledgerSynthetic =
+    computePortfolioTransactionLedger([
+      { id: 1, symbol: 'VALID', side: 'BUY', quantity: 100, price: 10, fees: 10, trade_date: '2026-01-01' },
+      { id: 2, symbol: 'VALID', side: 'BUY', quantity: 50, price: 12, fees: 0, trade_date: '2026-02-01' },
+      { id: 3, symbol: 'VALID', side: 'SELL', quantity: 50, price: 15, fees: 5, trade_date: '2026-03-01' },
+      { id: 4, symbol: 'VALID', side: 'DIVIDEND', quantity: 0, price: 0, cash_amount: 100, fees: 0, trade_date: '2026-04-01' }
+    ]);
+
+  assert.equal(
+    Math.round(
+      ledgerSynthetic.bySymbol
+        .get('VALID')
+        .quantity
+    ),
+    100,
+    'portfolio ledger must preserve the correct open share quantity after buys and sells'
+  );
+
+  assert.ok(
+    ledgerSynthetic.realizedPnl >
+      200 &&
+    ledgerSynthetic.realizedPnl <
+      210,
+    'portfolio ledger must calculate average-cost realized P&L after fees'
+  );
+
+  assert.equal(
+    ledgerSynthetic.dividends,
+    100,
+    'portfolio ledger must track dividend cash separately from trading P&L'
+  );
+
+  const oversellSynthetic =
+    computePortfolioTransactionLedger([
+      { id: 1, symbol: 'VALID', side: 'BUY', quantity: 10, price: 10, fees: 0, trade_date: '2026-01-01' },
+      { id: 2, symbol: 'VALID', side: 'SELL', quantity: 11, price: 12, fees: 0, trade_date: '2026-01-02' }
+    ]);
+
+  assert.equal(
+    oversellSynthetic.invalid.length,
+    1,
+    'portfolio ledger must reject a sell that exceeds available shares'
+  );
+
+  const portfolioAwareAllocation =
+    allocateDecisionCenterOpportunities(
+      syntheticBoard,
+      5000,
+      riskBalanced,
+      {
+        holdingCount: 1,
+        currentValuePkr: 10000,
+        symbolValues: { VALID: 7000 },
+        sectorValues: { Engineering: 7000 }
+      }
+    );
+
+  assert.equal(
+    portfolioAwareAllocation.portfolioAware,
+    true,
+    'Decision Center allocator must declare when existing portfolio exposure was considered'
+  );
+
+  assert.ok(
+    portfolioAwareAllocation.allocations.length === 0 ||
+    portfolioAwareAllocation.allocations.every(
+      item =>
+        item.symbol !== 'VALID'
+    ),
+    'existing concentration above the balanced stock cap must prevent NOMAD from adding more of the same stock'
   );
 
   console.log(
@@ -23111,6 +24792,82 @@ async function handler(
           status: 'OK',
           holding: saved
         }
+      );
+    }
+
+    if (
+      request.method ===
+        'POST' &&
+      action ===
+        'portfolio-transaction'
+    ) {
+      const body =
+        await readJsonRequestBody(
+          request
+        );
+
+      const saved =
+        await savePortfolioTransaction(
+          body
+        );
+
+      try {
+        const market =
+          await loadPSXMarket();
+
+        const marketRow =
+          market.stocks.find(
+            row =>
+              normalizeSymbol(
+                row.symbol
+              ) ===
+              normalizeSymbol(
+                body.symbol
+              )
+          ) ||
+          null;
+
+        await refreshHistoricalSituation(
+          body.symbol,
+          marketRow
+        );
+      } catch {}
+
+      return sendJSON(
+        response,
+        {
+          status: 'OK',
+          ...saved
+        }
+      );
+    }
+
+    if (
+      (
+        request.method ===
+          'POST' ||
+        request.method ===
+          'DELETE'
+      ) &&
+      action ===
+        'portfolio-transaction-delete'
+    ) {
+      const body =
+        request.method ===
+          'POST'
+          ? await readJsonRequestBody(
+              request
+            )
+          : {};
+
+      return sendJSON(
+        response,
+        await deletePortfolioTransaction(
+          body.id ||
+          url.searchParams.get(
+            'id'
+          )
+        )
       );
     }
 
@@ -25561,6 +27318,187 @@ tbody tr:hover {
   color: #5de2ad;
 }
 
+
+.portfolioLiveStrip {
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+  padding: 10px 12px;
+  border: 1px solid #26364b;
+  border-radius: 6px;
+  background: #0d1725;
+  color: #8ea3ba;
+  font-size: 11px;
+}
+
+.portfolioDashboardGrid {
+  display: grid;
+  grid-template-columns: minmax(0,1.5fr) minmax(280px,.7fr);
+  gap: 12px;
+  margin: 12px 0;
+}
+
+.portfolioHealthGrid {
+  display: grid;
+  grid-template-columns: repeat(2,minmax(0,1fr));
+  gap: 8px;
+}
+
+.portfolioHealthMetric {
+  padding: 10px;
+  border: 1px solid #26364b;
+  border-radius: 6px;
+  background: #0d1725;
+}
+
+.portfolioHealthMetric span {
+  display: block;
+  color: #71869c;
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+}
+
+.portfolioHealthMetric strong {
+  display: block;
+  margin-top: 4px;
+  font-size: 14px;
+}
+
+.portfolioSectorList {
+  display: grid;
+  gap: 7px;
+  margin-top: 10px;
+}
+
+.portfolioSectorRow {
+  display: grid;
+  grid-template-columns: minmax(0,1fr) 55px;
+  gap: 8px;
+  align-items: center;
+  font-size: 11px;
+}
+
+.portfolioSectorTrack {
+  height: 5px;
+  margin-top: 4px;
+  border-radius: 999px;
+  background: #1a2a3d;
+  overflow: hidden;
+}
+
+.portfolioSectorFill {
+  height: 100%;
+  border-radius: 999px;
+  background: #456987;
+}
+
+.portfolioTableScroller {
+  width: 100%;
+  overflow-x: auto;
+}
+
+.portfolioPositionHeader,
+.portfolioPositionRow {
+  min-width: 1040px;
+  display: grid;
+  grid-template-columns: 75px minmax(180px,1.45fr) 72px 88px 88px 105px 110px 88px 105px;
+  gap: 10px;
+  align-items: center;
+}
+
+.portfolioPositionHeader {
+  padding: 8px 10px;
+  color: #71869c;
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  border-bottom: 1px solid #26364b;
+}
+
+.portfolioPositionRow {
+  padding: 11px 10px;
+  border-bottom: 1px solid #23344a;
+  font-size: 11px;
+}
+
+.portfolioPositionRow:last-child {
+  border-bottom: 0;
+}
+
+.portfolioPositionName {
+  color: #7f93aa;
+  font-size: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.portfolioViewTag,
+.transactionSideTag {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 68px;
+  padding: 3px 7px;
+  border: 1px solid #2c4059;
+  border-radius: 999px;
+  background: #132033;
+  font-size: 9px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.portfolioViewTag.accumulate,
+.portfolioViewTag.buy,
+.transactionSideTag.buy {
+  background: #123328;
+  color: #5de2ad;
+}
+
+.portfolioViewTag.avoid,
+.transactionSideTag.sell {
+  background: #351b24;
+  color: #ff8b96;
+}
+
+.portfolioViewTag.research_required,
+.transactionSideTag.dividend {
+  background: #372d13;
+  color: #f1d47b;
+}
+
+.transactionList {
+  display: grid;
+}
+
+.transactionRow {
+  display: grid;
+  grid-template-columns: 90px 72px 68px minmax(0,1fr) 90px 62px;
+  gap: 9px;
+  align-items: center;
+  padding: 9px 0;
+  border-top: 1px solid #23344a;
+  font-size: 11px;
+}
+
+.transactionRow:first-child {
+  border-top: 0;
+}
+
+@media (max-width: 900px) {
+  .portfolioDashboardGrid {
+    grid-template-columns: 1fr;
+  }
+
+  .portfolioHealthGrid {
+    grid-template-columns: repeat(2,minmax(0,1fr));
+  }
+}
+
 .pageTitleRow {
   margin: 22px 0 12px;
   align-items: flex-end;
@@ -26053,7 +27991,7 @@ Build ${VERSION}
 Market, company metadata, fundamentals, symbol normalization,
 canonical universe identity, metadata, fundamentals and deterministic technical analysis are connected.
 
-Persistent intelligence memory and the market scanner are connected. Build 0.8.4B.2 adds official PSX screener session-change fallback and feed-health transparency while preserving the Decision Center, analyst-evidence gates and shadow-only allocator.
+Persistent intelligence memory and the market scanner are connected. Build 0.8.5A adds the live personal portfolio mirror, transaction ledger, realized/unrealized P&L, portfolio health and portfolio-aware Decision Center allocation while preserving strict shadow-only decision controls.
 
 </p>
 
@@ -26100,7 +28038,7 @@ Checking connection...
 <h2>Portfolio</h2>
 </div>
 <div class="panelActions">
-<button class="miniButton" id="homeAddHolding">+ Add holding</button>
+<button class="miniButton" id="homeRecordTrade">+ Record trade</button>
 <button class="miniButton secondary" id="homeImportPortfolio">Import CSV</button>
 </div>
 </div>
@@ -26222,10 +28160,10 @@ Checking connection...
 
 <section class="appPage" id="portfolioPage" data-page="portfolio">
 <div class="pageTitleRow">
-<div><div class="eyebrow">PERSONAL INTELLIGENCE</div><h1>Portfolio</h1><p class="muted">Your holdings receive priority monitoring for performance, historical weakness, risk and meaningful changes.</p></div>
-<div class="panelActions"><button id="portfolioAddHolding" class="miniButton">+ Add holding</button><button id="portfolioImportCsv" class="miniButton secondary">Import CSV</button></div>
+<div><div class="eyebrow">LIVE PORTFOLIO INTELLIGENCE</div><h1>Your portfolio mirror</h1><p class="muted">Record the trades you execute with your broker. NOMAD mirrors the positions against current PSX prices, tracks P&amp;L, concentration and the latest NOMAD view, and uses existing holdings when allocating new money.</p></div>
+<div class="panelActions"><button id="portfolioRecordTrade" class="miniButton">+ Record trade</button><button id="portfolioImportCsv" class="miniButton secondary">Import CSV</button><button id="portfolioAddHolding" class="miniButton secondary">Opening holding</button></div>
 </div>
-<div id="portfolioFull"><div class="terminalCard"><div class="terminalEmpty">Loading portfolio...</div></div></div>
+<div id="portfolioFull"><div class="terminalCard"><div class="terminalEmpty">Loading live portfolio...</div></div></div>
 </section>
 
 <section
@@ -26838,6 +28776,24 @@ Next
 <div class="modalActions"><button id="saveHoldingButton">Save holding</button><button id="cancelHoldingButton" class="miniButton secondary">Cancel</button></div>
 </div>
 </div>
+
+<div id="portfolioTransactionModal" class="modalBackdrop" hidden>
+<div class="modalCard">
+<div class="modalHeader"><div><div class="eyebrow">PORTFOLIO LEDGER</div><h2>Record a real trade</h2></div><button id="closePortfolioTransactionModal" class="iconButton">×</button></div>
+<div class="formGrid">
+<div><label>Transaction</label><select id="transactionSide"><option value="BUY">Buy</option><option value="SELL">Sell</option><option value="DIVIDEND">Dividend received</option></select></div>
+<div><label>PSX symbol</label><input id="transactionSymbol" placeholder="FCL"></div>
+<div class="tradeField"><label>Quantity</label><input id="transactionQuantity" inputmode="decimal" placeholder="100"></div>
+<div class="tradeField"><label>Price / share</label><input id="transactionPrice" inputmode="decimal" placeholder="26.50"></div>
+<div class="dividendField" hidden><label>Dividend cash received</label><input id="transactionCashAmount" inputmode="decimal" placeholder="1500"></div>
+<div><label>Trade date</label><input id="transactionDate" type="date"></div>
+<div><label>Fees / charges</label><input id="transactionFees" inputmode="decimal" value="0"></div>
+<div><label>Notes (optional)</label><input id="transactionNotes" placeholder="Broker / contract note reference"></div>
+</div>
+<div id="transactionFormStatus" class="smallStatus"></div>
+<div class="modalActions"><button id="saveTransactionButton">Save transaction</button><button id="cancelTransactionButton" class="miniButton secondary">Cancel</button></div>
+</div>
+</div>
 <input id="portfolioCsvInput" type="file" accept=".csv,text/csv" hidden>
 
 </main>
@@ -26871,6 +28827,7 @@ const METADATA_AUDIT_PAGE_SIZE =
   50;
 
 let liveRefreshTimer = null;
+let portfolioRefreshTimer = null;
 
 let liveRefreshSymbol = null;
 
@@ -27306,7 +29263,7 @@ async function apiPost(
 
 
 /* =========================================================
-   APP NAVIGATION + DECISION CENTER - BUILD 0.8.4B.1
+   APP NAVIGATION + DECISION CENTER + LIVE PORTFOLIO - BUILD 0.8.5A
 ========================================================= */
 
 function openAppPage(
@@ -27344,6 +29301,31 @@ function openAppPage(
     top: 0,
     behavior: 'smooth'
   });
+
+  if (portfolioRefreshTimer) {
+    clearInterval(
+      portfolioRefreshTimer
+    );
+    portfolioRefreshTimer =
+      null;
+  }
+
+  if (page === 'portfolio') {
+    loadPortfolioViews();
+
+    portfolioRefreshTimer =
+      setInterval(
+        () => {
+          if (
+            document.visibilityState ===
+            'visible'
+          ) {
+            loadPortfolioViews();
+          }
+        },
+        10000
+      );
+  }
 }
 
 function relativeTime(
@@ -27624,6 +29606,508 @@ function portfolioMoney(
     );
 }
 
+
+function portfolioViewClass(
+  value
+) {
+  return String(
+    value ||
+    'monitor'
+  )
+    .trim()
+    .toLowerCase()
+    .replace(
+      /[^a-z0-9]+/g,
+      '_'
+    );
+}
+
+function renderPortfolioFull(
+  result,
+  targetId = 'portfolioFull'
+) {
+  const target =
+    $(targetId);
+
+  if (!target) {
+    return;
+  }
+
+  if (!result?.configured) {
+    target.innerHTML =
+      '<div class="terminalCard"><div class="terminalEmpty">Portfolio storage is not set up yet. Run the portfolio foundation SQL migration in Supabase.</div></div>';
+    return;
+  }
+
+  const holdings =
+    Array.isArray(
+      result.holdings
+    )
+      ? result.holdings
+      : [];
+
+  const summary =
+    result.summary ||
+    {};
+
+  const health =
+    result.health ||
+    {};
+
+  const transactions =
+    Array.isArray(
+      result.transactions
+    )
+      ? result.transactions
+      : [];
+
+  let html =
+    '<div class="portfolioLiveStrip"><div><strong>Portfolio mirror</strong> · ' +
+    (
+      result.asOf
+        ? 'PSX prices ' +
+          escapeHtml(
+            relativeTime(
+              result.asOf
+            )
+          )
+        : 'latest available PSX prices'
+    ) +
+    '</div><div>' +
+    (
+      result.ledgerConfigured
+        ? 'Transaction ledger active · ' +
+          formatNumber(
+            summary.transactionCount ||
+            0,
+            0
+          ) +
+          ' records'
+        : 'Holdings-only mode · run the 0.8.5A ledger migration to record buys/sells/dividends'
+    ) +
+    '</div></div>' +
+    '<div class="portfolioSummaryStrip">' +
+    '<div class="portfolioMetric"><span>Market value</span><strong>' +
+    portfolioMoney(
+      summary.currentValue
+    ) +
+    '</strong></div>' +
+    '<div class="portfolioMetric"><span>Open cost basis</span><strong>' +
+    portfolioMoney(
+      summary.investedCost
+    ) +
+    '</strong></div>' +
+    '<div class="portfolioMetric"><span>Today</span><strong class="' +
+    percentClass(
+      summary.dayPnlPct
+    ) +
+    '">' +
+    portfolioMoney(
+      summary.dayPnl
+    ) +
+    ' · ' +
+    (
+      Number(
+        summary.dayPnlPct
+      ) > 0
+        ? '+'
+        : ''
+    ) +
+    formatNumber(
+      summary.dayPnlPct,
+      2
+    ) +
+    '%</strong></div>' +
+    '<div class="portfolioMetric"><span>Unrealized P&amp;L</span><strong class="' +
+    percentClass(
+      summary.totalPnlPct
+    ) +
+    '">' +
+    portfolioMoney(
+      summary.totalPnl
+    ) +
+    ' · ' +
+    (
+      Number(
+        summary.totalPnlPct
+      ) > 0
+        ? '+'
+        : ''
+    ) +
+    formatNumber(
+      summary.totalPnlPct,
+      2
+    ) +
+    '%</strong></div>' +
+    '<div class="portfolioMetric"><span>Realized P&amp;L</span><strong class="' +
+    percentClass(
+      summary.realizedPnl
+    ) +
+    '">' +
+    portfolioMoney(
+      summary.realizedPnl
+    ) +
+    '</strong></div>' +
+    '<div class="portfolioMetric"><span>Dividends logged</span><strong>' +
+    portfolioMoney(
+      summary.dividends
+    ) +
+    '</strong></div>' +
+    '</div>';
+
+  if (!holdings.length) {
+    html +=
+      '<div class="terminalCard"><div class="terminalEmpty"><strong>No open positions yet.</strong><br>Use Record trade for new buys, or Opening holding if you want to start NOMAD from an existing portfolio without entering historical transactions.</div></div>';
+  } else {
+    html +=
+      '<div class="portfolioDashboardGrid">' +
+      '<div class="terminalCard"><div class="panelHeader"><div><div class="eyebrow">LIVE POSITIONS</div><h2>What you own now</h2></div><span class="boardCount">' +
+      formatNumber(
+        holdings.length,
+        0
+      ) +
+      '</span></div>' +
+      '<div class="portfolioTableScroller"><div class="portfolioPositionHeader"><div>Symbol</div><div>Company</div><div>Qty</div><div>Avg cost</div><div>Live</div><div>Value</div><div>Total P&amp;L</div><div>Weight</div><div>NOMAD</div></div>' +
+      holdings.map(
+        item =>
+          '<div class="portfolioPositionRow">' +
+          '<div><strong>' +
+          escapeHtml(
+            item.symbol
+          ) +
+          '</strong></div>' +
+          '<div><div class="portfolioPositionName">' +
+          escapeHtml(
+            item.companyName ||
+            item.symbol
+          ) +
+          '</div><div class="decisionMinor">' +
+          escapeHtml(
+            item.sector ||
+            'Unknown'
+          ) +
+          '</div></div>' +
+          '<div>' +
+          formatNumber(
+            item.quantity,
+            2
+          ) +
+          '</div>' +
+          '<div>PKR ' +
+          formatNumber(
+            item.averageCost,
+            2
+          ) +
+          '</div>' +
+          '<div>PKR ' +
+          formatNumber(
+            item.currentPrice,
+            2
+          ) +
+          '<div class="' +
+          percentClass(
+            item.dayChangePct
+          ) +
+          '">' +
+          (
+            Number(
+              item.dayChangePct
+            ) > 0
+              ? '+'
+              : ''
+          ) +
+          formatNumber(
+            item.dayChangePct,
+            2
+          ) +
+          '%</div></div>' +
+          '<div>' +
+          portfolioMoney(
+            item.currentValue
+          ) +
+          '</div>' +
+          '<div class="' +
+          percentClass(
+            item.totalPnlPct
+          ) +
+          '">' +
+          portfolioMoney(
+            item.totalPnl
+          ) +
+          '<div>' +
+          (
+            Number(
+              item.totalPnlPct
+            ) > 0
+              ? '+'
+              : ''
+          ) +
+          formatNumber(
+            item.totalPnlPct,
+            2
+          ) +
+          '%</div></div>' +
+          '<div>' +
+          formatNumber(
+            item.weightPct,
+            1
+          ) +
+          '%</div>' +
+          '<div><span class="portfolioViewTag ' +
+          portfolioViewClass(
+            item.nomadView
+          ) +
+          '">' +
+          escapeHtml(
+            decisionActionLabel(
+              item.nomadView
+            )
+          ) +
+          '</span><div class="decisionMinor">' +
+          escapeHtml(
+            item.historicalContext
+              ?.condition ||
+            'Context pending'
+          ) +
+          '</div></div>' +
+          '</div>'
+      ).join('') +
+      '</div></div>' +
+      '<div class="terminalCard"><div class="panelHeader"><div><div class="eyebrow">PORTFOLIO HEALTH</div><h2>Exposure &amp; concentration</h2></div></div>' +
+      '<div class="portfolioHealthGrid">' +
+      '<div class="portfolioHealthMetric"><span>Health</span><strong>' +
+      escapeHtml(
+        health.state ||
+        'N/A'
+      ) +
+      '</strong></div>' +
+      '<div class="portfolioHealthMetric"><span>Concentration</span><strong>' +
+      escapeHtml(
+        health.concentration ||
+        'N/A'
+      ) +
+      '</strong></div>' +
+      '<div class="portfolioHealthMetric"><span>Largest stock</span><strong>' +
+      escapeHtml(
+        health.largestPositionSymbol ||
+        'N/A'
+      ) +
+      (
+        health.largestPositionPct !==
+          null &&
+        health.largestPositionPct !==
+          undefined
+          ? ' · ' +
+            formatNumber(
+              health.largestPositionPct,
+              1
+            ) +
+            '%'
+          : ''
+      ) +
+      '</strong></div>' +
+      '<div class="portfolioHealthMetric"><span>Largest sector</span><strong>' +
+      escapeHtml(
+        health.largestSector ||
+        'N/A'
+      ) +
+      (
+        health.largestSectorPct !==
+          null &&
+        health.largestSectorPct !==
+          undefined
+          ? ' · ' +
+            formatNumber(
+              health.largestSectorPct,
+              1
+            ) +
+            '%'
+          : ''
+      ) +
+      '</strong></div>' +
+      '</div>' +
+      '<div class="portfolioSectorList">' +
+      (health.sectors || [])
+        .slice(0, 8)
+        .map(
+          item =>
+            '<div class="portfolioSectorRow"><div><strong>' +
+            escapeHtml(
+              item.sector
+            ) +
+            '</strong><div class="portfolioSectorTrack"><div class="portfolioSectorFill" style="width:' +
+            Math.max(
+              0,
+              Math.min(
+                100,
+                Number(
+                  item.weightPct
+                ) ||
+                0
+              )
+            ) +
+            '%"></div></div></div><div>' +
+            formatNumber(
+              item.weightPct,
+              1
+            ) +
+            '%</div></div>'
+        )
+        .join('') +
+      '</div></div>' +
+      '</div>';
+  }
+
+  html +=
+    '<div class="terminalCard"><div class="panelHeader"><div><div class="eyebrow">TRANSACTION LEDGER</div><h2>Recent activity</h2></div><span class="boardCount">' +
+    formatNumber(
+      summary.transactionCount ||
+      0,
+      0
+    ) +
+    '</span></div>';
+
+  if (!result.ledgerConfigured) {
+    html +=
+      '<div class="terminalEmpty small">Transaction tracking is not enabled yet. Your existing holdings still work. Run the 0.8.5A portfolio ledger migration when you are ready to record every buy, sell and dividend.</div>';
+  } else if (!transactions.length) {
+    html +=
+      '<div class="terminalEmpty small">No transactions recorded yet. Use <strong>Record trade</strong> after you execute a trade with your broker.</div>';
+  } else {
+    html +=
+      '<div class="transactionList">' +
+      transactions.map(
+        item => {
+          const side =
+            String(
+              item.side ||
+              ''
+            ).toUpperCase();
+
+          const detail =
+            side === 'DIVIDEND'
+              ? portfolioMoney(
+                  item.cash_amount
+                )
+              : formatNumber(
+                  item.quantity,
+                  2
+                ) +
+                ' @ PKR ' +
+                formatNumber(
+                  item.price,
+                  2
+                );
+
+          return (
+            '<div class="transactionRow">' +
+            '<div>' +
+            escapeHtml(
+              item.trade_date ||
+              ''
+            ) +
+            '</div>' +
+            '<div><strong>' +
+            escapeHtml(
+              item.symbol ||
+              ''
+            ) +
+            '</strong></div>' +
+            '<div><span class="transactionSideTag ' +
+            portfolioViewClass(
+              side
+            ) +
+            '">' +
+            escapeHtml(
+              side
+            ) +
+            '</span></div>' +
+            '<div>' +
+            escapeHtml(
+              detail
+            ) +
+            '</div>' +
+            '<div>' +
+            (
+              Number(
+                item.fees
+              ) > 0
+                ? 'Fees ' +
+                  portfolioMoney(
+                    item.fees
+                  )
+                : ''
+            ) +
+            '</div>' +
+            '<div>' +
+            (
+              side !== 'OPENING'
+                ? '<button class="miniButton secondary deleteTransaction" data-delete-transaction="' +
+                  escapeHtml(
+                    item.id
+                  ) +
+                  '">Delete</button>'
+                : '<span class="decisionMinor">Opening</span>'
+            ) +
+            '</div>' +
+            '</div>'
+          );
+        }
+      ).join('') +
+      '</div>';
+  }
+
+  html +=
+    '<div class="sourceNote">Live values use NOMAD\'s latest PSX market snapshot. Portfolio P&amp;L is calculated from the prices and transactions you record; it is not a broker statement. Decision Center now considers your existing position and sector exposure before allocating new money.</div>' +
+    '</div>';
+
+  target.innerHTML =
+    html;
+
+  target
+    .querySelectorAll(
+      '[data-delete-transaction]'
+    )
+    .forEach(
+      button => {
+        button.onclick =
+          async () => {
+            const id =
+              button.dataset
+                .deleteTransaction;
+
+            if (
+              !id ||
+              !confirm(
+                'Delete this portfolio transaction? NOMAD will rebuild the position from the remaining ledger.'
+              )
+            ) {
+              return;
+            }
+
+            button.disabled =
+              true;
+
+            try {
+              await apiPost(
+                'portfolio-transaction-delete',
+                { id }
+              );
+
+              await loadPortfolioViews();
+            } catch (error) {
+              alert(
+                error.message
+              );
+            } finally {
+              button.disabled =
+                false;
+            }
+          };
+      }
+    );
+}
+
 function renderPortfolioSnapshot(
   result,
   targetId = 'portfolioHome',
@@ -27633,6 +30117,14 @@ function renderPortfolioSnapshot(
     $(targetId);
 
   if (!target) {
+    return;
+  }
+
+  if (full) {
+    renderPortfolioFull(
+      result,
+      targetId
+    );
     return;
   }
 
@@ -35467,6 +37959,170 @@ $('runMemoryTest')
     };
 
 
+
+function setPortfolioTransactionMode() {
+  const side =
+    String(
+      $('transactionSide')
+        ?.value ||
+      'BUY'
+    ).toUpperCase();
+
+  document
+    .querySelectorAll(
+      '#portfolioTransactionModal .tradeField'
+    )
+    .forEach(
+      element => {
+        element.hidden =
+          side === 'DIVIDEND';
+      }
+    );
+
+  document
+    .querySelectorAll(
+      '#portfolioTransactionModal .dividendField'
+    )
+    .forEach(
+      element => {
+        element.hidden =
+          side !== 'DIVIDEND';
+      }
+    );
+}
+
+function openPortfolioTransactionModal(
+  preset = {}
+) {
+  if (
+    !$('portfolioTransactionModal')
+  ) {
+    return;
+  }
+
+  $('transactionSide').value =
+    preset.side ||
+    'BUY';
+
+  $('transactionSymbol').value =
+    preset.symbol ||
+    '';
+
+  $('transactionQuantity').value =
+    preset.quantity ||
+    '';
+
+  $('transactionPrice').value =
+    preset.price ||
+    '';
+
+  $('transactionCashAmount').value =
+    preset.cashAmount ||
+    '';
+
+  $('transactionFees').value =
+    preset.fees ??
+    0;
+
+  $('transactionNotes').value =
+    preset.notes ||
+    '';
+
+  $('transactionDate').value =
+    preset.tradeDate ||
+    new Date()
+      .toISOString()
+      .slice(0, 10);
+
+  $('transactionFormStatus')
+    .textContent =
+      '';
+
+  setPortfolioTransactionMode();
+
+  $('portfolioTransactionModal').hidden =
+    false;
+
+  setTimeout(
+    () =>
+      $('transactionSymbol')
+        .focus(),
+    0
+  );
+}
+
+function closePortfolioTransactionModal() {
+  if (
+    $('portfolioTransactionModal')
+  ) {
+    $('portfolioTransactionModal').hidden =
+      true;
+  }
+}
+
+async function savePortfolioTransactionFromForm() {
+  const button =
+    $('saveTransactionButton');
+
+  if (!button) {
+    return;
+  }
+
+  button.disabled =
+    true;
+
+  $('transactionFormStatus')
+    .textContent =
+      'Saving transaction and rebuilding your live position...';
+
+  try {
+    await apiPost(
+      'portfolio-transaction',
+      {
+        side:
+          $('transactionSide')
+            .value,
+        symbol:
+          $('transactionSymbol')
+            .value,
+        quantity:
+          $('transactionQuantity')
+            .value ||
+          0,
+        price:
+          $('transactionPrice')
+            .value ||
+          0,
+        cash_amount:
+          $('transactionCashAmount')
+            .value ||
+          0,
+        trade_date:
+          $('transactionDate')
+            .value,
+        fees:
+          $('transactionFees')
+            .value ||
+          0,
+        notes:
+          $('transactionNotes')
+            .value ||
+          ''
+      }
+    );
+
+    closePortfolioTransactionModal();
+    await loadDecisionCenter();
+  } catch (error) {
+    $('transactionFormStatus')
+      .textContent =
+        error.message;
+  } finally {
+    button.disabled =
+      false;
+  }
+}
+
 function openPortfolioModal(
   preset = {}
 ) {
@@ -35618,7 +38274,7 @@ async function importPortfolioCsv(
 
   const lines =
     text
-      .split(/\\r?\\n/)
+      .split(/\r?\n/)
       .filter(
         line =>
           line.trim()
@@ -35626,7 +38282,7 @@ async function importPortfolioCsv(
 
   if (lines.length < 2) {
     throw new Error(
-      'CSV needs a header row and at least one holding.'
+      'CSV needs a header row and at least one data row.'
     );
   }
 
@@ -35635,6 +38291,20 @@ async function importPortfolioCsv(
       lines[0]
     ).map(
       normalizeCsvHeader
+    );
+
+  const transactionMode =
+    headers.some(
+      header =>
+        [
+          'side',
+          'type',
+          'action',
+          'transaction_type',
+          'trade_type'
+        ].includes(
+          header
+        )
     );
 
   let imported = 0;
@@ -35663,60 +38333,158 @@ async function importPortfolioCsv(
       }
     );
 
-    const payload = {
-      symbol:
-        csvValue(
-          row,
-          [
-            'symbol',
-            'ticker',
-            'stock'
-          ]
-        ),
-      quantity:
-        csvValue(
-          row,
-          [
-            'quantity',
-            'qty',
-            'shares'
-          ]
-        ),
-      average_cost:
-        csvValue(
-          row,
-          [
-            'average_cost',
-            'avg_cost',
-            'cost',
-            'buy_price',
-            'purchase_price'
-          ]
-        ),
-      purchase_date:
-        csvValue(
-          row,
-          [
-            'purchase_date',
-            'buy_date',
-            'date'
-          ]
-        ) ||
-        null,
-      fees:
-        csvValue(
-          row,
-          [
-            'fees',
-            'fee'
-          ]
-        ) ||
-        0
-    };
+    let action =
+      'portfolio-holding';
+
+    let payload;
+
+    if (transactionMode) {
+      action =
+        'portfolio-transaction';
+
+      payload = {
+        side:
+          csvValue(
+            row,
+            [
+              'side',
+              'type',
+              'action',
+              'transaction_type',
+              'trade_type'
+            ]
+          ),
+        symbol:
+          csvValue(
+            row,
+            [
+              'symbol',
+              'ticker',
+              'stock'
+            ]
+          ),
+        quantity:
+          csvValue(
+            row,
+            [
+              'quantity',
+              'qty',
+              'shares'
+            ]
+          ) ||
+          0,
+        price:
+          csvValue(
+            row,
+            [
+              'price',
+              'trade_price',
+              'buy_price',
+              'sell_price',
+              'purchase_price'
+            ]
+          ) ||
+          0,
+        trade_date:
+          csvValue(
+            row,
+            [
+              'trade_date',
+              'date',
+              'purchase_date',
+              'buy_date',
+              'sell_date'
+            ]
+          ) ||
+          null,
+        fees:
+          csvValue(
+            row,
+            [
+              'fees',
+              'fee',
+              'charges',
+              'brokerage'
+            ]
+          ) ||
+          0,
+        cash_amount:
+          csvValue(
+            row,
+            [
+              'cash_amount',
+              'dividend_amount',
+              'amount'
+            ]
+          ) ||
+          0,
+        notes:
+          csvValue(
+            row,
+            [
+              'notes',
+              'note',
+              'reference'
+            ]
+          ) ||
+          ''
+      };
+    } else {
+      payload = {
+        symbol:
+          csvValue(
+            row,
+            [
+              'symbol',
+              'ticker',
+              'stock'
+            ]
+          ),
+        quantity:
+          csvValue(
+            row,
+            [
+              'quantity',
+              'qty',
+              'shares'
+            ]
+          ),
+        average_cost:
+          csvValue(
+            row,
+            [
+              'average_cost',
+              'avg_cost',
+              'cost',
+              'buy_price',
+              'purchase_price'
+            ]
+          ),
+        purchase_date:
+          csvValue(
+            row,
+            [
+              'purchase_date',
+              'buy_date',
+              'date'
+            ]
+          ) ||
+          null,
+        fees:
+          csvValue(
+            row,
+            [
+              'fees',
+              'fee'
+            ]
+          ) ||
+          0
+      };
+    }
 
     try {
       await apiPost(
-        'portfolio-holding',
+        action,
         payload
       );
 
@@ -35736,7 +38504,11 @@ async function importPortfolioCsv(
 
   return {
     imported,
-    errors
+    errors,
+    mode:
+      transactionMode
+        ? 'transactions'
+        : 'holdings'
   };
 }
 
@@ -35870,6 +38642,21 @@ if ($('refreshIntelligenceFeed')) {
         loadDecisionCenter();
 }
 
+
+[
+  'homeRecordTrade',
+  'portfolioRecordTrade'
+]
+  .forEach(
+    id => {
+      if ($(id)) {
+        $(id).onclick =
+          () =>
+            openPortfolioTransactionModal();
+      }
+    }
+  );
+
 [
   'homeAddHolding',
   'portfolioAddHolding'
@@ -35930,6 +38717,44 @@ if ($('portfolioModal')) {
       };
 }
 
+
+if ($('transactionSide')) {
+  $('transactionSide')
+    .onchange =
+      setPortfolioTransactionMode;
+}
+
+if ($('saveTransactionButton')) {
+  $('saveTransactionButton')
+    .onclick =
+      savePortfolioTransactionFromForm;
+}
+
+if ($('cancelTransactionButton')) {
+  $('cancelTransactionButton')
+    .onclick =
+      closePortfolioTransactionModal;
+}
+
+if ($('closePortfolioTransactionModal')) {
+  $('closePortfolioTransactionModal')
+    .onclick =
+      closePortfolioTransactionModal;
+}
+
+if ($('portfolioTransactionModal')) {
+  $('portfolioTransactionModal')
+    .onclick =
+      event => {
+        if (
+          event.target ===
+          $('portfolioTransactionModal')
+        ) {
+          closePortfolioTransactionModal();
+        }
+      };
+}
+
 if ($('portfolioCsvInput')) {
   $('portfolioCsvInput')
     .onchange =
@@ -35951,7 +38776,11 @@ if ($('portfolioCsvInput')) {
           alert(
             'Imported ' +
             result.imported +
-            ' holding(s).' +
+            (
+              result.mode === 'transactions'
+                ? ' transaction(s).'
+                : ' holding(s).'
+            ) +
             (
               result.errors.length
                 ? '\\n' +
@@ -36461,6 +39290,21 @@ function renderShadowDecision(
       ''
     ) +
     '</div>';
+
+  if (
+    result?.allocationDiagnostics
+      ?.portfolioAware
+  ) {
+    html +=
+      '<div class="decisionMetaLine"><strong>Portfolio-aware allocation:</strong> NOMAD considered your existing portfolio value of PKR ' +
+      formatNumber(
+        result.allocationDiagnostics
+          .existingPortfolioValuePkr ||
+        0,
+        0
+      ) +
+      ' before applying stock and sector caps to this new capital.</div>';
+  }
 
   if (allocations.length) {
     html +=
