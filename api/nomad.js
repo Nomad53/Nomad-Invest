@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.8.5B.3';
+const VERSION = '0.9.0';
 
 
 const SUPABASE_URL =
@@ -4465,8 +4465,10 @@ function parseOfficialPSXScreenerAsOf(
     );
 
   if (!match) {
-    return new Date()
-      .toISOString();
+    // Do not fabricate freshness. If pyPSX does not expose an explicit
+    // market timestamp, preserve the uncertainty instead of pretending
+    // the snapshot was observed "now".
+    return null;
   }
 
   const parsed =
@@ -7875,12 +7877,23 @@ async function loadPSXMarket() {
   const [
     screener,
     sectorMap,
-    companyMap
+    companyMap,
+    marketStatus
   ] =
     await Promise.all([
       loadRawScreener(),
       loadSectorMap(),
-      loadCompanyMap()
+      loadCompanyMap(),
+      getPyPSXMarketStatus()
+        .catch(
+          () => ({
+            known: false,
+            isOpen: false,
+            status: 'UNKNOWN',
+            statusText: 'Market status unavailable',
+            holidayName: null
+          })
+        )
     ]);
 
   const normalizedRows =
@@ -8256,6 +8269,236 @@ async function loadPSXMarket() {
         stock.normalizedSymbol
     ).length;
 
+  // MARKET DATA INTEGRITY LAYER
+  // ---------------------------------------------
+  // The market pulse must be a factual market-wide view, not a filtered
+  // recommendation universe. Build it directly from one primary live
+  // provider snapshot so gainers, losers and breadth cannot become a
+  // hybrid of pyPSX, fallback feeds and NOMAD eligibility filters.
+  const primaryLiveSnapshot =
+    pyPSXPublicMarket?.rows?.length
+      ? pyPSXPublicMarket
+      : officialScreener?.rows?.length
+        ? officialScreener
+        : null;
+
+  const stockBySymbol =
+    new Map(
+      stocks.map(
+        stock => [
+          normalizeSymbol(
+            stock.symbol
+          ),
+          stock
+        ]
+      )
+    );
+
+  const liveMarketRows =
+    (
+      primaryLiveSnapshot?.rows ||
+      []
+    )
+      .map(
+        row => {
+          const canonicalSymbol =
+            normalizeSymbol(
+              row.symbol
+            );
+
+          const stock =
+            stockBySymbol.get(
+              canonicalSymbol
+            ) ||
+            null;
+
+          const displaySymbol =
+            normalizeSymbol(
+              row.tradingSymbol ||
+              row.symbol
+            ) ||
+            canonicalSymbol;
+
+          return {
+            symbol:
+              displaySymbol,
+            canonicalSymbol,
+            companyName:
+              stock?.companyName ||
+              getUniverseMasterEntry(
+                canonicalSymbol
+              )?.companyName ||
+              displaySymbol,
+            sector:
+              stock?.sector ||
+              getUniverseMasterEntry(
+                canonicalSymbol
+              )?.sector ||
+              'Unknown',
+            price:
+              safeNumber(
+                row.price ??
+                row.current
+              ),
+            changePct:
+              safeNumber(
+                row.changePct
+              ),
+            volume:
+              safeNumber(
+                row.volume
+              ),
+            marketCap:
+              safeNumber(
+                row.marketCap
+              ),
+            recommendationEligible:
+              stock?.recommendationEligible ===
+              true,
+            universeClass:
+              stock?.universeClass ||
+              null
+          };
+        }
+      )
+      .filter(
+        row =>
+          row.symbol &&
+          safeNumber(
+            row.price
+          ) !== null &&
+          safeNumber(
+            row.price
+          ) > 0 &&
+          safeNumber(
+            row.changePct
+          ) !== null
+      );
+
+  // Cross-check pyPSX against the official PSX screener when both are
+  // available. The official feed may be delayed, so only flag large
+  // differences that are more consistent with mapping/source problems
+  // than ordinary intraday movement. This is diagnostic; it never
+  // silently blends the two sources into one Top Movers table.
+  let marketDataIntegrity = {
+    status:
+      pyPSXPublicMarket?.rows?.length &&
+      officialScreener?.rows?.length
+        ? 'CHECKED'
+        : 'SINGLE_SOURCE',
+    primarySource:
+      primaryLiveSnapshot?.source ||
+      null,
+    primaryAsOf:
+      primaryLiveSnapshot?.asOf ||
+      null,
+    overlapCount: 0,
+    largePriceDifferences: 0,
+    largeChangeDifferences: 0
+  };
+
+  if (
+    pyPSXPublicMarket?.rows?.length &&
+    officialScreener?.rows?.length
+  ) {
+    const officialLiveMap =
+      new Map(
+        officialScreener.rows.map(
+          row => [
+            normalizeSymbol(
+              row.symbol
+            ),
+            row
+          ]
+        )
+      );
+
+    for (
+      const live
+      of pyPSXPublicMarket.rows
+    ) {
+      const official =
+        officialLiveMap.get(
+          normalizeSymbol(
+            live.symbol
+          )
+        );
+
+      if (!official) {
+        continue;
+      }
+
+      const pyPrice =
+        safeNumber(
+          live.price
+        );
+
+      const officialPrice =
+        safeNumber(
+          official.price
+        );
+
+      const pyChange =
+        safeNumber(
+          live.changePct
+        );
+
+      const officialChange =
+        safeNumber(
+          official.changePct
+        );
+
+      marketDataIntegrity.overlapCount +=
+        1;
+
+      if (
+        pyPrice !== null &&
+        officialPrice !== null &&
+        officialPrice > 0 &&
+        Math.abs(
+          pyPrice -
+          officialPrice
+        ) /
+          officialPrice *
+          100 > 5
+      ) {
+        marketDataIntegrity.largePriceDifferences +=
+          1;
+      }
+
+      if (
+        pyChange !== null &&
+        officialChange !== null &&
+        Math.abs(
+          pyChange -
+          officialChange
+        ) > 5
+      ) {
+        marketDataIntegrity.largeChangeDifferences +=
+          1;
+      }
+    }
+
+    const largeDifferences =
+      marketDataIntegrity.largePriceDifferences +
+      marketDataIntegrity.largeChangeDifferences;
+
+    const warningThreshold =
+      Math.max(
+        5,
+        Math.ceil(
+          marketDataIntegrity.overlapCount *
+          0.05
+        )
+      );
+
+    marketDataIntegrity.status =
+      largeDifferences >
+        warningThreshold
+        ? 'WARNING'
+        : 'OK';
+  }
+
   const result = {
     sourceName:
       'psxdata-api',
@@ -8273,19 +8516,26 @@ async function loadPSXMarket() {
       screener.timestamp,
 
     marketWatchAsOf:
-      pyPSXPublicMarket?.asOf ||
+      primaryLiveSnapshot?.asOf ||
       marketWatch?.asOf ||
-      officialScreener?.asOf ||
       null,
 
     sessionChangeSource:
-      pyPSXPublicMarket?.rows?.length
-        ? 'pyPSX public live market board'
-        : marketWatch?.rows?.length
+      primaryLiveSnapshot?.source ||
+      (
+        marketWatch?.rows?.length
           ? 'PSX market watch'
-          : officialScreener?.rows?.length
-            ? 'PSX Data Portal screener'
-            : 'screener API fallback',
+          : 'screener API fallback'
+      ),
+
+    liveMarketRows,
+
+    liveMarketUniverse:
+      liveMarketRows.length
+        ? 'ALL_PRIMARY_LIVE_ROWS'
+        : 'UNAVAILABLE',
+
+    marketDataIntegrity,
 
     sessionChangeCoverage:
       stocks.filter(
@@ -8294,6 +8544,10 @@ async function loadPSXMarket() {
             stock.dayChangePct
           ) !== null
       ).length,
+
+    marketStatus:
+      marketStatus ||
+      null,
 
     totalStocks:
       stocks.length,
@@ -12996,7 +13250,7 @@ function buildFinancialAnalystCore(
 
   return {
     version:
-      'FINANCIAL-ANALYST-0.8.4B.1',
+      'FINANCIAL-ANALYST-0.9.0',
     mode:
       'SHADOW_ONLY',
     affectsDecision:
@@ -17837,8 +18091,9 @@ async function getPortfolioSnapshot() {
         decisionRaw.opportunityBoard.priority2 || []
       ],
       [
-        'RESEARCH_REQUIRED',
-        decisionRaw.opportunityBoard.researchRequired || []
+        'EVIDENCE_RESEARCH',
+        decisionRaw.opportunityBoard.evidenceResearch ||
+          decisionRaw.opportunityBoard.researchRequired || []
       ],
       [
         'AVOID',
@@ -17875,8 +18130,8 @@ async function getPortfolioSnapshot() {
                   ? 'WATCH'
                   : bucket === 'AVOID'
                     ? 'AVOID'
-                    : bucket === 'RESEARCH_REQUIRED'
-                      ? 'RESEARCH_REQUIRED'
+                    : bucket === 'EVIDENCE_RESEARCH'
+                      ? 'EVIDENCE_RESEARCH'
                       : 'MONITOR'
               ),
             reason:
@@ -18587,8 +18842,10 @@ const DECISION_FUNDAMENTAL_CACHE_FRESH_MS =
 const DECISION_FUNDAMENTAL_CACHE_FALLBACK_MS =
   14 * 24 * 60 * 60 * 1000;
 
-const DECISION_CENTER_SHORTLIST_LIMIT = 18;
-const DECISION_CENTER_DEEP_LIMIT = 12;
+const DECISION_CENTER_SHORTLIST_LIMIT = 30;
+const DECISION_CENTER_COMPARABLE_TARGET = 18;
+const DECISION_CENTER_DEEP_ATTEMPT_LIMIT = 24;
+const DECISION_CENTER_DEEP_BATCH_SIZE = 6;
 const DECISION_CENTER_MIN_ANALYST_COVERAGE = 65;
 const DECISION_CENTER_MAX_DEPLOYMENT_PCT = 0.90;
 
@@ -19900,9 +20157,10 @@ function decisionCenterAnalystGate(
 
   if (!analyst) {
     return {
-      state: 'RESEARCH_REQUIRED',
+      state: 'RESEARCHING',
+      validationTier: 'NONE',
       reason:
-        'Financial Analyst evidence is unavailable. The stock remains visible, but NOMAD will not promote it to a validated opportunity.'
+        'NOMAD could not complete the first-pass Financial Analyst evidence. The company remains visible and enters automatic evidence research instead of being silently discarded.'
     };
   }
 
@@ -19959,24 +20217,29 @@ function decisionCenterAnalystGate(
         true
   ) {
     return {
-      state: 'RESEARCH_REQUIRED',
+      state: 'RESEARCHING',
+      validationTier: 'SECTOR_MODEL_REQUIRED',
       reason:
-        'A financial-sector-specific analyst model is required before NOMAD can validate this stock.'
+        'This company requires a financial-sector-specific analyst model before NOMAD can validate a new-money thesis. NOMAD keeps it in evidence research rather than applying the wrong generic model.'
     };
   }
 
-  // Explicitly bad evidence is a hard gate. Missing evidence is not treated
-  // as bad evidence; it lowers the validation tier instead.
+  // Explicit negative evidence is different from missing evidence.
+  // Missing evidence triggers research; verified weakness can reject a thesis.
   if (
     overall === 'WEAK' ||
     cash === 'WEAK'
   ) {
     return {
       state: 'REJECT',
+      validationTier:
+        extendedCoverage >= 67
+          ? 'FULL_STATEMENT'
+          : 'PSX_SUMMARY',
       reason:
         overall === 'WEAK'
-          ? 'The available Financial Analyst evidence currently classifies the company financial view as weak.'
-          : 'Available cash-flow evidence is weak relative to reported earnings.'
+          ? 'The available Financial Analyst evidence classifies the current financial view as weak.'
+          : 'Verified cash-flow evidence is weak relative to reported earnings.'
     };
   }
 
@@ -19985,9 +20248,10 @@ function decisionCenterAnalystGate(
     overall === 'UNRELIABLE'
   ) {
     return {
-      state: 'RESEARCH_REQUIRED',
+      state: 'RESEARCHING',
+      validationTier: 'INCOMPLETE_SUMMARY',
       reason:
-        'Headline PSX financial evidence is incomplete, so NOMAD cannot form a dependable summary thesis yet.'
+        'Headline financial evidence is incomplete. NOMAD will keep researching the company and continue through the ranked universe instead of letting this missing evidence consume a validated-analysis slot.'
     };
   }
 
@@ -19998,8 +20262,12 @@ function decisionCenterAnalystGate(
   ) {
     return {
       state: 'REVIEW',
+      validationTier:
+        extendedCoverage >= 67
+          ? 'FULL_STATEMENT'
+          : 'PSX_SUMMARY',
       reason:
-        'The headline evidence is usable, but a quality or trend concern keeps this below Priority 1.'
+        'The evidence is usable, but a quality or trend concern prevents high-conviction validation.'
     };
   }
 
@@ -20017,32 +20285,168 @@ function decisionCenterAnalystGate(
       state: 'VALIDATED',
       validationTier: 'FULL_STATEMENT',
       reason:
-        'Headline and extended financial evidence pass the current Decision Center gate.'
+        'Headline and extended financial evidence pass the current analyst gate.'
     };
   }
 
   if (overall === 'GOOD') {
     return {
-      state: 'SUMMARY_VALIDATED',
+      state: 'PARTIALLY_VALIDATED',
       validationTier: 'PSX_SUMMARY',
       reason:
-        'Official PSX headline financials support the opportunity, but full cash-flow/balance-sheet validation is not yet available. NOMAD limits this to staged exposure.'
+        'Official PSX headline financials support the thesis, but full cash-flow/balance-sheet validation is not yet available. NOMAD can only consider staged exposure with lower confidence.'
     };
   }
 
   return {
     state: 'REVIEW',
+    validationTier: 'PSX_SUMMARY',
     reason:
-      'The headline evidence is usable but does not yet support Priority 1.'
+      'The headline evidence is usable but does not yet support a high-conviction thesis.'
   };
 }
 
-function decisionCenterCandidateView(
+function decisionEvidenceProfile(
+  candidate,
+  analystGate
+) {
+  const analyst =
+    candidate?.analystCore ||
+    null;
+
+  const summaryCoverage =
+    safeNumber(
+      analyst?.coverage
+        ?.summaryCoveragePct ??
+      analyst?.coverage
+        ?.coreCoveragePct
+    ) ||
+    0;
+
+  const extendedCoverage =
+    safeNumber(
+      analyst?.coverage
+        ?.extendedCoveragePct
+    ) ||
+    0;
+
+  const dataQuality =
+    safeNumber(
+      candidate?.dataQuality
+        ?.score
+    ) ||
+    0;
+
+  const evidenceState =
+    String(
+      candidate?.fundamentalEvidenceState ||
+      ''
+    );
+
+  let freshnessScore = 85;
+
+  if (
+    evidenceState === 'LIVE' ||
+    evidenceState === 'CACHE_FRESH'
+  ) {
+    freshnessScore = 100;
+  } else if (
+    evidenceState === 'CACHE_FALLBACK'
+  ) {
+    freshnessScore = 65;
+  } else if (!evidenceState) {
+    freshnessScore = 50;
+  }
+
+  let score =
+    summaryCoverage * 0.40 +
+    extendedCoverage * 0.25 +
+    dataQuality * 0.20 +
+    freshnessScore * 0.15;
+
+  if (
+    analystGate?.validationTier ===
+      'SECTOR_MODEL_REQUIRED'
+  ) {
+    score = Math.min(
+      score,
+      45
+    );
+  }
+
+  if (
+    analystGate?.state ===
+      'RESEARCHING'
+  ) {
+    score = Math.min(
+      score,
+      55
+    );
+  }
+
+  score =
+    decisionRound(
+      decisionClamp(score),
+      2
+    );
+
+  const confidence =
+    score >= 82
+      ? 'HIGH'
+      : score >= 62
+        ? 'MEDIUM'
+        : score >= 42
+          ? 'LOW'
+          : 'UNRESOLVED';
+
+  return {
+    summaryCoveragePct:
+      decisionRound(
+        summaryCoverage,
+        2
+      ),
+    extendedCoveragePct:
+      decisionRound(
+        extendedCoverage,
+        2
+      ),
+    dataQualityPct:
+      decisionRound(
+        dataQuality,
+        2
+      ),
+    freshnessScore,
+    score,
+    confidence,
+    validationTier:
+      analystGate?.validationTier ||
+      'NONE',
+    state:
+      analystGate?.state ||
+      'RESEARCHING',
+    missingSummary:
+      analyst?.coverage
+        ?.coreMetricsMissing ||
+      [],
+    missingExtended:
+      analyst?.coverage
+        ?.extendedMetricsMissing ||
+      []
+  };
+}
+
+function decisionCanonicalCompanyState(
   candidate
 ) {
-  const gate =
+  const analystGate =
     decisionCenterAnalystGate(
       candidate
+    );
+
+  const evidence =
+    decisionEvidenceProfile(
+      candidate,
+      analystGate
     );
 
   const legacyAction =
@@ -20051,88 +20455,145 @@ function decisionCenterCandidateView(
       'WAIT'
     );
 
-  let view = 'WATCH';
-  let bucket = 'PRIORITY_2';
+  let marketAction = 'WATCH';
+  let opportunityTier =
+    'PRIORITY_2';
+  let researchState =
+    'COMPLETE';
   let reason =
     candidate?.actionReason ||
-    'The candidate remains under review.';
+    'The company remains under review.';
 
   if (
-    gate.state ===
-      'RESEARCH_REQUIRED'
+    analystGate.state ===
+      'RESEARCHING'
   ) {
-    view =
-      'RESEARCH_REQUIRED';
-    bucket =
-      'RESEARCH_REQUIRED';
-    reason =
-      gate.reason;
+    marketAction = 'WATCH';
+    opportunityTier =
+      'EVIDENCE_RESEARCH';
+    researchState = 'ACTIVE';
+    reason = analystGate.reason;
   } else if (
-    gate.state === 'REJECT' ||
+    analystGate.state === 'REJECT' ||
     legacyAction === 'AVOID'
   ) {
-    view = 'AVOID';
-    bucket = 'AVOID';
+    marketAction = 'AVOID';
+    opportunityTier =
+      'LOW_PRIORITY';
     reason =
-      gate.state === 'REJECT'
-        ? gate.reason
+      analystGate.state === 'REJECT'
+        ? analystGate.reason
         : (
             candidate?.actionReason ||
-            'The current risk/reward does not pass the shadow model.'
+            'The current risk/reward does not pass the analyst standard.'
           );
   } else if (
-    gate.state === 'VALIDATED' &&
+    analystGate.state === 'VALIDATED' &&
     legacyAction === 'BUY_NOW'
   ) {
-    view = 'BUY';
-    bucket = 'PRIORITY_1';
+    marketAction = 'BUY';
+    opportunityTier =
+      'PRIORITY_1';
     reason =
-      'Validated analyst evidence and the current entry/risk gates support a new position.';
+      'Validated analyst evidence and current entry/risk conditions support a new position.';
   } else if (
-    gate.state === 'VALIDATED' &&
+    analystGate.state === 'VALIDATED' &&
     legacyAction === 'STAGED_BUY'
   ) {
-    view = 'ACCUMULATE';
-    bucket = 'PRIORITY_1';
+    marketAction = 'ACCUMULATE';
+    opportunityTier =
+      'PRIORITY_1';
     reason =
-      'The long-term thesis passes, but NOMAD prefers staged exposure at the current entry.';
+      'The thesis is validated, but NOMAD prefers staged exposure at the current entry.';
   } else if (
-    gate.state === 'SUMMARY_VALIDATED' &&
+    analystGate.state ===
+      'PARTIALLY_VALIDATED' &&
     (
       legacyAction === 'BUY_NOW' ||
       legacyAction === 'STAGED_BUY'
     )
   ) {
-    // PSX summary evidence can rank a company as a current opportunity,
-    // but incomplete extended statements cap the action at ACCUMULATE.
-    view = 'ACCUMULATE';
-    bucket = 'PRIORITY_1';
-    reason = gate.reason;
+    marketAction = 'ACCUMULATE';
+    opportunityTier =
+      'PRIORITY_1';
+    reason = analystGate.reason;
   } else if (
-    gate.state === 'REVIEW' &&
+    analystGate.state === 'REVIEW' &&
     (
       legacyAction === 'BUY_NOW' ||
       legacyAction === 'STAGED_BUY'
     )
   ) {
-    view = 'ACCUMULATE';
-    bucket = 'PRIORITY_2';
-    reason =
-      gate.reason;
+    marketAction = 'ACCUMULATE';
+    opportunityTier =
+      'PRIORITY_2';
+    reason = analystGate.reason;
   } else {
-    view = 'WATCH';
-    bucket = 'PRIORITY_2';
+    marketAction = 'WATCH';
+    opportunityTier =
+      'PRIORITY_2';
     reason =
       legacyAction === 'WAIT'
         ? (
             candidate?.actionReason ||
-            gate.reason
+            analystGate.reason
           )
-        : gate.reason;
+        : analystGate.reason;
   }
+
+  const allocationAllowed =
+    (
+      marketAction === 'BUY' ||
+      marketAction === 'ACCUMULATE'
+    ) &&
+    (
+      analystGate.state === 'VALIDATED' ||
+      analystGate.state ===
+        'PARTIALLY_VALIDATED' ||
+      analystGate.state === 'REVIEW'
+    ) &&
+    researchState !== 'ACTIVE';
+
+  const allocationReason =
+    allocationAllowed
+      ? 'The canonical market action is actionable and the evidence state is sufficient for the current shadow allocator.'
+      : marketAction === 'WATCH'
+        ? 'WATCH is never allowed to receive new capital.'
+        : researchState === 'ACTIVE'
+          ? 'Automatic evidence research is still active, so allocation is blocked.'
+          : 'The current canonical state does not permit a new-money allocation.';
+
+  return {
+    securityState:
+      'ACTIVE_CANDIDATE',
+    evidence,
+    analystGate,
+    researchState,
+    marketAction,
+    opportunityTier,
+    reason,
+    allocationPermission: {
+      allowed:
+        allocationAllowed,
+      reason:
+        allocationReason
+    }
+  };
+}
+
+function decisionCenterCandidateView(
+  candidate
+) {
+  const canonicalState =
+    decisionCanonicalCompanyState(
+      candidate
+    );
 
   const coverage =
     safeNumber(
+      candidate?.analystCore
+        ?.coverage
+        ?.summaryCoveragePct ??
       candidate?.analystCore
         ?.coverage
         ?.coreCoveragePct
@@ -20148,33 +20609,40 @@ function decisionCenterCandidateView(
         0
       ) +
       (
-        gate.state === 'VALIDATED'
+        canonicalState.opportunityTier ===
+          'PRIORITY_1'
           ? 5
-          : gate.state === 'SUMMARY_VALIDATED'
-            ? 3
-            : gate.state === 'REVIEW'
-              ? 1
-              : 0
+          : canonicalState.opportunityTier ===
+              'PRIORITY_2'
+            ? 2
+            : 0
       ) +
       Math.min(
-        3,
+        4,
+        canonicalState.evidence.score /
+          100 *
+          4
+      ) +
+      Math.min(
+        2,
         coverage /
           100 *
-          3
+          2
       ),
       2
     );
 
   return {
     ...candidate,
+    canonicalState,
     analystGate:
-      gate,
+      canonicalState.analystGate,
     decisionCenterView:
-      view,
+      canonicalState.marketAction,
     decisionCenterBucket:
-      bucket,
+      canonicalState.opportunityTier,
     decisionCenterReason:
-      reason,
+      canonicalState.reason,
     opportunityRankScore:
       rankScore
   };
@@ -20187,6 +20655,12 @@ function decisionCenterSummary(
   const analyst =
     candidate?.analystCore ||
     null;
+
+  const canonical =
+    candidate?.canonicalState ||
+    decisionCanonicalCompanyState(
+      candidate
+    );
 
   return {
     rank,
@@ -20201,11 +20675,15 @@ function decisionCenterSummary(
     marketAsOf:
       candidate.marketAsOf,
     decisionCenterView:
-      candidate.decisionCenterView,
+      canonical.marketAction,
     reason:
-      candidate.decisionCenterReason,
+      canonical.reason,
     analystGate:
-      candidate.analystGate,
+      canonical.analystGate,
+    canonicalState:
+      canonical,
+    allocationPermission:
+      canonical.allocationPermission,
     opportunityRankScore:
       candidate.opportunityRankScore,
     overallScore:
@@ -20234,18 +20712,22 @@ function decisionCenterSummary(
           ?.state ||
         'UNAVAILABLE',
       coveragePct:
-        analyst?.coverage
-          ?.summaryCoveragePct ??
-        analyst?.coverage
-          ?.coreCoveragePct ??
-        null,
+        canonical.evidence
+          .summaryCoveragePct,
       extendedCoveragePct:
-        analyst?.coverage
-          ?.extendedCoveragePct ??
-        null,
+        canonical.evidence
+          .extendedCoveragePct,
+      evidenceConfidence:
+        canonical.evidence
+          .confidence,
+      evidenceScore:
+        canonical.evidence
+          .score,
       evidenceTier:
-        analyst?.evidenceTier ||
-        'UNAVAILABLE',
+        canonical.evidence
+          .validationTier,
+      researchState:
+        canonical.researchState,
       earningsQuality:
         analyst?.views
           ?.earningsQuality
@@ -20297,7 +20779,8 @@ function buildDecisionOpportunityBoard(
     sortGroup(
       enriched.filter(
         item =>
-          item.decisionCenterBucket ===
+          item.canonicalState
+            ?.opportunityTier ===
             'PRIORITY_1'
       )
     )
@@ -20307,18 +20790,20 @@ function buildDecisionOpportunityBoard(
     sortGroup(
       enriched.filter(
         item =>
-          item.decisionCenterBucket ===
+          item.canonicalState
+            ?.opportunityTier ===
             'PRIORITY_2'
       )
     )
       .slice(0, 5);
 
-  const researchRequired =
+  const evidenceResearch =
     sortGroup(
       enriched.filter(
         item =>
-          item.decisionCenterBucket ===
-            'RESEARCH_REQUIRED'
+          item.canonicalState
+            ?.opportunityTier ===
+            'EVIDENCE_RESEARCH'
       )
     )
       .slice(0, 5);
@@ -20327,50 +20812,50 @@ function buildDecisionOpportunityBoard(
     sortGroup(
       enriched.filter(
         item =>
-          item.decisionCenterBucket ===
-            'AVOID'
+          item.canonicalState
+            ?.opportunityTier ===
+            'LOW_PRIORITY'
       )
     )
       .slice(0, 5);
 
+  const summarize =
+    list =>
+      list.map(
+        (item, index) =>
+          decisionCenterSummary(
+            item,
+            index + 1
+          )
+      );
+
+  const researchSummaries =
+    summarize(
+      evidenceResearch
+    );
+
   return {
     priority1:
-      priority1.map(
-        (item, index) =>
-          decisionCenterSummary(
-            item,
-            index + 1
-          )
+      summarize(
+        priority1
       ),
     priority2:
-      priority2.map(
-        (item, index) =>
-          decisionCenterSummary(
-            item,
-            index + 1
-          )
+      summarize(
+        priority2
       ),
+    evidenceResearch:
+      researchSummaries,
+    // Backwards-compatible alias for older UI/storage readers.
     researchRequired:
-      researchRequired.map(
-        (item, index) =>
-          decisionCenterSummary(
-            item,
-            index + 1
-          )
-      ),
+      researchSummaries,
     avoid:
-      avoid.map(
-        (item, index) =>
-          decisionCenterSummary(
-            item,
-            index + 1
-          )
+      summarize(
+        avoid
       ),
     all:
       enriched
   };
 }
-
 
 async function buildDecisionPortfolioContext(
   market
@@ -20666,160 +21151,144 @@ function decisionCenterAllocationCandidatePool(
       ? opportunityBoard.all
       : [];
 
-  const priorityOne =
+  const eligible =
     all
       .filter(
         item =>
-          item.decisionCenterBucket ===
-            'PRIORITY_1' &&
+          item?.canonicalState
+            ?.allocationPermission
+            ?.allowed === true &&
           (
-            item.decisionCenterView ===
-              'BUY' ||
-            item.decisionCenterView ===
-              'ACCUMULATE'
+            item.canonicalState
+              ?.marketAction === 'BUY' ||
+            item.canonicalState
+              ?.marketAction === 'ACCUMULATE'
           )
       )
       .map(
-        item => ({
-          ...item,
-          allocationTier:
-            'PRIORITY_1',
-          allocationStrengthMultiplier:
-            item.decisionCenterView ===
-              'ACCUMULATE'
-              ? 0.82
-              : 1,
-          allocationCapMultiplier:
-            item.decisionCenterView ===
-              'ACCUMULATE'
-              ? 0.90
-              : 1
-        })
-      );
-
-  // Priority 2 is never treated as equivalent to Priority 1. It can receive a
-  // smaller provisional allocation only when the company itself is financially
-  // validated, risk/data-quality gates pass, and the reason for Priority 2 is
-  // primarily timing/entry rather than missing evidence. Financial-sector names
-  // remain excluded until their sector-specific analyst model exists.
-  const priorityTwo =
-    all
-      .filter(
         item => {
-          if (
-            item.decisionCenterBucket !==
-              'PRIORITY_2' ||
-            decisionCenterFinancialSectorCandidate(
-              item
-            )
-          ) {
-            return false;
-          }
+          const action =
+            item.canonicalState
+              .marketAction;
 
-          const gateState =
-            String(
-              item.analystGate
-                ?.state ||
-              ''
-            );
+          const tier =
+            item.canonicalState
+              .opportunityTier;
 
-          const overall =
-            safeNumber(
-              item.overallScore
-            ) ||
-            0;
+          const confidence =
+            item.canonicalState
+              .evidence
+              .confidence;
 
-          const fundamental =
-            safeNumber(
-              item.fundamental
-                ?.score
-            ) ||
-            0;
+          const actionMultiplier =
+            action === 'BUY'
+              ? 1
+              : 0.76;
+
+          const tierMultiplier =
+            tier === 'PRIORITY_1'
+              ? 1
+              : 0.72;
+
+          const confidenceMultiplier =
+            confidence === 'HIGH'
+              ? 1
+              : confidence === 'MEDIUM'
+                ? 0.86
+                : 0.68;
 
           const riskScore =
             safeNumber(
-              item.risk
-                ?.score
+              item.risk?.score
             ) ||
-            0;
+            50;
 
-          const dataQuality =
+          const entryScore =
             safeNumber(
-              item.dataQuality
-                ?.score
+              item.entry?.score
             ) ||
-            0;
+            50;
 
-          const entry =
-            safeNumber(
-              item.entry
-                ?.score
-            ) ||
-            0;
+          const riskMultiplier =
+            0.82 +
+            decisionClamp(
+              riskScore
+            ) /
+            100 *
+            0.24;
+
+          const entryMultiplier =
+            0.86 +
+            decisionClamp(
+              entryScore
+            ) /
+            100 *
+            0.18;
+
+          const allocationStrengthMultiplier =
+            actionMultiplier *
+            tierMultiplier *
+            confidenceMultiplier *
+            riskMultiplier *
+            entryMultiplier;
+
+          let allocationCapMultiplier =
+            action === 'BUY'
+              ? 1
+              : 0.84;
+
+          if (
+            tier === 'PRIORITY_2'
+          ) {
+            allocationCapMultiplier *=
+              0.72;
+          }
+
+          if (
+            confidence === 'LOW'
+          ) {
+            allocationCapMultiplier *=
+              0.75;
+          }
+
+          return {
+            ...item,
+            allocationTier:
+              tier,
+            allocationStrengthMultiplier,
+            allocationCapMultiplier
+          };
+        }
+      )
+      .sort(
+        (
+          a,
+          b
+        ) => {
+          if (
+            a.allocationTier !==
+            b.allocationTier
+          ) {
+            return a.allocationTier ===
+              'PRIORITY_1'
+                ? -1
+                : 1;
+          }
 
           return (
-            (
-              gateState ===
-                'VALIDATED' ||
-              gateState ===
-                'SUMMARY_VALIDATED'
-            ) &&
-            overall >=
-              riskPolicy.minOverallScore -
-              4 &&
-            fundamental >= 60 &&
-            riskScore >=
-              riskPolicy.minRiskScore &&
-            dataQuality >=
-              riskPolicy.minDataQualityScore &&
-            entry >= 30
+            b.opportunityRankScore -
+            a.opportunityRankScore
           );
         }
-      )
-      .map(
-        item => ({
-          ...item,
-          allocationTier:
-            'PRIORITY_2',
-          allocationStrengthMultiplier:
-            0.48,
-          allocationCapMultiplier:
-            0.50
-        })
       );
 
-  return [
-    ...priorityOne,
-    ...priorityTwo
-  ]
-    .sort(
-      (
-        a,
-        b
-      ) => {
-        if (
-          a.allocationTier !==
-          b.allocationTier
-        ) {
-          return a.allocationTier ===
-            'PRIORITY_1'
-              ? -1
-              : 1;
-        }
-
-        return (
-          b.opportunityRankScore -
-          a.opportunityRankScore
-        );
-      }
+  return eligible.slice(
+    0,
+    Math.max(
+      1,
+      targetPositions
     )
-    .slice(
-      0,
-      Math.max(
-        1,
-        targetPositions
-      )
-    );
+  );
 }
 
 function allocateDecisionCenterOpportunities(
@@ -21164,11 +21633,12 @@ function allocateDecisionCenterOpportunities(
       sector:
         candidate.sector,
       action:
-        candidate.allocationTier ===
-          'PRIORITY_2'
-          ? 'ACCUMULATE'
-          : candidate.decisionCenterView,
+        candidate.canonicalState
+          ?.marketAction ||
+        candidate.decisionCenterView,
       marketView:
+        candidate.canonicalState
+          ?.marketAction ||
         candidate.decisionCenterView,
       allocationTier:
         candidate.allocationTier,
@@ -21238,7 +21708,7 @@ function allocateDecisionCenterOpportunities(
       note:
         candidate.allocationTier ===
           'PRIORITY_2'
-          ? 'Smaller provisional allocation from Priority 2: financial/risk evidence passes, but the full current-action threshold is not met. NOMAD deliberately sizes this below Priority 1.'
+          ? 'Actionable Priority 2 position: the canonical market action is ACCUMULATE, evidence passes the allocation gate, and NOMAD deliberately sizes it below Priority 1.'
           : candidate.decisionCenterView ===
               'ACCUMULATE'
             ? 'Staged Priority 1 exposure: the analyst thesis passes, but NOMAD is not sizing this as a full position yet.'
@@ -21249,6 +21719,8 @@ function allocateDecisionCenterOpportunities(
       symbol:
         candidate.symbol,
       marketView:
+        candidate.canonicalState
+          ?.marketAction ||
         candidate.decisionCenterView,
       portfolioAction:
         existingStockValuePaisa > 0
@@ -21285,7 +21757,7 @@ function allocateDecisionCenterOpportunities(
           ? 'The holding is below NOMAD\'s current target exposure, so some of the new capital can be added without breaching stock or sector limits.'
           : candidate.allocationTier ===
               'PRIORITY_2'
-            ? 'NOMAD permits only a smaller provisional position because this is a validated Priority 2 opportunity, not a full Priority 1 allocation.'
+            ? 'The canonical market action is actionable, but this is a lower-priority opportunity, so NOMAD limits the position size.'
             : 'The opportunity passes the current allocation gate and fits the portfolio diversification limits.'
     });
   }
@@ -22912,141 +23384,198 @@ async function runDecisionLab(
           a.deepProxyScore
       );
 
-  const deepShortList =
-    historyReady
-      .slice(
-        0,
-        DECISION_CENTER_DEEP_LIMIT
+  // 0.9.0 adaptive deep-analysis backfill. Missing evidence no longer consumes
+  // the entire comparable set: NOMAD keeps moving through the ranked history-ready
+  // universe until it reaches the comparable target or exhausts the bounded research budget.
+  const deepResults = [];
+  const deepAttemptedItems = [];
+  let comparableCount = 0;
+  let deepCursor = 0;
+
+  while (
+    deepCursor < historyReady.length &&
+    deepAttemptedItems.length <
+      DECISION_CENTER_DEEP_ATTEMPT_LIMIT &&
+    comparableCount <
+      DECISION_CENTER_COMPARABLE_TARGET
+  ) {
+    const remainingAttempts =
+      DECISION_CENTER_DEEP_ATTEMPT_LIMIT -
+      deepAttemptedItems.length;
+
+    const batch =
+      historyReady.slice(
+        deepCursor,
+        deepCursor +
+          Math.min(
+            DECISION_CENTER_DEEP_BATCH_SIZE,
+            remainingAttempts
+          )
       );
 
-  const deepResults =
-    await decisionMapWithConcurrency(
-      deepShortList,
-      4,
-      async item => {
-        const fundamentalEvidence =
-          await decisionLoadFundamentals(
-            item.row,
-            memoryMap
-          );
+    if (!batch.length) {
+      break;
+    }
 
-        const fundamentals =
-          fundamentalEvidence
-            .fundamentals;
+    deepCursor +=
+      batch.length;
 
-        const fundamental =
-          scoreDecisionFundamentals(
-            fundamentals
-          );
-
-        fundamental.evidenceState =
-          fundamentalEvidence
-            .evidenceState;
-
-        fundamental.cachedAt =
-          fundamentalEvidence
-            .cachedAt;
-
-        if (
-          fundamentalEvidence.error
-        ) {
-          fundamental.risks =
-            uniqueTextValues([
-              ...(
-                fundamental.risks ||
-                []
-              ),
-              fundamentalEvidence.error
-            ]);
-        }
-
-        const dataQuality =
-          scoreDecisionDataQuality(
-            item.row,
-            item.historicalContext,
-            fundamental
-          );
-
-        const overallScore =
-          decisionOverallScore(
-            model,
-            fundamental,
-            item.valuation,
-            item.entry,
-            item.risk,
-            dataQuality
-          );
-
-        const candidate = {
-          symbol:
-            item.row.symbol,
-          companyName:
-            item.row.companyName,
-          sector:
-            item.row.sector,
-          statusCodes:
-            item.row.statusCodes ||
-            [],
-          price:
-            decisionRound(
-              item.row.price,
-              4
-            ),
-          marketAsOf:
-            item.row.asOf ||
-            market.asOf ||
-            null,
-          averageVolume30d:
-            decisionRound(
-              item.row.averageVolume30d,
-              0
-            ),
-          screeningScore:
-            item.screeningScore,
-          historicalContext:
-            item.historicalContext,
-          fundamental,
-          analystCore:
-            fundamentals?.analystCore ||
-            null,
-          fundamentalEvidenceState:
-            fundamentalEvidence
-              .evidenceState,
-          fundamentalEvidenceDiagnostics:
-            fundamentalEvidence
-              .diagnostics ||
-            null,
-          valuation:
-            item.valuation,
-          entry:
-            item.entry,
-          risk:
-            item.risk,
-          dataQuality,
-          overallScore
-        };
-
-        const action =
-          decisionCandidateAction(
-            candidate,
-            model,
-            riskPolicy
-          );
-
-        candidate.action =
-          action.action;
-
-        candidate.actionReason =
-          action.reason;
-
-        candidate.narrative =
-          decisionCandidateNarrative(
-            candidate
-          );
-
-        return candidate;
-      }
+    deepAttemptedItems.push(
+      ...batch
     );
+
+    const batchResults =
+      await decisionMapWithConcurrency(
+        batch,
+        4,
+        async item => {
+          const fundamentalEvidence =
+            await decisionLoadFundamentals(
+              item.row,
+              memoryMap
+            );
+
+          const fundamentals =
+            fundamentalEvidence
+              .fundamentals;
+
+          const fundamental =
+            scoreDecisionFundamentals(
+              fundamentals
+            );
+
+          fundamental.evidenceState =
+            fundamentalEvidence
+              .evidenceState;
+
+          fundamental.cachedAt =
+            fundamentalEvidence
+              .cachedAt;
+
+          if (
+            fundamentalEvidence.error
+          ) {
+            fundamental.risks =
+              uniqueTextValues([
+                ...(
+                  fundamental.risks ||
+                  []
+                ),
+                fundamentalEvidence.error
+              ]);
+          }
+
+          const dataQuality =
+            scoreDecisionDataQuality(
+              item.row,
+              item.historicalContext,
+              fundamental
+            );
+
+          const overallScore =
+            decisionOverallScore(
+              model,
+              fundamental,
+              item.valuation,
+              item.entry,
+              item.risk,
+              dataQuality
+            );
+
+          const candidate = {
+            symbol:
+              item.row.symbol,
+            companyName:
+              item.row.companyName,
+            sector:
+              item.row.sector,
+            statusCodes:
+              item.row.statusCodes ||
+              [],
+            price:
+              decisionRound(
+                item.row.price,
+                4
+              ),
+            marketAsOf:
+              item.row.asOf ||
+              market.asOf ||
+              null,
+            averageVolume30d:
+              decisionRound(
+                item.row.averageVolume30d,
+                0
+              ),
+            screeningScore:
+              item.screeningScore,
+            historicalContext:
+              item.historicalContext,
+            fundamental,
+            analystCore:
+              fundamentals?.analystCore ||
+              null,
+            fundamentalEvidenceState:
+              fundamentalEvidence
+                .evidenceState,
+            fundamentalEvidenceDiagnostics:
+              fundamentalEvidence
+                .diagnostics ||
+              null,
+            valuation:
+              item.valuation,
+            entry:
+              item.entry,
+            risk:
+              item.risk,
+            dataQuality,
+            overallScore
+          };
+
+          const action =
+            decisionCandidateAction(
+              candidate,
+              model,
+              riskPolicy
+            );
+
+          candidate.action =
+            action.action;
+
+          candidate.actionReason =
+            action.reason;
+
+          candidate.narrative =
+            decisionCandidateNarrative(
+              candidate
+            );
+
+          candidate.canonicalState =
+            decisionCanonicalCompanyState(
+              candidate
+            );
+
+          return candidate;
+        }
+      );
+
+    deepResults.push(
+      ...batchResults
+    );
+
+    comparableCount =
+      deepResults.filter(
+        candidate =>
+          candidate &&
+          !candidate.error &&
+          candidate.symbol &&
+          candidate.canonicalState
+            ?.opportunityTier !==
+            'EVIDENCE_RESEARCH'
+      ).length;
+  }
+
+  const deepShortList =
+    deepAttemptedItems;
 
   const candidates =
     deepResults
@@ -23106,10 +23635,13 @@ async function runDecisionLab(
       .priority2
       .length;
 
-  const researchRequiredCount =
+  const evidenceResearchCount =
     opportunityBoard
-      .researchRequired
+      .evidenceResearch
       .length;
+
+  const researchRequiredCount =
+    evidenceResearchCount;
 
   const decisionBlocked =
     candidates.length === 0 &&
@@ -23161,11 +23693,11 @@ async function runDecisionLab(
     researchRequiredCount > 0
   ) {
     action =
-      'RESEARCH_REQUIRED';
+      'EVIDENCE_RESEARCH';
     headline =
-      'Interesting candidates exist, but NOMAD cannot independently validate them yet.';
+      'Interesting candidates exist and NOMAD is automatically researching the missing evidence.';
     reason =
-      'Missing evidence does not hide a stock. It is shown under Research Required until the missing analyst evidence is resolved.';
+      'Missing evidence is a research trigger, not a final verdict. NOMAD keeps these names visible, backfills additional candidates, and blocks allocation until the evidence state becomes actionable.';
   }
 
   const evidencePool =
@@ -23173,32 +23705,89 @@ async function runDecisionLab(
       ? opportunityBoard.priority1
       : opportunityBoard.priority2.length
         ? opportunityBoard.priority2
-        : opportunityBoard.researchRequired;
+        : opportunityBoard.evidenceResearch;
+
+  const averageMetric =
+    (
+      list,
+      getter
+    ) => {
+      if (!list.length) {
+        return 0;
+      }
+
+      return decisionRound(
+        list.reduce(
+          (
+            sum,
+            item
+          ) =>
+            sum +
+            (
+              safeNumber(
+                getter(item)
+              ) ||
+              0
+            ),
+          0
+        ) /
+        list.length,
+        2
+      );
+    };
+
+  const evidenceSample =
+    evidencePool.slice(
+      0,
+      5
+    );
+
+  const evidenceProfile = {
+    confidenceScore:
+      averageMetric(
+        evidenceSample,
+        item =>
+          item.canonicalState
+            ?.evidence
+            ?.score
+      ),
+    summaryCoveragePct:
+      averageMetric(
+        evidenceSample,
+        item =>
+          item.canonicalState
+            ?.evidence
+            ?.summaryCoveragePct
+      ),
+    extendedCoveragePct:
+      averageMetric(
+        evidenceSample,
+        item =>
+          item.canonicalState
+            ?.evidence
+            ?.extendedCoveragePct
+      ),
+    dataQualityPct:
+      averageMetric(
+        evidenceSample,
+        item =>
+          item.canonicalState
+            ?.evidence
+            ?.dataQualityPct
+      )
+  };
+
+  evidenceProfile.confidence =
+    evidenceProfile.confidenceScore >= 82
+      ? 'HIGH'
+      : evidenceProfile.confidenceScore >= 62
+        ? 'MEDIUM'
+        : evidenceProfile.confidenceScore >= 42
+          ? 'LOW'
+          : 'UNRESOLVED';
 
   const evidenceStrength =
-    evidencePool.length
-      ? decisionRound(
-          evidencePool
-            .slice(0, 3)
-            .reduce(
-              (sum, item) =>
-                sum +
-                (
-                  safeNumber(
-                    item.analyst
-                      ?.coveragePct
-                  ) ||
-                  0
-                ),
-              0
-            ) /
-            Math.min(
-              3,
-              evidencePool.length
-            ),
-          2
-        )
-      : 0;
+    evidenceProfile.confidenceScore;
 
   const result = {
     status: 'OK',
@@ -23276,7 +23865,15 @@ async function runDecisionLab(
       historicalAnalyzed:
         historyReady.length,
       deepAnalyzed:
-        candidates.length,
+        deepAttemptedItems.length,
+      comparableAnalyzed:
+        comparableCount,
+      evidenceResearch:
+        evidenceResearchCount,
+      deepAttemptLimit:
+        DECISION_CENTER_DEEP_ATTEMPT_LIMIT,
+      comparableTarget:
+        DECISION_CENTER_COMPARABLE_TARGET,
       dataBlocked:
         dataBlockedCount,
       rankingBudgetIndependent:
@@ -23293,6 +23890,8 @@ async function runDecisionLab(
       investedPct:
         allocation.investedPct,
       evidenceStrength,
+      evidence:
+        evidenceProfile,
       probabilityClaim:
         'NONE — evidence strength is not a calibrated probability.'
     },
@@ -23303,8 +23902,10 @@ async function runDecisionLab(
         opportunityBoard.priority1,
       priority2:
         opportunityBoard.priority2,
+      evidenceResearch:
+        opportunityBoard.evidenceResearch,
       researchRequired:
-        opportunityBoard.researchRequired,
+        opportunityBoard.evidenceResearch,
       avoid:
         opportunityBoard.avoid
     },
@@ -23366,7 +23967,7 @@ async function runDecisionLab(
       'Allocations are planning principals only. Brokerage, levies, taxes and execution slippage are not yet included.',
       'No order-execution capability exists. The user remains the final decision maker.',
       'Current scoring rules remain supporting evidence only; Priority 1 now also requires the Financial Analyst evidence gate.',
-      'Opportunity ranking is independent of the entered budget. The allocator then sizes a dynamic, portfolio-aware set of positions from Priority 1 and only financially validated Priority 2 opportunities; Research Required and Avoid receive no capital.',
+      'Opportunity ranking is independent of the entered budget. The allocator receives only canonical BUY/ACCUMULATE states with allocation permission; WATCH, active Evidence Research and Avoid are hard-blocked from receiving capital.',
       ...(
         candidates.some(
           candidate =>
@@ -23827,8 +24428,8 @@ function runDecisionEngineSelfTests() {
       ...validatedDecisionCandidate,
       analystCore: null
     }).state,
-    'RESEARCH_REQUIRED',
-    'missing analyst evidence must remain visible but cannot become Priority 1'
+    'RESEARCHING',
+    'missing analyst evidence must trigger automatic research and cannot become Priority 1'
   );
 
   const summaryValidatedCandidate = {
@@ -23855,8 +24456,8 @@ function runDecisionEngineSelfTests() {
     decisionCenterAnalystGate(
       summaryValidatedCandidate
     ).state,
-    'SUMMARY_VALIDATED',
-    'complete PSX summary evidence must remain actionable even when the source does not provide extended statements'
+    'PARTIALLY_VALIDATED',
+    'complete PSX summary evidence must remain partially validated when the source does not provide extended statements'
   );
 
   assert.equal(
@@ -23947,7 +24548,7 @@ function runDecisionEngineSelfTests() {
     syntheticBoard.researchRequired[0]
       .symbol,
     'RESEARCH',
-    'missing-evidence candidate must remain visible under Research Required'
+    'missing-evidence candidate must remain visible under Evidence Research'
   );
 
   const strictAllocation =
@@ -23972,6 +24573,51 @@ function runDecisionEngineSelfTests() {
         item.shares > 0
     ),
     'Decision Center allocation must use positive whole shares'
+  );
+
+  const watchCandidate = {
+    ...validatedDecisionCandidate,
+    symbol: 'WATCHONLY',
+    action: 'WAIT',
+    actionReason: 'Synthetic watch state.'
+  };
+
+  const watchBoard =
+    buildDecisionOpportunityBoard([
+      watchCandidate
+    ]);
+
+  const watchAllocation =
+    allocateDecisionCenterOpportunities(
+      watchBoard,
+      100000,
+      riskBalanced
+    );
+
+  assert.equal(
+    watchAllocation.allocations.length,
+    0,
+    'canonical WATCH state must never receive new capital'
+  );
+
+  const researchCanonical =
+    decisionCanonicalCompanyState({
+      ...validatedDecisionCandidate,
+      symbol: 'RESEARCH2',
+      analystCore: null
+    });
+
+  assert.equal(
+    researchCanonical.allocationPermission.allowed,
+    false,
+    'active Evidence Research must always block allocation'
+  );
+
+  assert.ok(
+    decisionCanonicalCompanyState(
+      summaryValidatedCandidate
+    ).evidence.score < 100,
+    'summary-only evidence must never masquerade as complete evidence confidence'
   );
 
   const ledgerSynthetic =
@@ -24074,6 +24720,32 @@ function runDecisionEngineSelfTests() {
     dynamicLargeCaps.stockCapPct <
       riskBalanced.maxStockPct,
     'dynamic diversification must tighten the legacy per-stock cap for larger portfolios'
+  );
+
+  const marketPulseSynthetic =
+    buildMarketPulseFromRows([
+      { symbol: 'CORE', changePct: 5, price: 100, recommendationEligible: true },
+      { symbol: 'NONCORE', changePct: 12, price: 10, recommendationEligible: false },
+      { symbol: 'FLAT', changePct: 0, price: 20, recommendationEligible: true },
+      { symbol: 'LOSS', changePct: -8, price: 30, recommendationEligible: false }
+    ]);
+
+  assert.equal(
+    marketPulseSynthetic.gainers[0].symbol,
+    'NONCORE',
+    'market-wide Top Gainers must not be filtered by NOMAD recommendation eligibility'
+  );
+
+  assert.equal(
+    marketPulseSynthetic.losers[0].symbol,
+    'LOSS',
+    'market-wide Top Losers must not be filtered by NOMAD recommendation eligibility'
+  );
+
+  assert.deepEqual(
+    marketPulseSynthetic.breadth,
+    { advancers: 2, decliners: 1, unchanged: 1 },
+    'market breadth must represent the primary live feed rather than the investable universe'
   );
 
   console.log(
@@ -25066,6 +25738,136 @@ async function runMarketSnapshotScan(
   }
 }
 
+function buildMarketPulseFromRows(
+  rows
+) {
+  const liveRows =
+    (
+      Array.isArray(
+        rows
+      )
+        ? rows
+        : []
+    )
+      .filter(
+        row =>
+          row &&
+          safeNumber(
+            row.changePct
+          ) !== null
+      );
+
+  const moverShape =
+    row => ({
+      symbol:
+        row.symbol,
+      canonicalSymbol:
+        row.canonicalSymbol ||
+        row.symbol,
+      companyName:
+        row.companyName,
+      price:
+        row.price,
+      changePct:
+        roundMemoryNumber(
+          row.changePct,
+          2
+        ),
+      volume:
+        row.volume,
+      sector:
+        row.sector,
+      recommendationEligible:
+        row.recommendationEligible ===
+        true
+    });
+
+  const gainers =
+    [...liveRows]
+      .filter(
+        row =>
+          safeNumber(
+            row.changePct
+          ) > 0
+      )
+      .sort(
+        (
+          a,
+          b
+        ) =>
+          safeNumber(
+            b.changePct
+          ) -
+          safeNumber(
+            a.changePct
+          )
+      )
+      .slice(0, 5)
+      .map(
+        moverShape
+      );
+
+  const losers =
+    [...liveRows]
+      .filter(
+        row =>
+          safeNumber(
+            row.changePct
+          ) < 0
+      )
+      .sort(
+        (
+          a,
+          b
+        ) =>
+          safeNumber(
+            a.changePct
+          ) -
+          safeNumber(
+            b.changePct
+          )
+      )
+      .slice(0, 5)
+      .map(
+        moverShape
+      );
+
+  const breadth =
+    liveRows.length
+      ? {
+          advancers:
+            liveRows.filter(
+              row =>
+                safeNumber(
+                  row.changePct
+                ) > 0
+            ).length,
+          decliners:
+            liveRows.filter(
+              row =>
+                safeNumber(
+                  row.changePct
+                ) < 0
+            ).length,
+          unchanged:
+            liveRows.filter(
+              row =>
+                safeNumber(
+                  row.changePct
+                ) === 0
+            ).length
+        }
+      : null;
+
+  return {
+    gainers,
+    losers,
+    breadth,
+    rowCount:
+      liveRows.length
+  };
+}
+
 async function getIntelligenceFeed() {
   if (!continuousMemoryConfigured()) {
     return {
@@ -25291,123 +26093,70 @@ async function getIntelligenceFeed() {
     null;
 
   if (market) {
-    const eligible =
-      market.stocks.filter(
-        row =>
-          row.recommendationEligible ===
-            true &&
-          safeNumber(
-            row.dayChangePct
-          ) !== null
+    // Market breadth and Top Movers are factual market-wide statistics.
+    // They must come from one primary live provider snapshot and must NOT
+    // be filtered by NOMAD's recommendation eligibility rules.
+    const liveRows =
+      Array.isArray(
+        market.liveMarketRows
+      ) &&
+      market.liveMarketRows.length
+        ? market.liveMarketRows
+        : market.stocks
+            .filter(
+              row =>
+                safeNumber(
+                  row.dayChangePct
+                ) !== null
+            )
+            .map(
+              row => ({
+                symbol:
+                  row.tradingSymbol ||
+                  row.symbol,
+                canonicalSymbol:
+                  row.symbol,
+                companyName:
+                  row.companyName,
+                sector:
+                  row.sector,
+                price:
+                  row.price,
+                changePct:
+                  row.dayChangePct,
+                volume:
+                  row.sessionVolume,
+                recommendationEligible:
+                  row.recommendationEligible ===
+                  true
+              })
+            );
+
+    const pulseData =
+      buildMarketPulseFromRows(
+        liveRows
       );
-
-    const moverShape =
-      row => ({
-        symbol:
-          row.symbol,
-        companyName:
-          row.companyName,
-        price:
-          row.price,
-        changePct:
-          roundMemoryNumber(
-            row.dayChangePct,
-            2
-          ),
-        volume:
-          row.sessionVolume,
-        sector:
-          row.sector
-      });
-
-    const gainers =
-      [...eligible]
-        .filter(
-          row =>
-            safeNumber(
-              row.dayChangePct
-            ) > 0
-        )
-        .sort(
-          (
-            a,
-            b
-          ) =>
-            safeNumber(
-              b.dayChangePct
-            ) -
-            safeNumber(
-              a.dayChangePct
-            )
-        )
-        .slice(0, 5)
-        .map(
-          moverShape
-        );
-
-    const losers =
-      [...eligible]
-        .filter(
-          row =>
-            safeNumber(
-              row.dayChangePct
-            ) < 0
-        )
-        .sort(
-          (
-            a,
-            b
-          ) =>
-            safeNumber(
-              a.dayChangePct
-            ) -
-            safeNumber(
-              b.dayChangePct
-            )
-        )
-        .slice(0, 5)
-        .map(
-          moverShape
-        );
-
-    const breadth =
-      eligible.length
-        ? {
-            advancers:
-              eligible.filter(
-                row =>
-                  safeNumber(
-                    row.dayChangePct
-                  ) > 0
-              ).length,
-            decliners:
-              eligible.filter(
-                row =>
-                  safeNumber(
-                    row.dayChangePct
-                  ) < 0
-              ).length,
-            unchanged:
-              eligible.filter(
-                row =>
-                  safeNumber(
-                    row.dayChangePct
-                  ) === 0
-              ).length
-          }
-        : null;
 
     marketPulse = {
       asOf:
         market.marketWatchAsOf ||
         market.asOf,
-      gainers,
-      losers,
-      breadth,
+      gainers:
+        pulseData.gainers,
+      losers:
+        pulseData.losers,
+      breadth:
+        pulseData.breadth,
       sessionChangeRows:
-        eligible.length,
+        pulseData.rowCount,
       sessionChangeSource:
         market.sessionChangeSource ||
+        null,
+      marketUniverse:
+        market.liveMarketUniverse ||
+        'PRIMARY_LIVE_ROWS',
+      marketDataIntegrity:
+        market.marketDataIntegrity ||
         null,
       marketStatus:
         marketStatus ||
@@ -29083,7 +29832,7 @@ Build ${VERSION}
 Market, company metadata, fundamentals, symbol normalization,
 canonical universe identity, metadata, fundamentals and deterministic technical analysis are connected.
 
-Persistent intelligence memory and the market scanner are connected. Build 0.8.5A adds the live personal portfolio mirror, transaction ledger, realized/unrealized P&L, portfolio health and portfolio-aware Decision Center allocation while preserving strict shadow-only decision controls.
+NOMAD 0.9.0 consolidates security validation, evidence state, analyst action, opportunity priority, portfolio context and allocation permission into one canonical decision contract. Live portfolio and market features remain shadow-only and no trade execution is performed.
 
 </p>
 
@@ -29219,7 +29968,7 @@ Checking connection...
 
 <div class="decisionBoardHeader">
 <div><div class="eyebrow">OPPORTUNITY BOARD</div><h2>Ranked before allocation</h2></div>
-<div class="decisionBoardNote">Priority 1 uses tiered evidence. Missing headline evidence moves a stock to Research Required; missing extended statements lowers confidence and limits sizing. The personal allocator can use smaller validated Priority 2 positions when they improve diversification, but Research Required and Avoid never receive capital.</div>
+<div class="decisionBoardNote">Each company now has one canonical state. Missing evidence triggers automatic Evidence Research and backfill; WATCH, active research and Avoid are never allowed to receive capital. Priority controls ranking, while the canonical market action controls whether allocation is permitted.</div>
 </div>
 
 <div class="opportunityBoardGrid">
@@ -29234,8 +29983,8 @@ Checking connection...
 </div>
 
 <div class="terminalCard opportunityCard researchCard">
-<div class="panelHeader"><div><div class="eyebrow">RESEARCH REQUIRED</div><h2>Interesting but unverified</h2></div><span class="boardCount" id="researchRequiredCount">0</span></div>
-<div id="researchRequiredList" class="opportunityList"><div class="terminalEmpty small">Missing evidence will appear here instead of disappearing.</div></div>
+<div class="panelHeader"><div><div class="eyebrow">EVIDENCE RESEARCH</div><h2>NOMAD is investigating missing evidence</h2></div><span class="boardCount" id="researchRequiredCount">0</span></div>
+<div id="researchRequiredList" class="opportunityList"><div class="terminalEmpty small">Missing evidence triggers automatic research and does not consume the whole comparable set.</div></div>
 </div>
 
 <div class="terminalCard opportunityCard avoidCard">
@@ -29918,7 +30667,7 @@ let marketRows = [];
 
 let currentPage = 1;
 
-const PAGE_SIZE = 50;
+const PAGE_SIZE = 25;
 
 let metadataAuditRows = [];
 
@@ -30157,6 +30906,66 @@ function formatDateTime(
         '2-digit'
     }
   );
+}
+
+function formatKarachiDate(
+  value = Date.now()
+) {
+  const date =
+    new Date(
+      value
+    );
+
+  if (
+    Number.isNaN(
+      date.getTime()
+    )
+  ) {
+    return '';
+  }
+
+  return date.toLocaleDateString(
+    'en-PK',
+    {
+      timeZone:
+        'Asia/Karachi',
+
+      day:
+        'numeric',
+
+      month:
+        'short',
+
+      year:
+        'numeric'
+    }
+  );
+}
+
+function marketClosedLabel(
+  marketStatus
+) {
+  const dateLabel =
+    formatKarachiDate();
+
+  let label =
+    'Market closed' +
+    (
+      dateLabel
+        ? ' for ' +
+          dateLabel
+        : ''
+    );
+
+  if (
+    marketStatus?.holidayName
+  ) {
+    label +=
+      ' · ' +
+      marketStatus.holidayName;
+  }
+
+  return label;
 }
 
 function formatTime(value) {
@@ -30419,12 +31228,95 @@ async function apiPost(
 
 
 /* =========================================================
-   APP NAVIGATION + DECISION CENTER + LIVE PORTFOLIO - BUILD 0.8.5A
+   APP NAVIGATION + DECISION CENTER + LIVE PORTFOLIO - BUILD 0.9.0
 ========================================================= */
 
-function openAppPage(
+const NOMAD_APP_PAGES =
+  new Set([
+    'home',
+    'portfolio',
+    'decision',
+    'research',
+    'explore',
+    'universe',
+    'system'
+  ]);
+
+function normalizedAppPage(
   page
 ) {
+  const normalized =
+    String(
+      page ||
+      ''
+    )
+      .trim()
+      .toLowerCase();
+
+  return NOMAD_APP_PAGES.has(
+    normalized
+  )
+    ? normalized
+    : 'home';
+}
+
+function appPageFromLocation() {
+  const rawHashPage =
+    String(
+      window.location.hash ||
+      ''
+    )
+      .replace(
+        /^#/,
+        ''
+      )
+      .trim()
+      .toLowerCase();
+
+  if (
+    rawHashPage &&
+    NOMAD_APP_PAGES.has(
+      rawHashPage
+    )
+  ) {
+    return rawHashPage;
+  }
+
+  try {
+    const stored =
+      localStorage.getItem(
+        'nomadActivePage'
+      );
+
+    if (
+      stored &&
+      NOMAD_APP_PAGES.has(
+        stored
+      )
+    ) {
+      return stored;
+    }
+  } catch {}
+
+  return 'home';
+}
+
+function openAppPage(
+  page,
+  options = {}
+) {
+  page =
+    normalizedAppPage(
+      page
+    );
+
+  const updateLocation =
+    options.updateLocation !==
+      false;
+
+  const scrollToTop =
+    options.scrollToTop !==
+      false;
   document
     .querySelectorAll(
       '.appPage'
@@ -30453,10 +31345,36 @@ function openAppPage(
       }
     );
 
-  window.scrollTo({
-    top: 0,
-    behavior: 'smooth'
-  });
+  try {
+    localStorage.setItem(
+      'nomadActivePage',
+      page
+    );
+  } catch {}
+
+  if (updateLocation) {
+    const targetHash =
+      '#' +
+      page;
+
+    if (
+      window.location.hash !==
+      targetHash
+    ) {
+      history.pushState(
+        null,
+        '',
+        targetHash
+      );
+    }
+  }
+
+  if (scrollToTop) {
+    window.scrollTo({
+      top: 0,
+      behavior: 'smooth'
+    });
+  }
 
   if (portfolioRefreshTimer) {
     clearInterval(
@@ -30759,6 +31677,12 @@ function renderMarketBreadth(
           escapeHtml(
             pulse.sessionChangeSource
           ) +
+          ' · market-wide primary feed · ' +
+          formatNumber(
+            pulse?.sessionChangeRows || 0,
+            0
+          ) +
+          ' rows' +
           (
             pulse?.asOf
               ? ' · ' +
@@ -30766,6 +31690,16 @@ function renderMarketBreadth(
                   relativeTime(
                     pulse.asOf
                   )
+                )
+              : ''
+          ) +
+          (
+            pulse?.marketDataIntegrity?.status
+              ? ' · provider check ' +
+                escapeHtml(
+                  String(
+                    pulse.marketDataIntegrity.status
+                  ).toLowerCase()
                 )
               : ''
           ) +
@@ -31773,7 +32707,13 @@ async function loadDecisionCenter() {
             ? (
                 status.isOpen
                   ? 'PSX market open'
-                  : 'PSX market closed'
+                  : 'PSX ' +
+                    marketClosedLabel(
+                      status
+                    ).replace(
+                      /^Market/,
+                      'market'
+                    )
               )
             : 'Latest PSX session snapshot';
     }
@@ -32996,6 +33936,38 @@ function renderFeedStatus(
         ? 'delayed'
         : 'closed';
 
+  const marketClosed =
+    Boolean(
+      result?.marketStatus?.known &&
+      !result.marketStatus.isOpen
+    );
+
+  if (marketClosed) {
+    $('liveStatus')
+      .innerHTML =
+        '<span class="feedDot closed"></span>' +
+        '<span class="feedPrice">' +
+        escapeHtml(
+          marketClosedLabel(
+            result.marketStatus
+          )
+        ) +
+        '</span>' +
+        '<span class="feedMeta">Last market price PKR ' +
+        formatNumber(
+          result.price
+        ) +
+        ' · Updated ' +
+        escapeHtml(
+          formatDateTime(
+            result.timestamp
+          )
+        ) +
+        '</span>';
+
+    return;
+  }
+
   $('liveStatus')
     .innerHTML =
       '<span class="feedDot ' +
@@ -33938,7 +34910,10 @@ function renderLiveChart(
       : result.feedState ===
         'DELAYED'
         ? 'Market open, but latest candle is delayed'
-        : 'Market closed - showing latest trading session';
+        : marketClosedLabel(
+            result.marketStatus
+          ) +
+          ' - showing latest trading session';
 
   const chart =
     liveChartMode ===
@@ -38374,45 +39349,107 @@ async function loadExploreMarket(
       currentPage = 1;
     }
 
+    const marketStatus =
+      result.marketStatus ||
+      null;
+
+    const marketOpen =
+      Boolean(
+        marketStatus?.known &&
+        marketStatus.isOpen
+      );
+
+    const marketClosed =
+      Boolean(
+        marketStatus?.known &&
+        !marketStatus.isOpen
+      );
+
+    const updatedLabel =
+      relativeTime(
+        result.marketWatchAsOf ||
+        result.asOf
+      ) ||
+      'now';
+
     $('coverage')
       .textContent =
-        (
-          result.sessionChangeCoverage ||
-          0
-        ) +
-        '/' +
-        result.totalStocks +
-        ' live · 10 sec refresh · Updated ' +
-        (
-          relativeTime(
-            result.marketWatchAsOf ||
-            result.asOf
-          ) ||
-          'now'
-        );
+        marketOpen
+          ? (
+              (
+                result.sessionChangeCoverage ||
+                0
+              ) +
+              '/' +
+              result.totalStocks +
+              ' live · 10 sec refresh · Updated ' +
+              updatedLabel
+            )
+          : marketClosed
+            ? (
+                result.totalStocks +
+                ' securities · ' +
+                marketClosedLabel(
+                  marketStatus
+                ) +
+                ' · Latest session updated ' +
+                updatedLabel
+              )
+            : (
+                result.totalStocks +
+                ' securities · Market status unavailable · Updated ' +
+                updatedLabel
+              );
 
     populateSectors();
 
     renderStocks();
 
     if (status) {
-      status.innerHTML =
-        '<span class="feedDot live"></span>' +
-        '<span class="feedPrice">Live PSX feed</span>' +
-        '<span class="feedMeta">' +
-        escapeHtml(
-          result.sessionChangeSource ||
-          'PSX market feed'
-        ) +
-        ' · ' +
-        escapeHtml(
-          relativeTime(
-            result.marketWatchAsOf ||
-            result.asOf
-          ) ||
-          'updated now'
-        ) +
-        ' · refreshing every 10 sec</span>';
+      if (marketOpen) {
+        status.innerHTML =
+          '<span class="feedDot live"></span>' +
+          '<span class="feedPrice">Live PSX feed</span>' +
+          '<span class="feedMeta">' +
+          escapeHtml(
+            result.sessionChangeSource ||
+            'PSX market feed'
+          ) +
+          ' · ' +
+          escapeHtml(
+            updatedLabel
+          ) +
+          ' · refreshing every 10 sec</span>';
+      } else if (marketClosed) {
+        status.innerHTML =
+          '<span class="feedDot closed"></span>' +
+          '<span class="feedPrice">' +
+          escapeHtml(
+            marketClosedLabel(
+              marketStatus
+            )
+          ) +
+          '</span>' +
+          '<span class="feedMeta">Showing latest available PSX session · ' +
+          escapeHtml(
+            result.sessionChangeSource ||
+            'PSX market feed'
+          ) +
+          ' · ' +
+          escapeHtml(
+            updatedLabel
+          ) +
+          '</span>';
+      } else {
+        status.innerHTML =
+          '<span class="feedDot delayed"></span>' +
+          '<span class="feedPrice">Latest PSX snapshot</span>' +
+          '<span class="feedMeta">Market status unavailable · ' +
+          escapeHtml(
+            updatedLabel
+          ) +
+          '</span>';
+      }
     }
   } catch (error) {
     if (!marketRows.length) {
@@ -39952,6 +40989,19 @@ document
     }
   );
 
+window.addEventListener(
+  'popstate',
+  () => {
+    openAppPage(
+      appPageFromLocation(),
+      {
+        updateLocation: false,
+        scrollToTop: false
+      }
+    );
+  }
+);
+
 document
   .querySelectorAll(
     '[data-open-page]'
@@ -40188,7 +41238,9 @@ function decisionActionLabel(
     WATCH: 'WATCH',
     HOLD: 'HOLD',
     RESEARCH_REQUIRED:
-      'RESEARCH REQUIRED',
+      'EVIDENCE RESEARCH',
+    EVIDENCE_RESEARCH:
+      'EVIDENCE RESEARCH',
     WAIT: 'WAIT',
     WAIT_DATA: 'WAIT / DATA',
     DATA_BLOCKED: 'DATA BLOCKED',
@@ -40282,7 +41334,12 @@ function renderOpportunityList(
             analyst.financialView ||
             'UNAVAILABLE'
           ) +
-          ' · Summary evidence ' +
+          ' · Evidence ' +
+          escapeHtml(
+            analyst.evidenceConfidence ||
+            'UNRESOLVED'
+          ) +
+          ' · Summary ' +
           (
             analyst.coveragePct !==
               null &&
@@ -40359,6 +41416,7 @@ function renderOpportunityBoard(
     [];
 
   const research =
+    board.evidenceResearch ||
     board.researchRequired ||
     [];
 
@@ -40381,7 +41439,7 @@ function renderOpportunityBoard(
   renderOpportunityList(
     'researchRequiredList',
     research,
-    'No shortlisted company is currently blocked by missing analyst evidence.'
+    'No shortlisted company is currently in automatic evidence research.'
   );
 
   renderOpportunityList(
@@ -40447,8 +41505,16 @@ function renderDecisionAudit(
       screening.historicalAnalyzed
     ],
     [
-      'Deep analyzed',
+      'Deep attempts',
       screening.deepAnalyzed
+    ],
+    [
+      'Comparable set',
+      screening.comparableAnalyzed
+    ],
+    [
+      'Evidence research',
+      screening.evidenceResearch
     ],
     [
       'Data blocked',
@@ -40566,7 +41632,7 @@ function renderHomeDecisionSummary(
       summary.priority2Count,
       0
     ) +
-    ' · Research required: ' +
+    ' · Evidence research: ' +
     formatNumber(
       summary.researchCount,
       0
@@ -40631,13 +41697,27 @@ function renderShadowDecision(
       ''
     ) +
     '</div></div>' +
-    '<span>Analyst evidence ' +
+    '<span>Evidence confidence ' +
+    escapeHtml(
+      decision.evidence
+        ?.confidence ||
+      'UNRESOLVED'
+    ) +
+    ' · Summary ' +
     formatNumber(
-      decision.evidenceStrength ||
+      decision.evidence
+        ?.summaryCoveragePct ||
       0,
       0
     ) +
-    '/100</span>' +
+    '% · Extended ' +
+    formatNumber(
+      decision.evidence
+        ?.extendedCoveragePct ||
+      0,
+      0
+    ) +
+    '%</span>' +
     '</div>' +
     '<div class="decisionMoneyLine">' +
     '<div><span>Requested</span><strong>PKR ' +
@@ -40717,7 +41797,7 @@ function renderShadowDecision(
         0,
         0
       ) +
-      ' validated Priority 2). Current caps: ' +
+      ' actionable Priority 2). Current caps: ' +
       formatNumber(
         result.allocationDiagnostics
           .dynamicMaxStockPct ||
@@ -40774,7 +41854,7 @@ function renderShadowDecision(
           escapeHtml(
             item.allocationTier ===
               'PRIORITY_2'
-              ? 'provisional Priority 2'
+              ? 'Priority 2'
               : 'Priority 1'
           ) +
           ' · new money ' +
@@ -40816,7 +41896,7 @@ function renderShadowDecision(
       ).join('');
   } else {
     html +=
-      '<div class="decisionMetaLine">No capital is allocated until a Priority 1 thesis passes the evidence gate and at least one whole share fits the amount/risk limits.</div>';
+      '<div class="decisionMetaLine">No capital is allocated unless a canonical BUY or ACCUMULATE state has allocation permission and at least one whole share fits the portfolio/risk limits.</div>';
   }
 
   const unfunded =
@@ -41132,6 +42212,14 @@ try {
   );
 }
 
+openAppPage(
+  appPageFromLocation(),
+  {
+    updateLocation: false,
+    scrollToTop: false
+  }
+);
+
 loadDecisionCenter();
 
 /* =========================================================
@@ -41213,6 +42301,8 @@ module.exports.decisionEngine = {
     buildDecisionOpportunityBoard,
   analystGate:
     decisionCenterAnalystGate,
+  canonicalState:
+    decisionCanonicalCompanyState,
   candidateAction:
     decisionCandidateAction
 };
