@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.8.5B';
+const VERSION = '0.8.5B.2';
 
 
 const SUPABASE_URL =
@@ -63,6 +63,10 @@ const PSX_MARKET_WATCH_URL =
 
 const PSX_SCREENER_URL =
   `${PSX_DPS_BASE}/screener/`;
+
+const PYPSX_PUBLIC_MARKET_URL =
+  process.env.PYPSX_PUBLIC_MARKET_URL ||
+  'https://www.pypsx.com/market';
 
 const PSX_CORPORATE_BASE =
   process.env.PSX_CORPORATE_BASE ||
@@ -4480,6 +4484,417 @@ function parseOfficialPSXScreenerAsOf(
         .toISOString();
 }
 
+
+function parseCompactMarketNumber(
+  value
+) {
+  const text =
+    String(
+      value ?? ''
+    )
+      .replace(/,/g, '')
+      .trim();
+
+  if (!text) {
+    return null;
+  }
+
+  const match =
+    text.match(
+      /^([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*([KMBT])?$/i
+    );
+
+  if (!match) {
+    return safeNumber(
+      text
+    );
+  }
+
+  const base =
+    Number(
+      match[1]
+    );
+
+  if (!Number.isFinite(base)) {
+    return null;
+  }
+
+  const multiplier = {
+    K: 1e3,
+    M: 1e6,
+    B: 1e9,
+    T: 1e12
+  }[
+    String(
+      match[2] || ''
+    ).toUpperCase()
+  ] || 1;
+
+  return base * multiplier;
+}
+
+function pyPSXPublicMarketSymbol(
+  row
+) {
+  const href =
+    String(
+      row?.href || ''
+    );
+
+  if (href) {
+    try {
+      const parts =
+        new URL(
+          href
+        )
+          .pathname
+          .split('/')
+          .filter(Boolean);
+
+      for (
+        let index =
+          parts.length - 1;
+        index >= 0;
+        index -= 1
+      ) {
+        const candidate =
+          normalizeSymbol(
+            decodeURIComponent(
+              parts[index]
+            )
+          );
+
+        if (
+          /^[A-Z0-9]{1,15}$/.test(
+            candidate
+          ) &&
+          (
+            PSX_UNIVERSE_BY_SYMBOL.has(
+              candidate
+            ) ||
+            candidate.length <= 10
+          )
+        ) {
+          return candidate;
+        }
+      }
+    } catch {}
+  }
+
+  const cell =
+    String(
+      row?.cells?.[0] || ''
+    )
+      .trim();
+
+  const firstToken =
+    normalizeSymbol(
+      cell.split(/\s+/)[0]
+    );
+
+  if (
+    firstToken &&
+    /^[A-Z0-9]{1,15}$/.test(
+      firstToken
+    )
+  ) {
+    return firstToken;
+  }
+
+  return '';
+}
+
+function parsePyPSXPublicMarketRows(
+  html
+) {
+  const tables =
+    parseHTMLTables(
+      html
+    );
+
+  for (
+    const table
+    of tables
+  ) {
+    const matrix =
+      tableToMatrix(
+        table
+      );
+
+    if (matrix.length < 2) {
+      continue;
+    }
+
+    const header =
+      matrix[0] || [];
+
+    const normalized =
+      header.map(
+        value =>
+          normalizeOfficialScreenerHeader(
+            value
+          )
+      );
+
+    const symbolIndex =
+      normalized.findIndex(
+        value =>
+          value === 'SYMBOL'
+      );
+
+    const lastIndex =
+      normalized.findIndex(
+        value =>
+          value === 'LAST' ||
+          value === 'PRICE'
+      );
+
+    const changeIndex =
+      normalized.findIndex(
+        value =>
+          value === 'CHANGE' ||
+          value === 'CHANGE (%)' ||
+          value === 'CHANGE %'
+      );
+
+    if (
+      symbolIndex < 0 ||
+      lastIndex < 0 ||
+      changeIndex < 0
+    ) {
+      continue;
+    }
+
+    const volumeIndex =
+      normalized.findIndex(
+        value =>
+          value === 'VOLUME'
+      );
+
+    const marketCapIndex =
+      normalized.findIndex(
+        value =>
+          value === 'MKT CAP' ||
+          value === 'MARKET CAP'
+      );
+
+    const rows = [];
+
+    for (
+      const row
+      of table.rows.slice(1)
+    ) {
+      const symbol =
+        pyPSXPublicMarketSymbol(
+          row
+        );
+
+      const price =
+        safeNumber(
+          row.cells[
+            lastIndex
+          ]
+        );
+
+      const changePct =
+        safeNumber(
+          row.cells[
+            changeIndex
+          ]
+        );
+
+      if (
+        !symbol ||
+        price === null ||
+        price <= 0 ||
+        changePct === null
+      ) {
+        continue;
+      }
+
+      rows.push({
+        symbol,
+        price,
+        changePct,
+        volume:
+          volumeIndex >= 0
+            ? parseCompactMarketNumber(
+                row.cells[
+                  volumeIndex
+                ]
+              )
+            : null,
+        marketCap:
+          marketCapIndex >= 0
+            ? parseCompactMarketNumber(
+                row.cells[
+                  marketCapIndex
+                ]
+              )
+            : null
+      });
+    }
+
+    if (rows.length >= 50) {
+      return rows;
+    }
+  }
+
+  return [];
+}
+
+function parsePyPSXPublicMarketAsOf(
+  html
+) {
+  const text =
+    htmlToLines(
+      html
+    )
+      .join(' ');
+
+  const match =
+    text.match(
+      /\blive\s*[·|\-]?\s*(\d{1,2}:\d{2})\s*PKT\b/i
+    );
+
+  if (!match) {
+    return new Date()
+      .toISOString();
+  }
+
+  const parts =
+    new Intl.DateTimeFormat(
+      'en-US',
+      {
+        timeZone:
+          'Asia/Karachi',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit'
+      }
+    )
+      .formatToParts(
+        new Date()
+      );
+
+  const dateParts = {};
+
+  for (
+    const part
+    of parts
+  ) {
+    if (
+      part.type !==
+        'literal'
+    ) {
+      dateParts[
+        part.type
+      ] =
+        part.value;
+    }
+  }
+
+  const date =
+    `${dateParts.year}-${dateParts.month}-${dateParts.day}`;
+
+  const parsed =
+    Date.parse(
+      `${date}T${match[1]}:00+05:00`
+    );
+
+  return Number.isFinite(
+    parsed
+  )
+    ? new Date(
+        parsed
+      ).toISOString()
+    : new Date()
+        .toISOString();
+}
+
+async function loadPyPSXPublicMarketSnapshot(
+  companyMap
+) {
+  const html =
+    await fetchText(
+      PYPSX_PUBLIC_MARKET_URL,
+      20000,
+      {
+        Referer:
+          'https://www.pypsx.com/'
+      }
+    );
+
+  const rawRows =
+    parsePyPSXPublicMarketRows(
+      html
+    );
+
+  if (!rawRows.length) {
+    bad(
+      'pyPSX public market board returned no live rows.',
+      502
+    );
+  }
+
+  const rows = [];
+
+  for (
+    const row
+    of rawRows
+  ) {
+    const identity =
+      resolveSymbolIdentity(
+        row.symbol,
+        companyMap
+      );
+
+    const symbol =
+      identity.canonicalSymbol ||
+      primaryMarketToken(
+        row.symbol
+      );
+
+    if (!symbol) {
+      continue;
+    }
+
+    rows.push({
+      symbol,
+      tradingSymbol:
+        identity.tradingSymbol ||
+        row.symbol,
+      price:
+        row.price,
+      changePct:
+        row.changePct,
+      volume:
+        row.volume,
+      marketCap:
+        row.marketCap
+    });
+  }
+
+  if (!rows.length) {
+    bad(
+      'pyPSX live rows could not be mapped to the NOMAD universe.',
+      502
+    );
+  }
+
+  return {
+    asOf:
+      parsePyPSXPublicMarketAsOf(
+        html
+      ),
+    source:
+      'pyPSX public live market board',
+    total:
+      rows.length,
+    rows
+  };
+}
+
 async function loadOfficialPSXScreenerSnapshot(
   companyMap
 ) {
@@ -7452,7 +7867,7 @@ async function loadPSXMarket() {
     marketCache &&
     Date.now() -
       marketCache.fetchedAt <
-      60000
+      8000
   ) {
     return marketCache.data;
   }
@@ -7514,15 +7929,111 @@ async function loadPSXMarket() {
           )
       );
 
+  let pyPSXPublicMarket =
+    null;
+
   let officialScreener =
     null;
 
   let marketWatch =
     null;
 
-  // The official DPS screener is the primary current-session source for
-  // price and % change. The legacy /market-watch route has changed over
-  // time and must not be allowed to zero-out Home market breadth.
+  // pyPSX exposes a public live all-stock board with last price, daily
+  // change, volume and market cap. Use it as the freshest market-wide
+  // snapshot when available, then fall back to the official PSX screener.
+  try {
+    pyPSXPublicMarket =
+      await loadPyPSXPublicMarketSnapshot(
+        companyMap
+      );
+
+    const pyPSXMap =
+      new Map(
+        (
+          pyPSXPublicMarket.rows ||
+          []
+        ).map(
+          row => [
+            normalizeSymbol(
+              row.symbol
+            ),
+            row
+          ]
+        )
+      );
+
+    for (
+      const stock
+      of stocks
+    ) {
+      const live =
+        pyPSXMap.get(
+          normalizeSymbol(
+            stock.symbol
+          )
+        );
+
+      if (!live) {
+        continue;
+      }
+
+      if (
+        safeNumber(
+          live.price
+        ) !== null &&
+        safeNumber(
+          live.price
+        ) > 0
+      ) {
+        stock.price =
+          safeNumber(
+            live.price
+          );
+      }
+
+      if (
+        safeNumber(
+          live.changePct
+        ) !== null
+      ) {
+        stock.dayChangePct =
+          safeNumber(
+            live.changePct
+          );
+      }
+
+      if (
+        safeNumber(
+          live.volume
+        ) !== null
+      ) {
+        stock.sessionVolume =
+          safeNumber(
+            live.volume
+          );
+      }
+
+      if (
+        safeNumber(
+          live.marketCap
+        ) !== null
+      ) {
+        stock.marketCap =
+          safeNumber(
+            live.marketCap
+          );
+      }
+
+      stock.marketWatchAsOf =
+        pyPSXPublicMarket.asOf;
+
+      stock.sessionChangeSource =
+        pyPSXPublicMarket.source;
+    }
+  } catch {}
+
+  // The official DPS screener remains the trusted fallback for current
+  // price and % change if the pyPSX public live board is unavailable.
   try {
     officialScreener =
       await loadOfficialPSXScreenerSnapshot(
@@ -7560,6 +8071,8 @@ async function loadPSXMarket() {
       }
 
       if (
+        stock.sessionChangeSource !==
+          'pyPSX public live market board' &&
         safeNumber(
           live.price
         ) !== null &&
@@ -7574,6 +8087,8 @@ async function loadPSXMarket() {
       }
 
       if (
+        stock.sessionChangeSource !==
+          'pyPSX public live market board' &&
         safeNumber(
           live.changePct
         ) !== null
@@ -7584,11 +8099,16 @@ async function loadPSXMarket() {
           );
       }
 
-      stock.marketWatchAsOf =
-        officialScreener.asOf;
+      if (
+        stock.sessionChangeSource !==
+          'pyPSX public live market board'
+      ) {
+        stock.marketWatchAsOf =
+          officialScreener.asOf;
 
-      stock.sessionChangeSource =
-        officialScreener.source;
+        stock.sessionChangeSource =
+          officialScreener.source;
+      }
     }
   } catch {}
 
@@ -7632,6 +8152,8 @@ async function loadPSXMarket() {
       }
 
       if (
+        stock.sessionChangeSource !==
+          'pyPSX public live market board' &&
         safeNumber(
           watch.current
         ) !== null &&
@@ -7656,6 +8178,8 @@ async function loadPSXMarket() {
         );
 
       if (
+        stock.sessionChangeSource !==
+          'pyPSX public live market board' &&
         safeNumber(
           watch.changePct
         ) !== null
@@ -7686,11 +8210,16 @@ async function loadPSXMarket() {
           watch.volume
         );
 
-      stock.marketWatchAsOf =
-        marketWatch.asOf;
+      if (
+        stock.sessionChangeSource !==
+          'pyPSX public live market board'
+      ) {
+        stock.marketWatchAsOf =
+          marketWatch.asOf;
 
-      stock.sessionChangeSource =
-        'PSX market watch';
+        stock.sessionChangeSource =
+          'PSX market watch';
+      }
     }
   } catch {}
 
@@ -7744,16 +8273,19 @@ async function loadPSXMarket() {
       screener.timestamp,
 
     marketWatchAsOf:
+      pyPSXPublicMarket?.asOf ||
       marketWatch?.asOf ||
       officialScreener?.asOf ||
       null,
 
     sessionChangeSource:
-      marketWatch?.rows?.length
-        ? 'PSX market watch'
-        : officialScreener?.rows?.length
-          ? 'PSX Data Portal screener'
-          : 'screener API fallback',
+      pyPSXPublicMarket?.rows?.length
+        ? 'pyPSX public live market board'
+        : marketWatch?.rows?.length
+          ? 'PSX market watch'
+          : officialScreener?.rows?.length
+            ? 'PSX Data Portal screener'
+            : 'screener API fallback',
 
     sessionChangeCoverage:
       stocks.filter(
@@ -25923,6 +26455,14 @@ tbody tr:hover {
   font-weight: 700;
 }
 
+.livePriceUp {
+  background: rgba(17,130,59,.08);
+}
+
+.livePriceDown {
+  background: rgba(181,42,42,.08);
+}
+
 #error {
   color: #b52a2a;
   font-weight: 600;
@@ -28742,16 +29282,18 @@ More
 
 <section class="card appPage" id="exploreSection" data-page="explore">
 
-<h2>
-Explore PSX
-</h2>
+<div class="panelHeader">
+<div>
+<div class="eyebrow">LIVE MARKET</div>
+<h2>Explore PSX</h2>
+<p class="muted">Current PSX market feed with live price tracking. Prices refresh automatically while this page is open.</p>
+</div>
+<button id="loadMarket" class="miniButton secondary">Refresh now</button>
+</div>
 
-<div class="actions">
-
-<button id="loadMarket">
-Load market data
-</button>
-
+<div id="exploreLiveStatus" class="liveStrip">
+<span class="feedDot delayed"></span>
+<span class="feedMeta">Loading latest PSX market feed...</span>
 </div>
 
 <div class="filters">
@@ -28804,6 +29346,22 @@ Lowest price
 
 <option value="priceDesc">
 Highest price
+</option>
+
+<option value="dayChangeDesc">
+Top gainers today
+</option>
+
+<option value="dayChangeAsc">
+Top losers today
+</option>
+
+<option value="sessionVolumeDesc">
+Highest live volume
+</option>
+
+<option value="marketCapDesc">
+Largest market cap
 </option>
 
 <option value="changeDesc">
@@ -29338,6 +29896,9 @@ const METADATA_AUDIT_PAGE_SIZE =
 
 let liveRefreshTimer = null;
 let portfolioRefreshTimer = null;
+let exploreRefreshTimer = null;
+let exploreRefreshInFlight = false;
+let explorePreviousPrices = new Map();
 
 let liveRefreshSymbol = null;
 
@@ -29409,6 +29970,53 @@ function formatNumber(
       maximumFractionDigits:
         digits
     }
+  );
+}
+
+function formatCompactNumber(
+  value
+) {
+  const number =
+    Number(
+      value
+    );
+
+  if (!Number.isFinite(number)) {
+    return 'N/A';
+  }
+
+  const absolute =
+    Math.abs(
+      number
+    );
+
+  if (absolute >= 1e12) {
+    return (
+      number / 1e12
+    ).toFixed(2) + 'T';
+  }
+
+  if (absolute >= 1e9) {
+    return (
+      number / 1e9
+    ).toFixed(2) + 'B';
+  }
+
+  if (absolute >= 1e6) {
+    return (
+      number / 1e6
+    ).toFixed(2) + 'M';
+  }
+
+  if (absolute >= 1e3) {
+    return (
+      number / 1e3
+    ).toFixed(1) + 'K';
+  }
+
+  return formatNumber(
+    number,
+    0
   );
 }
 
@@ -29820,6 +30428,14 @@ function openAppPage(
       null;
   }
 
+  if (exploreRefreshTimer) {
+    clearInterval(
+      exploreRefreshTimer
+    );
+    exploreRefreshTimer =
+      null;
+  }
+
   if (page === 'portfolio') {
     loadPortfolioViews();
 
@@ -29831,6 +30447,27 @@ function openAppPage(
             'visible'
           ) {
             loadPortfolioViews();
+          }
+        },
+        10000
+      );
+  }
+
+  if (page === 'explore') {
+    loadExploreMarket(
+      false
+    );
+
+    exploreRefreshTimer =
+      setInterval(
+        () => {
+          if (
+            document.visibilityState ===
+            'visible'
+          ) {
+            loadExploreMarket(
+              false
+            );
           }
         },
         10000
@@ -33552,6 +34189,74 @@ function getFilteredRows() {
       );
       break;
 
+    case 'dayChangeDesc':
+      rows.sort(
+        (
+          a,
+          b
+        ) =>
+          (
+            b.dayChangePct ??
+            -Infinity
+          ) -
+          (
+            a.dayChangePct ??
+            -Infinity
+          )
+      );
+      break;
+
+    case 'dayChangeAsc':
+      rows.sort(
+        (
+          a,
+          b
+        ) =>
+          (
+            a.dayChangePct ??
+            Infinity
+          ) -
+          (
+            b.dayChangePct ??
+            Infinity
+          )
+      );
+      break;
+
+    case 'sessionVolumeDesc':
+      rows.sort(
+        (
+          a,
+          b
+        ) =>
+          (
+            b.sessionVolume ??
+            -Infinity
+          ) -
+          (
+            a.sessionVolume ??
+            -Infinity
+          )
+      );
+      break;
+
+    case 'marketCapDesc':
+      rows.sort(
+        (
+          a,
+          b
+        ) =>
+          (
+            b.marketCap ??
+            -Infinity
+          ) -
+          (
+            a.marketCap ??
+            -Infinity
+          )
+      );
+      break;
+
     case 'changeDesc':
       rows.sort(
         (
@@ -33715,7 +34420,10 @@ function renderStocks() {
       '<th>Symbol</th>' +
       '<th>Company</th>' +
       '<th>Sector</th>' +
-      '<th>Price</th>' +
+      '<th>Live Price</th>' +
+      '<th>Today</th>' +
+      '<th>Live Volume</th>' +
+      '<th>Market Cap</th>' +
       '<th>P/E</th>' +
       '<th>Dividend Yield</th>' +
       '<th>30D Avg Volume</th>' +
@@ -33786,9 +34494,72 @@ function renderStocks() {
             ) +
             '</td>' +
 
-            '<td>' +
+            '<td class="' +
+            (
+              explorePreviousPrices.has(
+                stock.symbol
+              ) &&
+              Number(stock.price) >
+                Number(
+                  explorePreviousPrices.get(
+                    stock.symbol
+                  )
+                )
+                ? 'positive livePriceUp'
+                : explorePreviousPrices.has(
+                    stock.symbol
+                  ) &&
+                  Number(stock.price) <
+                    Number(
+                      explorePreviousPrices.get(
+                        stock.symbol
+                      )
+                    )
+                  ? 'negative livePriceDown'
+                  : ''
+            ) +
+            '">PKR ' +
             formatNumber(
               stock.price
+            ) +
+            '</td>' +
+
+            '<td class="' +
+            percentClass(
+              stock.dayChangePct
+            ) +
+            '">' +
+            (
+              stock.dayChangePct === null ||
+              stock.dayChangePct === undefined
+                ? 'N/A'
+                : formatPercent(
+                    stock.dayChangePct
+                  )
+            ) +
+            '</td>' +
+
+            '<td>' +
+            (
+              stock.sessionVolume === null ||
+              stock.sessionVolume === undefined
+                ? 'N/A'
+                : formatNumber(
+                    stock.sessionVolume,
+                    0
+                  )
+            ) +
+            '</td>' +
+
+            '<td>' +
+            (
+              stock.marketCap === null ||
+              stock.marketCap === undefined
+                ? 'N/A'
+                : 'PKR ' +
+                  formatCompactNumber(
+                    stock.marketCap
+                  )
             ) +
             '</td>' +
 
@@ -37523,62 +38294,140 @@ function buildSituationPanel(
    MARKET BUTTON
 ========================================================= */
 
-$('loadMarket')
-  .onclick =
-    async () => {
+async function loadExploreMarket(
+  manualRefresh = false
+) {
+  if (exploreRefreshInFlight) {
+    return;
+  }
 
+  exploreRefreshInFlight =
+    true;
+
+  $('error')
+    .textContent =
+      '';
+
+  if ($('loadMarket')) {
+    $('loadMarket')
+      .disabled =
+        true;
+  }
+
+  const status =
+    $('exploreLiveStatus');
+
+  if (
+    status &&
+    !marketRows.length
+  ) {
+    status.innerHTML =
+      '<span class="feedDot delayed"></span>' +
+      '<span class="feedMeta">Loading latest PSX market feed...</span>';
+  }
+
+  try {
+    const result =
+      await api(
+        'market'
+      );
+
+    explorePreviousPrices =
+      new Map(
+        marketRows.map(
+          row => [
+            row.symbol,
+            row.price
+          ]
+        )
+      );
+
+    marketRows =
+      result.stocks ||
+      [];
+
+    if (
+      manualRefresh ||
+      currentPage < 1
+    ) {
+      currentPage = 1;
+    }
+
+    $('coverage')
+      .textContent =
+        result.totalStocks +
+        ' feed securities | Live source: ' +
+        (
+          result.sessionChangeSource ||
+          'PSX market feed'
+        ) +
+        ' | Session coverage ' +
+        (
+          result.sessionChangeCoverage ||
+          0
+        ) +
+        ' | Auto-refresh 10 sec | Updated ' +
+        (
+          relativeTime(
+            result.marketWatchAsOf ||
+            result.asOf
+          ) ||
+          'now'
+        );
+
+    populateSectors();
+
+    renderStocks();
+
+    if (status) {
+      status.innerHTML =
+        '<span class="feedDot live"></span>' +
+        '<span class="feedPrice">Live PSX feed</span>' +
+        '<span class="feedMeta">' +
+        escapeHtml(
+          result.sessionChangeSource ||
+          'PSX market feed'
+        ) +
+        ' · ' +
+        escapeHtml(
+          relativeTime(
+            result.marketWatchAsOf ||
+            result.asOf
+          ) ||
+          'updated now'
+        ) +
+        ' · refreshing every 10 sec</span>';
+    }
+  } catch (error) {
+    if (!marketRows.length) {
       $('error')
         .textContent =
-          '';
+          error.message;
+    }
 
+    if (status) {
+      status.innerHTML =
+        '<span class="feedDot delayed"></span>' +
+        '<span class="feedWarning">Live refresh failed. Keeping the last successful market snapshot.</span>';
+    }
+  } finally {
+    exploreRefreshInFlight =
+      false;
+
+    if ($('loadMarket')) {
       $('loadMarket')
         .disabled =
-          true;
+          false;
+    }
+  }
+}
 
-      try {
-        const result =
-          await api(
-            'market'
-          );
-
-        marketRows =
-          result.stocks ||
-          [];
-
-        currentPage =
-          1;
-
-        $('coverage')
-          .textContent =
-            result.totalStocks +
-            ' feed securities | Universe master ' +
-            result.universeMasterVersion +
-            ' | Core ' +
-            result.coreEquityCount +
-            ' | GEM ' +
-            result.gemEquityCount +
-            ' | Alternative ' +
-            result.alternativeCurrentCount +
-            ' | Review ' +
-            result.reviewRequiredCount +
-            ' | Unmapped feed ' +
-            result.unmappedFeedCount +
-            ' | Updated ' +
-            result.asOf;
-
-        populateSectors();
-
-        renderStocks();
-      } catch (error) {
-        $('error')
-          .textContent =
-            error.message;
-      } finally {
-        $('loadMarket')
-          .disabled =
-            false;
-      }
-    };
+$('loadMarket')
+  .onclick =
+    () =>
+      loadExploreMarket(
+        true
+      );
 
 /* =========================================================
    METADATA / SECURITY UNIVERSE AUDIT BUTTONS
