@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.8.4B';
+const VERSION = '0.8.4B.1';
 
 
 const SUPABASE_URL =
@@ -10888,7 +10888,7 @@ async function getHistory(
 ========================================================= */
 
 /* =========================================================
-   FINANCIAL ANALYST CORE - BUILD 0.8.4B
+   FINANCIAL ANALYST CORE - BUILD 0.8.4B.1
 
    IMPORTANT:
    - This layer normalizes and interprets evidence already returned by PSX.
@@ -11053,6 +11053,11 @@ function analystNormalizeMetricLabel(
     value || ''
   )
     .replace(/\u00a0/g, ' ')
+    // PSX ratio labels commonly include units, e.g.
+    // "Gross Profit Margin (%)". Units are presentation metadata,
+    // not part of the metric identity, so strip only trailing unit tokens.
+    .replace(/\s*\(\s*%\s*\)\s*$/i, '')
+    .replace(/\s*%\s*$/i, '')
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -11762,11 +11767,11 @@ function analystOverallFinancialView(
   views,
   coveragePct
 ) {
-  if (coveragePct < 45) {
+  if (coveragePct < 60) {
     return {
       state: 'UNRELIABLE',
       reason:
-        'Core financial evidence coverage is too low for a dependable general financial verdict.'
+        'Headline PSX financial evidence coverage is too low for a dependable summary verdict.'
     };
   }
 
@@ -11804,6 +11809,9 @@ function analystOverallFinancialView(
     };
   }
 
+  // Explicit negative evidence should still override headline strength.
+  // Missing cash-flow/balance-sheet evidence is handled separately as an
+  // evidence-tier limitation rather than being treated as a negative fact.
   if (
     views.earningsQuality.state ===
       'QUESTIONABLE' ||
@@ -11813,7 +11821,7 @@ function analystOverallFinancialView(
     return {
       state: 'MIXED',
       reason:
-        'Headline profitability is not yet fully supported by the available earnings-quality/cash-flow evidence.'
+        'Headline profitability is not fully supported by the available quality evidence.'
     };
   }
 
@@ -11830,29 +11838,47 @@ function analystOverallFinancialView(
     };
   }
 
-  if (
+  const profitImproving =
     views.profitTrend.state ===
-      'IMPROVING' &&
+      'IMPROVING';
+
+  const epsImproving =
     views.epsTrend.state ===
-      'IMPROVING' &&
-    (
-      views.earningsQuality.state ===
-        'ACCEPTABLE' ||
-      views.earningsQuality.state ===
-        'SECTOR_MODEL_REQUIRED'
-    )
+      'IMPROVING';
+
+  const marginNotWeak =
+    views.marginTrend.state !==
+      'DETERIORATING' &&
+    views.marginTrend.state !==
+      'WEAK';
+
+  if (
+    profitImproving &&
+    epsImproving &&
+    marginNotWeak
   ) {
     return {
       state: 'GOOD',
       reason:
-        'Reported earnings trend is improving, subject to the stated evidence and sector-model limitations.'
+        'Headline PSX evidence shows improving profit and EPS with no deterioration in the available margin trend. Extended statement validation may still be pending.'
+    };
+  }
+
+  if (
+    (profitImproving || epsImproving) &&
+    marginNotWeak
+  ) {
+    return {
+      state: 'GOOD',
+      reason:
+        'Headline PSX evidence is positive overall, although not every trend is equally strong. Extended statement validation may still be pending.'
     };
   }
 
   return {
     state: 'MIXED',
     reason:
-      'Available evidence is usable, but does not support a stronger general financial conclusion yet.'
+      'Available headline evidence is usable, but does not support a stronger summary conclusion yet.'
   };
 }
 
@@ -11874,20 +11900,36 @@ function buildFinancialAnalystCore(
       );
   }
 
-  const coreKeys = [
+  // PSX company summary pages expose headline financials and ratios,
+  // but generally do not expose full balance-sheet/cash-flow statements.
+  // Do not grade the source as 33% merely because it lacks fields it never
+  // claims to provide. Track headline and extended evidence separately.
+  const summaryKeys = [
     'revenue',
     'profitAfterTax',
     'eps',
+    'grossMargin',
+    'netProfitMargin'
+  ];
+
+  const extendedKeys = [
     'totalAssets',
     'totalEquity',
     'financeCost',
     'operatingCashFlow',
-    'roe',
-    'netProfitMargin'
+    'borrowings',
+    'cash'
   ];
 
   const observedCore =
-    coreKeys.filter(
+    summaryKeys.filter(
+      key =>
+        evidence[key]
+          ?.available
+    );
+
+  const observedExtended =
+    extendedKeys.filter(
       key =>
         evidence[key]
           ?.available
@@ -11896,7 +11938,15 @@ function buildFinancialAnalystCore(
   const coveragePct =
     decisionRound(
       observedCore.length /
-      coreKeys.length *
+      summaryKeys.length *
+      100,
+      2
+    );
+
+  const extendedCoveragePct =
+    decisionRound(
+      observedExtended.length /
+      extendedKeys.length *
       100,
       2
     );
@@ -11954,7 +12004,14 @@ function buildFinancialAnalystCore(
     );
 
   const missingCore =
-    coreKeys.filter(
+    summaryKeys.filter(
+      key =>
+        !evidence[key]
+          ?.available
+    );
+
+  const missingExtended =
+    extendedKeys.filter(
       key =>
         !evidence[key]
           ?.available
@@ -11972,17 +12029,29 @@ function buildFinancialAnalystCore(
 
   return {
     version:
-      'FINANCIAL-ANALYST-0.8.4B',
+      'FINANCIAL-ANALYST-0.8.4B.1',
     mode:
       'SHADOW_ONLY',
     affectsDecision:
       false,
     status:
-      coveragePct >= 65
-        ? 'READY_FOR_SHADOW_ANALYSIS'
+      coveragePct >= 80
+        ? (
+            extendedCoveragePct >= 67
+              ? 'FULL_STATEMENT_READY'
+              : 'PSX_SUMMARY_READY'
+          )
         : availableMetricCount > 0
           ? 'PARTIAL_EVIDENCE'
           : 'DATA_BLOCKED',
+    evidenceTier:
+      coveragePct >= 80
+        ? (
+            extendedCoveragePct >= 67
+              ? 'FULL_STATEMENT'
+              : 'PSX_SUMMARY'
+          )
+        : 'PARTIAL',
     company: {
       symbol:
         fundamentals?.symbol ||
@@ -11999,12 +12068,21 @@ function buildFinancialAnalystCore(
         )
     },
     coverage: {
+      // Keep coreCoveragePct for backwards compatibility with the current UI.
+      // In 0.8.4B.1 it means PSX headline-summary coverage, not full-statement coverage.
       coreCoveragePct:
         coveragePct,
+      summaryCoveragePct:
+        coveragePct,
+      extendedCoveragePct,
       coreMetricsObserved:
         observedCore,
       coreMetricsMissing:
         missingCore,
+      extendedMetricsObserved:
+        observedExtended,
+      extendedMetricsMissing:
+        missingExtended,
       availableMetricCount,
       totalMetricDefinitions:
         Object.keys(
@@ -12042,7 +12120,7 @@ function buildFinancialAnalystCore(
       'Missing metrics remain missing; NOMAD does not infer zero values or manufacture financial evidence.',
       'Cash-flow, leverage and earnings-quality conclusions are limited when PSX does not expose matching rows.',
       'Sector-specific accounting models are not yet implemented in 0.8.4B.',
-      'This analyst output now gates Decision Center priority and allocation; the legacy score is retained as supporting evidence only.'
+      'Headline and extended evidence are tracked separately. Missing extended statements reduce validation tier instead of being treated as negative evidence; the legacy score remains supporting evidence only.'
     ]
   };
 }
@@ -16129,7 +16207,7 @@ async function readJsonRequestBody(
 }
 
 /* =========================================================
-   DECISION LAB + DECISION CENTER - BUILD 0.8.4B
+   DECISION LAB + DECISION CENTER - BUILD 0.8.4B.1
    Experimental shadow engine. No automatic trading.
 ========================================================= */
 
@@ -17520,14 +17598,23 @@ function decisionCenterAnalystGate(
     return {
       state: 'RESEARCH_REQUIRED',
       reason:
-        'Financial Analyst evidence is unavailable. The stock remains visible, but NOMAD will not promote it to a validated buy.'
+        'Financial Analyst evidence is unavailable. The stock remains visible, but NOMAD will not promote it to a validated opportunity.'
     };
   }
 
-  const coverage =
+  const summaryCoverage =
     safeNumber(
       analyst.coverage
+        ?.summaryCoveragePct ??
+      analyst.coverage
         ?.coreCoveragePct
+    ) ||
+    0;
+
+  const extendedCoverage =
+    safeNumber(
+      analyst.coverage
+        ?.extendedCoveragePct
     ) ||
     0;
 
@@ -17565,23 +17652,17 @@ function decisionCenterAnalystGate(
   if (
     analyst.company
       ?.financialSector ===
-        true &&
-    (
-      earnings ===
-        'SECTOR_MODEL_REQUIRED' ||
-      cash ===
-        'SECTOR_MODEL_REQUIRED' ||
-      balance ===
-        'SECTOR_MODEL_REQUIRED'
-    )
+        true
   ) {
     return {
       state: 'RESEARCH_REQUIRED',
       reason:
-        'A financial-sector-specific analyst model is required before NOMAD can validate this stock for Priority 1.'
+        'A financial-sector-specific analyst model is required before NOMAD can validate this stock.'
     };
   }
 
+  // Explicitly bad evidence is a hard gate. Missing evidence is not treated
+  // as bad evidence; it lowers the validation tier instead.
   if (
     overall === 'WEAK' ||
     cash === 'WEAK'
@@ -17590,33 +17671,19 @@ function decisionCenterAnalystGate(
       state: 'REJECT',
       reason:
         overall === 'WEAK'
-          ? 'The Financial Analyst currently classifies the company financial view as weak.'
-          : 'Cash-flow evidence is currently weak relative to reported earnings.'
+          ? 'The available Financial Analyst evidence currently classifies the company financial view as weak.'
+          : 'Available cash-flow evidence is weak relative to reported earnings.'
     };
   }
 
   if (
-    coverage < 45 ||
+    summaryCoverage < 80 ||
     overall === 'UNRELIABLE'
   ) {
     return {
       state: 'RESEARCH_REQUIRED',
       reason:
-        'Core financial evidence is too incomplete for a dependable analyst verdict.'
-    };
-  }
-
-  if (
-    coverage <
-      DECISION_CENTER_MIN_ANALYST_COVERAGE ||
-    earnings === 'UNRELIABLE' ||
-    cash === 'UNRELIABLE' ||
-    balance === 'UNRELIABLE'
-  ) {
-    return {
-      state: 'RESEARCH_REQUIRED',
-      reason:
-        'The company is still visible, but one or more critical evidence areas are not independently validated.'
+        'Headline PSX financial evidence is incomplete, so NOMAD cannot form a dependable summary thesis yet.'
     };
   }
 
@@ -17628,31 +17695,41 @@ function decisionCenterAnalystGate(
     return {
       state: 'REVIEW',
       reason:
-        'The evidence is usable, but earnings quality, cash conversion or the overall financial view still needs caution.'
+        'The headline evidence is usable, but a quality or trend concern keeps this below Priority 1.'
     };
   }
 
+  const hasExtendedValidation =
+    extendedCoverage >= 67 &&
+    cash !== 'UNRELIABLE' &&
+    balance !== 'UNRELIABLE' &&
+    earnings !== 'UNRELIABLE';
+
   if (
     overall === 'GOOD' &&
-    earnings === 'ACCEPTABLE' &&
-    (
-      cash === 'STRONG' ||
-      cash === 'ACCEPTABLE'
-    ) &&
-    balance ===
-      'EVIDENCE_AVAILABLE'
+    hasExtendedValidation
   ) {
     return {
       state: 'VALIDATED',
+      validationTier: 'FULL_STATEMENT',
       reason:
-        'Core financial coverage, earnings quality, cash flow and balance-sheet evidence pass the current Decision Center gate.'
+        'Headline and extended financial evidence pass the current Decision Center gate.'
+    };
+  }
+
+  if (overall === 'GOOD') {
+    return {
+      state: 'SUMMARY_VALIDATED',
+      validationTier: 'PSX_SUMMARY',
+      reason:
+        'Official PSX headline financials support the opportunity, but full cash-flow/balance-sheet validation is not yet available. NOMAD limits this to staged exposure.'
     };
   }
 
   return {
     state: 'REVIEW',
     reason:
-      'The evidence is usable but does not yet satisfy every Priority 1 validation condition.'
+      'The headline evidence is usable but does not yet support Priority 1.'
   };
 }
 
@@ -17716,6 +17793,18 @@ function decisionCenterCandidateView(
     reason =
       'The long-term thesis passes, but NOMAD prefers staged exposure at the current entry.';
   } else if (
+    gate.state === 'SUMMARY_VALIDATED' &&
+    (
+      legacyAction === 'BUY_NOW' ||
+      legacyAction === 'STAGED_BUY'
+    )
+  ) {
+    // PSX summary evidence can rank a company as a current opportunity,
+    // but incomplete extended statements cap the action at ACCUMULATE.
+    view = 'ACCUMULATE';
+    bucket = 'PRIORITY_1';
+    reason = gate.reason;
+  } else if (
     gate.state === 'REVIEW' &&
     (
       legacyAction === 'BUY_NOW' ||
@@ -17757,9 +17846,11 @@ function decisionCenterCandidateView(
       (
         gate.state === 'VALIDATED'
           ? 5
-          : gate.state === 'REVIEW'
-            ? 1
-            : 0
+          : gate.state === 'SUMMARY_VALIDATED'
+            ? 3
+            : gate.state === 'REVIEW'
+              ? 1
+              : 0
       ) +
       Math.min(
         3,
@@ -17840,8 +17931,17 @@ function decisionCenterSummary(
         'UNAVAILABLE',
       coveragePct:
         analyst?.coverage
+          ?.summaryCoveragePct ??
+        analyst?.coverage
           ?.coreCoveragePct ??
         null,
+      extendedCoveragePct:
+        analyst?.coverage
+          ?.extendedCoveragePct ??
+        null,
+      evidenceTier:
+        analyst?.evidenceTier ||
+        'UNAVAILABLE',
       earningsQuality:
         analyst?.views
           ?.earningsQuality
@@ -20631,7 +20731,9 @@ function runDecisionEngineSelfTests() {
         financialSector: false
       },
       coverage: {
-        coreCoveragePct: 90
+        coreCoveragePct: 100,
+        summaryCoveragePct: 100,
+        extendedCoveragePct: 100
       },
       overallFinancialView: {
         state: 'GOOD'
@@ -20671,6 +20773,101 @@ function runDecisionEngineSelfTests() {
     }).state,
     'RESEARCH_REQUIRED',
     'missing analyst evidence must remain visible but cannot become Priority 1'
+  );
+
+  const summaryValidatedCandidate = {
+    ...validatedDecisionCandidate,
+    symbol: 'SUMMARY',
+    analystCore: {
+      ...validatedDecisionCandidate.analystCore,
+      evidenceTier: 'PSX_SUMMARY',
+      coverage: {
+        coreCoveragePct: 100,
+        summaryCoveragePct: 100,
+        extendedCoveragePct: 0
+      },
+      views: {
+        ...validatedDecisionCandidate.analystCore.views,
+        earningsQuality: { state: 'UNRELIABLE' },
+        cashFlowQuality: { state: 'UNRELIABLE' },
+        balanceSheet: { state: 'UNRELIABLE' }
+      }
+    }
+  };
+
+  assert.equal(
+    decisionCenterAnalystGate(
+      summaryValidatedCandidate
+    ).state,
+    'SUMMARY_VALIDATED',
+    'complete PSX summary evidence must remain actionable even when the source does not provide extended statements'
+  );
+
+  assert.equal(
+    decisionCenterCandidateView(
+      summaryValidatedCandidate
+    ).decisionCenterView,
+    'ACCUMULATE',
+    'summary-only validation must cap a BUY_NOW legacy signal at staged ACCUMULATE'
+  );
+
+  const psxSummarySynthetic =
+    buildFinancialAnalystCore({
+      symbol: 'PSXSUM',
+      company: {
+        name: 'PSX Summary Synthetic',
+        sector: 'REFINERY'
+      },
+      source: 'Synthetic PSX summary',
+      annual: {
+        periods: ['2026', '2025', '2024'],
+        rows: [
+          { label: 'Sales', values: [
+            { period: '2026', value: 1200 },
+            { period: '2025', value: 1000 },
+            { period: '2024', value: 900 }
+          ] },
+          { label: 'Profit after Taxation', values: [
+            { period: '2026', value: 150 },
+            { period: '2025', value: 100 },
+            { period: '2024', value: 80 }
+          ] },
+          { label: 'EPS', values: [
+            { period: '2026', value: 15 },
+            { period: '2025', value: 10 },
+            { period: '2024', value: 8 }
+          ] }
+        ]
+      },
+      quarterly: null,
+      ratios: {
+        periods: ['2026', '2025', '2024'],
+        rows: [
+          { label: 'Gross Profit Margin (%)', values: [
+            { period: '2026', value: 12 },
+            { period: '2025', value: 10 },
+            { period: '2024', value: 9 }
+          ] },
+          { label: 'Net Profit Margin (%)', values: [
+            { period: '2026', value: 8 },
+            { period: '2025', value: 6 },
+            { period: '2024', value: 5 }
+          ] }
+        ]
+      },
+      valuation: {}
+    });
+
+  assert.equal(
+    psxSummarySynthetic.coverage.summaryCoveragePct,
+    100,
+    'PSX summary financials and ratio labels with (%) must produce full headline coverage'
+  );
+
+  assert.equal(
+    psxSummarySynthetic.coverage.extendedCoveragePct,
+    0,
+    'PSX summary evidence must not pretend full-statement evidence exists'
   );
 
   const syntheticBoard =
@@ -20728,7 +20925,7 @@ function runDecisionEngineSelfTests() {
 
 
 /* =========================================================
-   CONTINUOUS INTELLIGENCE SCANNER - BUILD 0.8.4B
+   CONTINUOUS INTELLIGENCE SCANNER - BUILD 0.8.4B.1
 ========================================================= */
 
 function scannerSecretConfigured() {
@@ -24190,7 +24387,7 @@ body > main > header {
 
 
 /* =========================================================
-   TRADING WORKSPACE + DECISION CENTER UI - BUILD 0.8.4B
+   TRADING WORKSPACE + DECISION CENTER UI - BUILD 0.8.4B.1
 ========================================================= */
 
 :root {
@@ -25066,7 +25263,7 @@ pre {
 
 
 /* =========================================================
-   DECISION CENTER - BUILD 0.8.4B
+   DECISION CENTER - BUILD 0.8.4B.1
 ========================================================= */
 .decisionTitleRow {
   align-items: flex-start;
@@ -25549,7 +25746,7 @@ Checking connection...
 
 <div class="decisionBoardHeader">
 <div><div class="eyebrow">OPPORTUNITY BOARD</div><h2>Ranked before allocation</h2></div>
-<div class="decisionBoardNote">Priority 1 is intentionally difficult to earn. Missing evidence does not remove a stock; it moves to Research Required.</div>
+<div class="decisionBoardNote">Priority 1 uses tiered evidence. Missing headline evidence moves a stock to Research Required; missing extended statements lowers confidence and limits the action to staged exposure.</div>
 </div>
 
 <div class="opportunityBoardGrid">
@@ -26666,7 +26863,7 @@ async function apiPost(
 
 
 /* =========================================================
-   APP NAVIGATION + DECISION CENTER - BUILD 0.8.4B
+   APP NAVIGATION + DECISION CENTER - BUILD 0.8.4B.1
 ========================================================= */
 
 function openAppPage(
@@ -35416,7 +35613,7 @@ function renderOpportunityList(
             analyst.financialView ||
             'UNAVAILABLE'
           ) +
-          ' · Evidence ' +
+          ' · Summary evidence ' +
           (
             analyst.coveragePct !==
               null &&
@@ -35427,6 +35624,18 @@ function renderOpportunityList(
                   0
                 ) + '%'
               : 'N/A'
+          ) +
+          (
+            analyst.extendedCoveragePct !==
+              null &&
+            analyst.extendedCoveragePct !==
+              undefined
+              ? ' · Extended ' +
+                formatNumber(
+                  analyst.extendedCoveragePct,
+                  0
+                ) + '%'
+              : ''
           ) +
           '</div>' +
           '<div class="opportunityReason">' +
@@ -35491,7 +35700,7 @@ function renderOpportunityBoard(
   renderOpportunityList(
     'priorityOneList',
     priority1,
-    'No company currently earns Priority 1 under the strict analyst-evidence gate.'
+    'No company currently earns Priority 1 under the tiered analyst-evidence gate.'
   );
 
   renderOpportunityList(
