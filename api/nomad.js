@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.8.5A.2';
+const VERSION = '0.8.5B';
 
 
 const SUPABASE_URL =
@@ -18055,8 +18055,8 @@ const DECISION_FUNDAMENTAL_CACHE_FRESH_MS =
 const DECISION_FUNDAMENTAL_CACHE_FALLBACK_MS =
   14 * 24 * 60 * 60 * 1000;
 
-const DECISION_CENTER_SHORTLIST_LIMIT = 15;
-const DECISION_CENTER_DEEP_LIMIT = 10;
+const DECISION_CENTER_SHORTLIST_LIMIT = 18;
+const DECISION_CENTER_DEEP_LIMIT = 12;
 const DECISION_CENTER_MIN_ANALYST_COVERAGE = 65;
 const DECISION_CENTER_MAX_DEPLOYMENT_PCT = 0.90;
 
@@ -19967,6 +19967,329 @@ async function buildDecisionPortfolioContext(
   }
 }
 
+function decisionCenterTargetPositionCount(
+  totalCapitalPkr,
+  riskPolicy
+) {
+  const capital =
+    Math.max(
+      0,
+      safeNumber(
+        totalCapitalPkr
+      ) ||
+      0
+    );
+
+  // Continuous scaling rather than a fixed "3 stocks" rule.
+  // Small accounts can remain concentrated because whole-share feasibility
+  // dominates. Larger portfolios require broader diversification, but NOMAD
+  // never fills slots with Research Required or Avoid names just to hit a count.
+  const capitalFactor =
+    Math.max(
+      1,
+      capital /
+      10000
+    );
+
+  let target =
+    Math.ceil(
+      3 +
+      Math.log10(
+        capitalFactor
+      ) *
+      2.5
+    );
+
+  if (
+    riskPolicy?.id ===
+      'RISK-CONSERVATIVE-0.1'
+  ) {
+    target += 1;
+  }
+
+  if (
+    riskPolicy?.id ===
+      'RISK-AGGRESSIVE-0.1'
+  ) {
+    target -= 1;
+  }
+
+  return Math.max(
+    2,
+    Math.min(
+      10,
+      target
+    )
+  );
+}
+
+function decisionCenterDynamicCaps(
+  targetPositions,
+  riskPolicy
+) {
+  const count =
+    Math.max(
+      2,
+      Number(
+        targetPositions
+      ) ||
+      2
+    );
+
+  let stockMultiplier = 1.35;
+  let minimumStockCap = 0.12;
+  let sectorMultiplier = 2.1;
+  let minimumSectorCap = 0.25;
+
+  if (
+    riskPolicy?.id ===
+      'RISK-CONSERVATIVE-0.1'
+  ) {
+    stockMultiplier = 1.20;
+    minimumStockCap = 0.10;
+    sectorMultiplier = 1.90;
+    minimumSectorCap = 0.22;
+  }
+
+  if (
+    riskPolicy?.id ===
+      'RISK-AGGRESSIVE-0.1'
+  ) {
+    stockMultiplier = 1.60;
+    minimumStockCap = 0.15;
+    sectorMultiplier = 2.20;
+    minimumSectorCap = 0.35;
+  }
+
+  const stockCapPct =
+    Math.min(
+      safeNumber(
+        riskPolicy?.maxStockPct
+      ) ||
+      1,
+      Math.max(
+        minimumStockCap,
+        stockMultiplier /
+        count
+      )
+    );
+
+  const sectorCapPct =
+    Math.min(
+      safeNumber(
+        riskPolicy?.maxSectorPct
+      ) ||
+      1,
+      Math.max(
+        minimumSectorCap,
+        stockCapPct *
+        sectorMultiplier
+      )
+    );
+
+  return {
+    stockCapPct,
+    sectorCapPct
+  };
+}
+
+function decisionCenterFinancialSectorCandidate(
+  candidate
+) {
+  if (
+    candidate?.analystCore
+      ?.company
+      ?.financialSector ===
+        true
+  ) {
+    return true;
+  }
+
+  const sector =
+    String(
+      candidate?.sector ||
+      ''
+    ).toLowerCase();
+
+  return (
+    sector.includes('commercial bank') ||
+    sector.includes('bank') ||
+    sector.includes('insurance') ||
+    sector.includes('leasing') ||
+    sector.includes('investment bank') ||
+    sector.includes('securities') ||
+    sector.includes('modaraba')
+  );
+}
+
+function decisionCenterAllocationCandidatePool(
+  opportunityBoard,
+  riskPolicy,
+  targetPositions
+) {
+  const all =
+    Array.isArray(
+      opportunityBoard?.all
+    )
+      ? opportunityBoard.all
+      : [];
+
+  const priorityOne =
+    all
+      .filter(
+        item =>
+          item.decisionCenterBucket ===
+            'PRIORITY_1' &&
+          (
+            item.decisionCenterView ===
+              'BUY' ||
+            item.decisionCenterView ===
+              'ACCUMULATE'
+          )
+      )
+      .map(
+        item => ({
+          ...item,
+          allocationTier:
+            'PRIORITY_1',
+          allocationStrengthMultiplier:
+            item.decisionCenterView ===
+              'ACCUMULATE'
+              ? 0.82
+              : 1,
+          allocationCapMultiplier:
+            item.decisionCenterView ===
+              'ACCUMULATE'
+              ? 0.90
+              : 1
+        })
+      );
+
+  // Priority 2 is never treated as equivalent to Priority 1. It can receive a
+  // smaller provisional allocation only when the company itself is financially
+  // validated, risk/data-quality gates pass, and the reason for Priority 2 is
+  // primarily timing/entry rather than missing evidence. Financial-sector names
+  // remain excluded until their sector-specific analyst model exists.
+  const priorityTwo =
+    all
+      .filter(
+        item => {
+          if (
+            item.decisionCenterBucket !==
+              'PRIORITY_2' ||
+            decisionCenterFinancialSectorCandidate(
+              item
+            )
+          ) {
+            return false;
+          }
+
+          const gateState =
+            String(
+              item.analystGate
+                ?.state ||
+              ''
+            );
+
+          const overall =
+            safeNumber(
+              item.overallScore
+            ) ||
+            0;
+
+          const fundamental =
+            safeNumber(
+              item.fundamental
+                ?.score
+            ) ||
+            0;
+
+          const riskScore =
+            safeNumber(
+              item.risk
+                ?.score
+            ) ||
+            0;
+
+          const dataQuality =
+            safeNumber(
+              item.dataQuality
+                ?.score
+            ) ||
+            0;
+
+          const entry =
+            safeNumber(
+              item.entry
+                ?.score
+            ) ||
+            0;
+
+          return (
+            (
+              gateState ===
+                'VALIDATED' ||
+              gateState ===
+                'SUMMARY_VALIDATED'
+            ) &&
+            overall >=
+              riskPolicy.minOverallScore -
+              4 &&
+            fundamental >= 60 &&
+            riskScore >=
+              riskPolicy.minRiskScore &&
+            dataQuality >=
+              riskPolicy.minDataQualityScore &&
+            entry >= 30
+          );
+        }
+      )
+      .map(
+        item => ({
+          ...item,
+          allocationTier:
+            'PRIORITY_2',
+          allocationStrengthMultiplier:
+            0.48,
+          allocationCapMultiplier:
+            0.50
+        })
+      );
+
+  return [
+    ...priorityOne,
+    ...priorityTwo
+  ]
+    .sort(
+      (
+        a,
+        b
+      ) => {
+        if (
+          a.allocationTier !==
+          b.allocationTier
+        ) {
+          return a.allocationTier ===
+            'PRIORITY_1'
+              ? -1
+              : 1;
+        }
+
+        return (
+          b.opportunityRankScore -
+          a.opportunityRankScore
+        );
+      }
+    )
+    .slice(
+      0,
+      Math.max(
+        1,
+        targetPositions
+      )
+    );
+}
+
 function allocateDecisionCenterOpportunities(
   opportunityBoard,
   amount,
@@ -19980,12 +20303,6 @@ function allocateDecisionCenterOpportunities(
         Number(amount) *
         100
       )
-    );
-
-  const deployCap =
-    Math.floor(
-      budgetPaisa *
-      DECISION_CENTER_MAX_DEPLOYMENT_PCT
     );
 
   const existingPortfolioValuePaisa =
@@ -20007,6 +20324,25 @@ function allocateDecisionCenterOpportunities(
     existingPortfolioValuePaisa +
     budgetPaisa;
 
+  const targetPositionCount =
+    decisionCenterTargetPositionCount(
+      postFundingCapitalBasePaisa /
+      100,
+      riskPolicy
+    );
+
+  const dynamicCaps =
+    decisionCenterDynamicCaps(
+      targetPositionCount,
+      riskPolicy
+    );
+
+  const deployCap =
+    Math.floor(
+      budgetPaisa *
+      DECISION_CENTER_MAX_DEPLOYMENT_PCT
+    );
+
   const existingSymbolValues =
     portfolioContext?.symbolValues ||
     {};
@@ -20016,30 +20352,11 @@ function allocateDecisionCenterOpportunities(
     {};
 
   const candidates =
-    (opportunityBoard?.all || [])
-      .filter(
-        item =>
-          item.decisionCenterBucket ===
-            'PRIORITY_1' &&
-          (
-            item.decisionCenterView ===
-              'BUY' ||
-            item.decisionCenterView ===
-              'ACCUMULATE'
-          )
-      )
-      .sort(
-        (
-          a,
-          b
-        ) =>
-          b.opportunityRankScore -
-          a.opportunityRankScore
-      )
-      .slice(
-        0,
-        riskPolicy.maxAllocations
-      );
+    decisionCenterAllocationCandidatePool(
+      opportunityBoard,
+      riskPolicy,
+      targetPositionCount
+    );
 
   if (!candidates.length) {
     return {
@@ -20064,7 +20381,24 @@ function allocateDecisionCenterOpportunities(
           100,
           2
         ),
-      unfundedPriorityOne: []
+      targetPositionCount,
+      eligibleAllocationCandidates: 0,
+      priorityOneAllocationCandidates: 0,
+      priorityTwoAllocationCandidates: 0,
+      dynamicMaxStockPct:
+        decisionRound(
+          dynamicCaps.stockCapPct *
+          100,
+          2
+        ),
+      dynamicMaxSectorPct:
+        decisionRound(
+          dynamicCaps.sectorCapPct *
+          100,
+          2
+        ),
+      unfundedPriorityOne: [],
+      personalActions: []
     };
   }
 
@@ -20082,12 +20416,7 @@ function allocateDecisionCenterOpportunities(
           ) ||
           1
         ) *
-        (
-          candidate.decisionCenterView ===
-            'ACCUMULATE'
-            ? 0.65
-            : 1
-        ),
+        candidate.allocationStrengthMultiplier,
       0
     );
 
@@ -20097,6 +20426,7 @@ function allocateDecisionCenterOpportunities(
   const allocations = [];
   const sectorSpent =
     new Map();
+  const personalActions = [];
 
   for (
     const candidate
@@ -20127,12 +20457,7 @@ function allocateDecisionCenterOpportunities(
         ) ||
         1
       ) *
-      (
-        candidate.decisionCenterView ===
-          'ACCUMULATE'
-          ? 0.65
-          : 1
-      );
+      candidate.allocationStrengthMultiplier;
 
     const proportionalTarget =
       Math.floor(
@@ -20154,30 +20479,26 @@ function allocateDecisionCenterOpportunities(
         100
       );
 
+    const existingStockWeightPct =
+      existingPortfolioValuePaisa > 0
+        ? existingStockValuePaisa /
+          existingPortfolioValuePaisa *
+          100
+        : 0;
+
     const stockTotalCap =
       Math.floor(
         postFundingCapitalBasePaisa *
-        riskPolicy.maxStockPct *
-        (
-          candidate.decisionCenterView ===
-            'ACCUMULATE'
-            ? 0.65
-            : 1
-        )
+        dynamicCaps.stockCapPct *
+        candidate.allocationCapMultiplier
       );
 
-    const stockCap =
+    const stockGap =
       Math.max(
         0,
         stockTotalCap -
         existingStockValuePaisa
       );
-
-    const existingSectorSpent =
-      sectorSpent.get(
-        candidate.sector
-      ) ||
-      0;
 
     const existingSectorValuePaisa =
       Math.round(
@@ -20192,14 +20513,24 @@ function allocateDecisionCenterOpportunities(
         100
       );
 
-    const sectorCap =
+    const existingSectorSpent =
+      sectorSpent.get(
+        candidate.sector
+      ) ||
+      0;
+
+    const sectorTotalCap =
+      Math.floor(
+        postFundingCapitalBasePaisa *
+        dynamicCaps.sectorCapPct
+      );
+
+    const sectorGap =
       Math.max(
         0,
-        Math.floor(
-          postFundingCapitalBasePaisa *
-          riskPolicy.maxSectorPct
-        ) -
-        existingSectorValuePaisa
+        sectorTotalCap -
+        existingSectorValuePaisa -
+        existingSectorSpent
       );
 
     const allowed =
@@ -20208,9 +20539,8 @@ function allocateDecisionCenterOpportunities(
         Math.min(
           remainingDeploy,
           proportionalTarget,
-          stockCap,
-          sectorCap -
-            existingSectorSpent
+          stockGap,
+          sectorGap
         )
       );
 
@@ -20221,6 +20551,59 @@ function allocateDecisionCenterOpportunities(
       );
 
     if (shares < 1) {
+      let personalAction =
+        'NO_ADD';
+      let personalReason =
+        'The opportunity remains ranked, but this new capital cannot fit one whole share inside the current target-weight and sector limits.';
+
+      if (
+        existingStockValuePaisa >=
+          stockTotalCap &&
+        existingStockValuePaisa > 0
+      ) {
+        personalAction =
+          'HOLD';
+        personalReason =
+          'NOMAD still likes the opportunity, but your current holding is already at or above its portfolio target. Do not add with this new money.';
+      } else if (
+        existingSectorValuePaisa >=
+          sectorTotalCap &&
+        existingSectorValuePaisa > 0
+      ) {
+        personalAction =
+          'DO_NOT_ADD';
+        personalReason =
+          'The stock remains attractive, but your existing sector exposure is already at the current portfolio cap.';
+      }
+
+      personalActions.push({
+        symbol:
+          candidate.symbol,
+        marketView:
+          candidate.decisionCenterView,
+        portfolioAction:
+          personalAction,
+        allocationTier:
+          candidate.allocationTier,
+        existingWeightPct:
+          decisionRound(
+            existingStockWeightPct,
+            2
+          ),
+        targetWeightPct:
+          decisionRound(
+            stockTotalCap /
+            Math.max(
+              1,
+              postFundingCapitalBasePaisa
+            ) *
+            100,
+            2
+          ),
+        reason:
+          personalReason
+      });
+
       continue;
     }
 
@@ -20237,6 +20620,10 @@ function allocateDecisionCenterOpportunities(
         spent
     );
 
+    const postStockValue =
+      existingStockValuePaisa +
+      spent;
+
     allocations.push({
       symbol:
         candidate.symbol,
@@ -20245,7 +20632,14 @@ function allocateDecisionCenterOpportunities(
       sector:
         candidate.sector,
       action:
+        candidate.allocationTier ===
+          'PRIORITY_2'
+          ? 'ACCUMULATE'
+          : candidate.decisionCenterView,
+      marketView:
         candidate.decisionCenterView,
+      allocationTier:
+        candidate.allocationTier,
       shares,
       referencePrice:
         decisionRound(
@@ -20260,16 +20654,44 @@ function allocateDecisionCenterOpportunities(
         ),
       targetWeightPct:
         decisionRound(
-          proportionalTarget /
-          budgetPaisa *
+          stockTotalCap /
+          Math.max(
+            1,
+            postFundingCapitalBasePaisa
+          ) *
           100,
+          2
+        ),
+      newMoneyWeightPct:
+        decisionRound(
+          budgetPaisa > 0
+            ? spent /
+              budgetPaisa *
+              100
+            : 0,
+          2
+        ),
+      postPortfolioWeightPct:
+        decisionRound(
+          postFundingCapitalBasePaisa > 0
+            ? postStockValue /
+              postFundingCapitalBasePaisa *
+              100
+            : 0,
+          2
+        ),
+      existingWeightPct:
+        decisionRound(
+          existingStockWeightPct,
           2
         ),
       actualWeightPct:
         decisionRound(
-          spent /
-          budgetPaisa *
-          100,
+          budgetPaisa > 0
+            ? spent /
+              budgetPaisa *
+              100
+            : 0,
           2
         ),
       overallScore:
@@ -20282,16 +20704,62 @@ function allocateDecisionCenterOpportunities(
           ?.coreCoveragePct ??
         null,
       note:
-        candidate.decisionCenterView ===
-          'ACCUMULATE'
-          ? 'Staged exposure: the analyst thesis is validated, but current entry conditions do not justify a full target position.'
-          : 'Priority 1 shadow allocation. Brokerage, taxes, levies and execution slippage are not included.'
+        candidate.allocationTier ===
+          'PRIORITY_2'
+          ? 'Smaller provisional allocation from Priority 2: financial/risk evidence passes, but the full current-action threshold is not met. NOMAD deliberately sizes this below Priority 1.'
+          : candidate.decisionCenterView ===
+              'ACCUMULATE'
+            ? 'Staged Priority 1 exposure: the analyst thesis passes, but NOMAD is not sizing this as a full position yet.'
+            : 'Priority 1 shadow allocation. Brokerage, taxes, levies and execution slippage are not included.'
+    });
+
+    personalActions.push({
+      symbol:
+        candidate.symbol,
+      marketView:
+        candidate.decisionCenterView,
+      portfolioAction:
+        existingStockValuePaisa > 0
+          ? 'ADD'
+          : 'BUY',
+      allocationTier:
+        candidate.allocationTier,
+      existingWeightPct:
+        decisionRound(
+          existingStockWeightPct,
+          2
+        ),
+      targetWeightPct:
+        decisionRound(
+          stockTotalCap /
+          Math.max(
+            1,
+            postFundingCapitalBasePaisa
+          ) *
+          100,
+          2
+        ),
+      postPortfolioWeightPct:
+        decisionRound(
+          postFundingCapitalBasePaisa > 0
+            ? postStockValue /
+              postFundingCapitalBasePaisa *
+              100
+            : 0,
+          2
+        ),
+      reason:
+        existingStockValuePaisa > 0
+          ? 'The holding is below NOMAD\'s current target exposure, so some of the new capital can be added without breaching stock or sector limits.'
+          : candidate.allocationTier ===
+              'PRIORITY_2'
+            ? 'NOMAD permits only a smaller provisional position because this is a validated Priority 2 opportunity, not a full Priority 1 allocation.'
+            : 'The opportunity passes the current allocation gate and fits the portfolio diversification limits.'
     });
   }
 
-  // One conservative second pass lets whole-share rounding use some of the
-  // intended deployment without breaching stock/sector caps. It never forces
-  // deployment to 100%.
+  // Whole-share rounding pass. It can add one share at a time only to already
+  // selected candidates and never above the dynamic post-portfolio target cap.
   let progressed = true;
 
   while (
@@ -20330,13 +20798,15 @@ function allocateDecisionCenterOpportunities(
               candidate.symbol
         );
 
+      if (!allocation) {
+        continue;
+      }
+
       const currentSpent =
-        allocation
-          ? Math.round(
-              allocation.principalPkr *
-              100
-            )
-          : 0;
+        Math.round(
+          allocation.principalPkr *
+          100
+        );
 
       const existingStockValuePaisa =
         Math.round(
@@ -20354,20 +20824,8 @@ function allocateDecisionCenterOpportunities(
       const stockTotalCap =
         Math.floor(
           postFundingCapitalBasePaisa *
-          riskPolicy.maxStockPct *
-          (
-            candidate.decisionCenterView ===
-              'ACCUMULATE'
-              ? 0.65
-              : 1
-          )
-        );
-
-      const stockCap =
-        Math.max(
-          0,
-          stockTotalCap -
-          existingStockValuePaisa
+          dynamicCaps.stockCapPct *
+          candidate.allocationCapMultiplier
         );
 
       const sectorCurrent =
@@ -20389,86 +20847,57 @@ function allocateDecisionCenterOpportunities(
           100
         );
 
-      const sectorCap =
-        Math.max(
-          0,
-          Math.floor(
-            postFundingCapitalBasePaisa *
-            riskPolicy.maxSectorPct
-          ) -
-          existingSectorValuePaisa
+      const sectorTotalCap =
+        Math.floor(
+          postFundingCapitalBasePaisa *
+          dynamicCaps.sectorCapPct
         );
 
       if (
-        currentSpent +
+        existingStockValuePaisa +
+          currentSpent +
           pricePaisa >
-            stockCap ||
-        sectorCurrent +
+            stockTotalCap ||
+        existingSectorValuePaisa +
+          sectorCurrent +
           pricePaisa >
-            sectorCap
+            sectorTotalCap
       ) {
         continue;
       }
 
-      if (allocation) {
-        allocation.shares += 1;
-        allocation.principalPkr =
-          decisionRound(
-            allocation.principalPkr +
-              pricePaisa /
-                100,
-            2
-          );
-        allocation.actualWeightPct =
-          decisionRound(
-            allocation.principalPkr /
-              amount *
-              100,
-            2
-          );
-      } else {
-        allocations.push({
-          symbol:
-            candidate.symbol,
-          companyName:
-            candidate.companyName,
-          sector:
-            candidate.sector,
-          action:
-            candidate.decisionCenterView,
-          shares: 1,
-          referencePrice:
-            decisionRound(
-              candidate.price,
-              2
-            ),
-          principalPkr:
-            decisionRound(
-              pricePaisa /
-                100,
-              2
-            ),
-          targetWeightPct: 0,
-          actualWeightPct:
-            decisionRound(
-              pricePaisa /
-                budgetPaisa *
-                100,
-              2
-            ),
-          overallScore:
-            candidate.overallScore,
-          opportunityRankScore:
-            candidate.opportunityRankScore,
-          evidenceStrength:
-            candidate.analystCore
-              ?.coverage
-              ?.coreCoveragePct ??
-            null,
-          note:
-            'One-share whole-number fit inside the validated Priority 1 allocation and risk caps.'
-        });
-      }
+      allocation.shares += 1;
+      allocation.principalPkr =
+        decisionRound(
+          allocation.principalPkr +
+            pricePaisa /
+            100,
+          2
+        );
+      allocation.newMoneyWeightPct =
+        decisionRound(
+          allocation.principalPkr /
+            amount *
+            100,
+          2
+        );
+      allocation.actualWeightPct =
+        allocation.newMoneyWeightPct;
+      allocation.postPortfolioWeightPct =
+        decisionRound(
+          (
+            existingStockValuePaisa /
+              100 +
+            allocation.principalPkr
+          ) /
+          Math.max(
+            0.01,
+            postFundingCapitalBasePaisa /
+              100
+          ) *
+          100,
+          2
+        );
 
       remainingDeploy -=
         pricePaisa;
@@ -20513,6 +20942,8 @@ function allocateDecisionCenterOpportunities(
     candidates
       .filter(
         candidate =>
+          candidate.allocationTier ===
+            'PRIORITY_1' &&
           !allocatedSymbols.has(
             candidate.symbol
           )
@@ -20525,8 +20956,8 @@ function allocateDecisionCenterOpportunities(
             candidate.price,
           reason:
             Boolean(portfolioContext?.holdingCount)
-              ? 'Priority 1 remains valid, but the entered amount plus your existing stock/sector exposure could not fit one whole share within portfolio limits.'
-              : 'Priority 1 remains valid, but the entered amount and current position/sector caps could not fit one whole share.'
+              ? 'Priority 1 remains valid, but your existing holding/sector exposure or whole-share feasibility leaves no prudent room to add it with this capital.'
+              : 'Priority 1 remains valid, but whole-share feasibility or the dynamic diversification cap prevents a prudent allocation with this amount.'
       }));
 
   return {
@@ -20569,7 +21000,35 @@ function allocateDecisionCenterOpportunities(
         100,
         2
       ),
-    unfundedPriorityOne
+    targetPositionCount,
+    eligibleAllocationCandidates:
+      candidates.length,
+    priorityOneAllocationCandidates:
+      candidates.filter(
+        item =>
+          item.allocationTier ===
+            'PRIORITY_1'
+      ).length,
+    priorityTwoAllocationCandidates:
+      candidates.filter(
+        item =>
+          item.allocationTier ===
+            'PRIORITY_2'
+      ).length,
+    dynamicMaxStockPct:
+      decisionRound(
+        dynamicCaps.stockCapPct *
+        100,
+        2
+      ),
+    dynamicMaxSectorPct:
+      decisionRound(
+        dynamicCaps.sectorCapPct *
+        100,
+        2
+      ),
+    unfundedPriorityOne,
+    personalActions
   };
 }
 
@@ -22096,7 +22555,7 @@ async function runDecisionLab(
   let headline =
     'No validated Priority 1 allocation is available right now.';
   let reason =
-    'NOMAD keeps opportunities visible, but only independently validated Priority 1 ideas can receive capital in this build.';
+    'NOMAD keeps opportunities visible. Priority 1 receives normal target sizing; financially validated Priority 2 ideas may receive smaller provisional sizing when that improves diversification without weakening the evidence standard.';
 
   const dataBlockedCount =
     candidates.filter(
@@ -22149,7 +22608,7 @@ async function runDecisionLab(
         ? 'One validated Priority 1 opportunity is currently actionable.'
         : 'Validated Priority 1 opportunities are currently actionable.';
     reason =
-      'The capital allocator used only Priority 1 ideas that passed the Financial Analyst evidence gate, then converted the entered amount into whole shares within stock and sector limits.';
+      'The capital allocator built a portfolio-aware target from the strongest validated opportunities. Priority 1 receives normal sizing, while eligible Priority 2 ideas can receive smaller provisional exposure. Existing holdings, stock caps and sector caps are applied to the combined post-investment portfolio before whole shares are calculated.';
   } else if (
     priorityOneCount > 0
   ) {
@@ -22326,6 +22785,27 @@ async function runDecisionLab(
       existingPortfolioValuePkr:
         allocation.existingPortfolioValuePkr ||
         0,
+      targetPositionCount:
+        allocation.targetPositionCount ||
+        0,
+      eligibleAllocationCandidates:
+        allocation.eligibleAllocationCandidates ||
+        0,
+      priorityOneAllocationCandidates:
+        allocation.priorityOneAllocationCandidates ||
+        0,
+      priorityTwoAllocationCandidates:
+        allocation.priorityTwoAllocationCandidates ||
+        0,
+      dynamicMaxStockPct:
+        allocation.dynamicMaxStockPct ||
+        0,
+      dynamicMaxSectorPct:
+        allocation.dynamicMaxSectorPct ||
+        0,
+      personalActions:
+        allocation.personalActions ||
+        [],
       unfundedPriorityOne:
         allocation.unfundedPriorityOne
     },
@@ -22354,7 +22834,7 @@ async function runDecisionLab(
       'Allocations are planning principals only. Brokerage, levies, taxes and execution slippage are not yet included.',
       'No order-execution capability exists. The user remains the final decision maker.',
       'Current scoring rules remain supporting evidence only; Priority 1 now also requires the Financial Analyst evidence gate.',
-      'Opportunity ranking is independent of the entered budget. The amount is applied only after ranking by the whole-share allocator.',
+      'Opportunity ranking is independent of the entered budget. The allocator then sizes a dynamic, portfolio-aware set of positions from Priority 1 and only financially validated Priority 2 opportunities; Research Required and Avoid receive no capital.',
       ...(
         candidates.some(
           candidate =>
@@ -23032,6 +23512,36 @@ function runDecisionEngineSelfTests() {
         item.symbol !== 'VALID'
     ),
     'existing concentration above the balanced stock cap must prevent NOMAD from adding more of the same stock'
+  );
+
+  const dynamicSmall =
+    decisionCenterTargetPositionCount(
+      5000,
+      riskBalanced
+    );
+
+  const dynamicLarge =
+    decisionCenterTargetPositionCount(
+      1000000,
+      riskBalanced
+    );
+
+  assert.ok(
+    dynamicLarge >
+      dynamicSmall,
+    'larger portfolios must target broader diversification than very small portfolios'
+  );
+
+  const dynamicLargeCaps =
+    decisionCenterDynamicCaps(
+      dynamicLarge,
+      riskBalanced
+    );
+
+  assert.ok(
+    dynamicLargeCaps.stockCapPct <
+      riskBalanced.maxStockPct,
+    'dynamic diversification must tighten the legacy per-stock cap for larger portfolios'
   );
 
   console.log(
@@ -28127,7 +28637,7 @@ Checking connection...
 
 <div class="decisionBoardHeader">
 <div><div class="eyebrow">OPPORTUNITY BOARD</div><h2>Ranked before allocation</h2></div>
-<div class="decisionBoardNote">Priority 1 uses tiered evidence. Missing headline evidence moves a stock to Research Required; missing extended statements lowers confidence and limits the action to staged exposure.</div>
+<div class="decisionBoardNote">Priority 1 uses tiered evidence. Missing headline evidence moves a stock to Research Required; missing extended statements lowers confidence and limits sizing. The personal allocator can use smaller validated Priority 2 positions when they improve diversification, but Research Required and Avoid never receive capital.</div>
 </div>
 
 <div class="opportunityBoardGrid">
@@ -38820,7 +39330,10 @@ function decisionActionLabel(
     AVOID: 'AVOID',
     INVEST: 'INVEST',
     PARTIAL_INVEST:
-      'PARTIAL INVEST'
+      'PARTIAL INVEST',
+    ADD: 'ADD',
+    NO_ADD: 'NO ADD',
+    DO_NOT_ADD: 'DO NOT ADD'
   };
 
   return labels[action] ||
@@ -39306,6 +39819,56 @@ function renderShadowDecision(
       ' before applying stock and sector caps to this new capital.</div>';
   }
 
+  if (
+    result?.allocationDiagnostics
+      ?.targetPositionCount
+  ) {
+    html +=
+      '<div class="decisionMetaLine"><strong>Dynamic diversification:</strong> target up to ' +
+      formatNumber(
+        result.allocationDiagnostics
+          .targetPositionCount ||
+        0,
+        0
+      ) +
+      ' positions for the combined capital base; ' +
+      formatNumber(
+        result.allocationDiagnostics
+          .eligibleAllocationCandidates ||
+        0,
+        0
+      ) +
+      ' currently pass the allocation gate (' +
+      formatNumber(
+        result.allocationDiagnostics
+          .priorityOneAllocationCandidates ||
+        0,
+        0
+      ) +
+      ' Priority 1 + ' +
+      formatNumber(
+        result.allocationDiagnostics
+          .priorityTwoAllocationCandidates ||
+        0,
+        0
+      ) +
+      ' validated Priority 2). Current caps: ' +
+      formatNumber(
+        result.allocationDiagnostics
+          .dynamicMaxStockPct ||
+        0,
+        1
+      ) +
+      '% per stock and ' +
+      formatNumber(
+        result.allocationDiagnostics
+          .dynamicMaxSectorPct ||
+        0,
+        1
+      ) +
+      '% per sector.</div>';
+  }
+
   if (allocations.length) {
     html +=
       '<div class="decisionMetaLine">Whole-share implementation</div>';
@@ -39342,12 +39905,34 @@ function renderShadowDecision(
             item.companyName ||
             ''
           ) +
-          ' · actual ' +
+          ' · ' +
+          escapeHtml(
+            item.allocationTier ===
+              'PRIORITY_2'
+              ? 'provisional Priority 2'
+              : 'Priority 1'
+          ) +
+          ' · new money ' +
           formatNumber(
+            item.newMoneyWeightPct ??
             item.actualWeightPct,
             1
           ) +
-          '% of entered capital</div></div>' +
+          '%' +
+          (
+            item.postPortfolioWeightPct !==
+              undefined &&
+            item.postPortfolioWeightPct !==
+              null
+              ? ' · post-portfolio ' +
+                formatNumber(
+                  item.postPortfolioWeightPct,
+                  1
+                ) +
+                '%'
+              : ''
+          ) +
+          '</div></div>' +
           '<div class="decisionActionTag ' +
           escapeHtml(
             String(
@@ -39384,6 +39969,41 @@ function renderShadowDecision(
           )
       ).join(', ') +
       '. NOMAD kept these ranked instead of replacing them with weaker cheaper stocks.</div>';
+  }
+
+  const personalActions =
+    result?.allocationDiagnostics
+      ?.personalActions ||
+    [];
+
+  const existingPortfolioActions =
+    personalActions.filter(
+      item =>
+        Number(
+          item.existingWeightPct ||
+          0
+        ) > 0
+    );
+
+  if (existingPortfolioActions.length) {
+    html +=
+      '<div class="decisionMetaLine"><strong>Your holdings changed the recommendation:</strong> ' +
+      existingPortfolioActions
+        .slice(0, 5)
+        .map(
+          item =>
+            escapeHtml(
+              item.symbol
+            ) +
+            ' = ' +
+            escapeHtml(
+              decisionActionLabel(
+                item.portfolioAction
+              )
+            )
+        )
+        .join(' · ') +
+      '.</div>';
   }
 
   html +=
