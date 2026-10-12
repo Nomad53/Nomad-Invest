@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.8.5A.1';
+const VERSION = '0.8.5A.2';
 
 
 const SUPABASE_URL =
@@ -30058,7 +30058,7 @@ function renderPortfolioFull(
   }
 
   html +=
-    '<div class="sourceNote">Live values use NOMAD\'s latest PSX market snapshot. Portfolio P&amp;L is calculated from the prices and transactions you record; it is not a broker statement. Decision Center now considers your existing position and sector exposure before allocating new money.</div>' +
+    '<div class="sourceNote">Live values use NOMAD\\'s latest PSX market snapshot. Portfolio P&amp;L is calculated from the prices and transactions you record; it is not a broker statement. Decision Center now considers your existing position and sector exposure before allocating new money.</div>' +
     '</div>';
 
   target.innerHTML =
@@ -38274,7 +38274,7 @@ async function importPortfolioCsv(
 
   const lines =
     text
-      .split(/\r?\n/)
+      .split(/\\r?\\n/)
       .filter(
         line =>
           line.trim()
