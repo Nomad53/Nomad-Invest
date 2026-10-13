@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.1';
+const VERSION = '0.9.2.1';
 
 
 const SUPABASE_URL =
@@ -11846,9 +11846,7 @@ async function getQuote(
           data.change_1y_pct
         ),
 
-      priceAction,
-
-    range52: {
+      range52: {
         low:
           range52Low,
 
@@ -24053,6 +24051,742 @@ async function recordDecisionRun(
   }
 }
 
+async function runSingleStockStrategy(
+  input
+) {
+  const requestedSymbol =
+    normalizeSymbol(
+      input?.symbol
+    );
+
+  const horizon =
+    String(
+      input?.horizon ||
+      'long_term'
+    );
+
+  const risk =
+    String(
+      input?.risk ||
+      'balanced'
+    );
+
+  if (!requestedSymbol) {
+    bad(
+      'Enter a PSX symbol to analyze.'
+    );
+  }
+
+  const model =
+    DECISION_MODELS[
+      horizon
+    ];
+
+  const riskPolicy =
+    DECISION_RISK_POLICIES[
+      risk
+    ];
+
+  if (!model) {
+    bad(
+      'Select a valid investment horizon.'
+    );
+  }
+
+  if (!riskPolicy) {
+    bad(
+      'Select a valid risk profile.'
+    );
+  }
+
+  const symbolContext =
+    await resolveSymbolContext(
+      requestedSymbol
+    );
+
+  const canonicalSymbol =
+    normalizeSymbol(
+      symbolContext?.canonicalSymbol ||
+      symbolContext?.tradingSymbol ||
+      requestedSymbol
+    );
+
+  const [
+    market,
+    memoryRows
+  ] =
+    await Promise.all([
+      loadPSXMarket(),
+      continuousMemoryConfigured()
+        ? readAllSecurityMemory()
+            .catch(
+              () => []
+            )
+        : Promise.resolve([])
+    ]);
+
+  const marketRow =
+    (market.stocks || [])
+      .find(
+        row =>
+          normalizeSymbol(
+            row.symbol
+          ) ===
+            canonicalSymbol ||
+          normalizeSymbol(
+            row.rawMarketSymbol
+          ) ===
+            canonicalSymbol
+      ) ||
+    null;
+
+  if (!marketRow) {
+    bad(
+      canonicalSymbol +
+      ' is not available in the current Official PSX market universe.'
+    );
+  }
+
+  const eligibleRows =
+    (market.stocks || [])
+      .filter(
+        row =>
+          row.recommendationEligible ===
+            true &&
+          safeNumber(
+            row.price
+          ) !== null &&
+          safeNumber(
+            row.price
+          ) > 0
+      );
+
+  const memoryMap =
+    new Map(
+      (memoryRows || [])
+        .map(
+          row => [
+            normalizeSymbol(
+              row.symbol
+            ),
+            row
+          ]
+        )
+    );
+
+  const historicalContext =
+    await decisionHistoricalContext(
+      marketRow,
+      memoryMap
+    );
+
+  const valuation =
+    scoreDecisionValuation(
+      marketRow,
+      eligibleRows
+    );
+
+  const entry =
+    scoreDecisionEntry(
+      historicalContext,
+      horizon,
+      riskPolicy
+    );
+
+  const riskScore =
+    scoreDecisionRisk(
+      marketRow,
+      historicalContext,
+      eligibleRows
+    );
+
+  const fundamentalEvidence =
+    await decisionLoadFundamentals(
+      marketRow,
+      memoryMap
+    );
+
+  const fundamentals =
+    fundamentalEvidence
+      .fundamentals;
+
+  const fundamental =
+    scoreDecisionFundamentals(
+      fundamentals
+    );
+
+  fundamental.evidenceState =
+    fundamentalEvidence
+      .evidenceState;
+
+  fundamental.cachedAt =
+    fundamentalEvidence
+      .cachedAt;
+
+  if (
+    fundamentalEvidence.error
+  ) {
+    fundamental.risks =
+      uniqueTextValues([
+        ...(
+          fundamental.risks ||
+          []
+        ),
+        fundamentalEvidence.error
+      ]);
+  }
+
+  const dataQuality =
+    scoreDecisionDataQuality(
+      marketRow,
+      historicalContext,
+      fundamental
+    );
+
+  const overallScore =
+    decisionOverallScore(
+      model,
+      fundamental,
+      valuation,
+      entry,
+      riskScore,
+      dataQuality
+    );
+
+  const candidate = {
+    horizon,
+    riskProfile:
+      risk,
+    symbol:
+      canonicalSymbol,
+    companyName:
+      marketRow.companyName ||
+      symbolContext?.companyName ||
+      canonicalSymbol,
+    sector:
+      marketRow.sector ||
+      symbolContext?.sector ||
+      'Unknown',
+    statusCodes:
+      marketRow.statusCodes ||
+      [],
+    price:
+      decisionRound(
+        marketRow.price,
+        4
+      ),
+    marketAsOf:
+      marketRow.asOf ||
+      market.marketWatchAsOf ||
+      market.asOf ||
+      null,
+    averageVolume30d:
+      decisionRound(
+        marketRow.averageVolume30d,
+        0
+      ),
+    historicalContext,
+    fundamental,
+    analystCore:
+      fundamentals?.analystCore ||
+      null,
+    fundamentalEvidenceState:
+      fundamentalEvidence
+        .evidenceState,
+    fundamentalEvidenceDiagnostics:
+      fundamentalEvidence
+        .diagnostics ||
+      null,
+    valuation,
+    entry,
+    risk:
+      riskScore,
+    dataQuality,
+    overallScore
+  };
+
+  const legacyAction =
+    decisionCandidateAction(
+      candidate,
+      model,
+      riskPolicy
+    );
+
+  candidate.action =
+    legacyAction.action;
+
+  candidate.actionReason =
+    legacyAction.reason;
+
+  candidate.narrative =
+    decisionCandidateNarrative(
+      candidate
+    );
+
+  candidate.canonicalState =
+    decisionCanonicalCompanyState(
+      candidate
+    );
+
+  const volatility =
+    safeNumber(
+      historicalContext
+        ?.technical
+        ?.annualizedVolatility20dPct
+    );
+
+  const avgVolume =
+    safeNumber(
+      marketRow.averageVolume30d
+    );
+
+  const suitabilityIssues = [];
+
+  if (
+    marketRow.recommendationEligible !==
+      true
+  ) {
+    suitabilityIssues.push(
+      'This security is not eligible for NOMAD new-money recommendations.'
+    );
+  }
+
+  if (
+    (marketRow.statusCodes || [])
+      .includes('NC')
+  ) {
+    suitabilityIssues.push(
+      'PSX non-compliant-segment status is present.'
+    );
+  }
+
+  if (
+    avgVolume === null ||
+    avgVolume <
+      riskPolicy.minAverageVolume30d
+  ) {
+    suitabilityIssues.push(
+      '30-day liquidity is below the selected risk profile minimum.'
+    );
+  }
+
+  if (
+    volatility !== null &&
+    volatility >
+      riskPolicy.maxAnnualizedVolatilityPct
+  ) {
+    suitabilityIssues.push(
+      'Recent annualized volatility exceeds the selected risk profile limit.'
+    );
+  }
+
+  if (
+    safeNumber(
+      dataQuality.score
+    ) <
+      riskPolicy.minDataQualityScore
+  ) {
+    suitabilityIssues.push(
+      'Data quality is below the selected risk profile minimum.'
+    );
+  }
+
+  if (
+    safeNumber(
+      riskScore.score
+    ) <
+      riskPolicy.minRiskScore
+  ) {
+    suitabilityIssues.push(
+      'Risk quality is below the selected risk profile minimum.'
+    );
+  }
+
+  const riskSuitability =
+    suitabilityIssues.length
+      ? 'NOT_SUITABLE'
+      : 'SUITABLE';
+
+  const portfolioContext =
+    await buildDecisionPortfolioContext(
+      market
+    );
+
+  const existingValue =
+    safeNumber(
+      portfolioContext
+        ?.symbolValues
+        ?.[canonicalSymbol]
+    ) ||
+    0;
+
+  const portfolioValue =
+    safeNumber(
+      portfolioContext
+        ?.currentValuePkr
+    ) ||
+    0;
+
+  const existingWeightPct =
+    portfolioValue > 0
+      ? existingValue /
+        portfolioValue *
+        100
+      : 0;
+
+  const canonical =
+    candidate.canonicalState;
+
+  let personalAction =
+    canonical.marketAction;
+
+  let personalReason =
+    canonical.reason;
+
+  if (
+    riskSuitability ===
+      'NOT_SUITABLE'
+  ) {
+    personalAction =
+      existingValue > 0
+        ? 'DO_NOT_ADD'
+        : 'AVOID_FOR_PROFILE';
+    personalReason =
+      suitabilityIssues.join(' ');
+  } else if (
+    existingValue > 0
+  ) {
+    if (
+      canonical.marketAction ===
+        'BUY' ||
+      canonical.marketAction ===
+        'ACCUMULATE'
+    ) {
+      if (
+        existingWeightPct >=
+          riskPolicy.maxStockPct *
+          100
+      ) {
+        personalAction =
+          'DO_NOT_ADD';
+        personalReason =
+          'The market thesis is actionable, but your existing position already reaches the selected profile\'s hard single-stock ceiling.';
+      } else {
+        personalAction =
+          'ADD_CANDIDATE';
+        personalReason =
+          'You already own this company and the current professional state remains actionable for the selected profile.';
+      }
+    } else if (
+      canonical.marketAction ===
+        'WATCH'
+    ) {
+      personalAction =
+        'HOLD';
+      personalReason =
+        'You already own the stock. The current thesis does not justify adding new capital, but it does not independently trigger an exit.';
+    } else if (
+      canonical.marketAction ===
+        'AVOID'
+    ) {
+      personalAction =
+        'REVIEW_REDUCE';
+      personalReason =
+        'You already own the stock and the current professional framework is unfavorable. Review the original thesis before deciding whether to reduce or exit.';
+    }
+  }
+
+  const priceAction =
+    historicalContext
+      ?.priceAction ||
+    null;
+
+  return {
+    status: 'OK',
+    build: VERSION,
+    engineMode: 'SHADOW',
+    realMoneyEligible: false,
+    input: {
+      requestedSymbol,
+      symbol:
+        canonicalSymbol,
+      horizon,
+      risk
+    },
+    identity: {
+      symbol:
+        canonicalSymbol,
+      companyName:
+        candidate.companyName,
+      sector:
+        candidate.sector,
+      statusCodes:
+        candidate.statusCodes,
+      recommendationEligible:
+        marketRow.recommendationEligible ===
+        true
+    },
+    market: {
+      price:
+        candidate.price,
+      dayChangePct:
+        decisionRound(
+          marketRow.dayChangePct,
+          2
+        ),
+      asOf:
+        candidate.marketAsOf,
+      source:
+        'Official PSX Data Portal screener'
+    },
+    professional: {
+      ...canonical.professional,
+      marketAction:
+        canonical.marketAction,
+      opportunityTier:
+        canonical.opportunityTier,
+      allocationAllowed:
+        canonical.allocationPermission
+          ?.allowed === true
+    },
+    personal: {
+      action:
+        personalAction,
+      reason:
+        personalReason,
+      hasPosition:
+        existingValue > 0,
+      currentPositionValuePkr:
+        decisionRound(
+          existingValue,
+          2
+        ),
+      currentPortfolioWeightPct:
+        decisionRound(
+          existingWeightPct,
+          2
+        ),
+      portfolioValuePkr:
+        decisionRound(
+          portfolioValue,
+          2
+        )
+    },
+    riskSuitability: {
+      state:
+        riskSuitability,
+      issues:
+        suitabilityIssues,
+      profile:
+        risk,
+      thresholds: {
+        minAverageVolume30d:
+          riskPolicy.minAverageVolume30d,
+        maxAnnualizedVolatilityPct:
+          riskPolicy.maxAnnualizedVolatilityPct,
+        minDataQualityScore:
+          riskPolicy.minDataQualityScore,
+        minRiskScore:
+          riskPolicy.minRiskScore
+      }
+    },
+    evidence:
+      canonical.evidence,
+    financial: {
+      analystStatus:
+        candidate.analystCore
+          ?.status ||
+        'UNAVAILABLE',
+      overall:
+        candidate.analystCore
+          ?.overallFinancialView
+          ?.state ||
+        'UNAVAILABLE',
+      earningsQuality:
+        candidate.analystCore
+          ?.views
+          ?.earningsQuality
+          ?.state ||
+        'UNAVAILABLE',
+      cashFlowQuality:
+        candidate.analystCore
+          ?.views
+          ?.cashFlowQuality
+          ?.state ||
+        'UNAVAILABLE',
+      balanceSheet:
+        candidate.analystCore
+          ?.views
+          ?.balanceSheet
+          ?.state ||
+        'UNAVAILABLE',
+      fundamentalScore:
+        candidate.fundamental
+          ?.score ??
+        null
+    },
+    valuation: {
+      state:
+        canonical.professional
+          ?.valuationState ||
+        'UNAVAILABLE',
+      score:
+        candidate.valuation
+          ?.score ??
+        null,
+      peRatio:
+        candidate.valuation
+          ?.peRatio ??
+        null,
+      dividendYield:
+        candidate.valuation
+          ?.dividendYield ??
+        null
+    },
+    risk: {
+      state:
+        canonical.professional
+          ?.riskState ||
+        'UNAVAILABLE',
+      score:
+        candidate.risk
+          ?.score ??
+        null,
+      annualizedVolatility20dPct:
+        volatility,
+      maxDrawdown52wPct:
+        historicalContext
+          ?.technical
+          ?.maxDrawdown52wPct ??
+        null,
+      averageVolume30d:
+        avgVolume
+    },
+    performance: {
+      todayPct:
+        decisionRound(
+          marketRow.dayChangePct,
+          2
+        ),
+      d5Pct:
+        historicalContext
+          ?.returns
+          ?.d5 ??
+        null,
+      m1Pct:
+        historicalContext
+          ?.returns
+          ?.m1 ??
+        null,
+      m3Pct:
+        historicalContext
+          ?.returns
+          ?.m3 ??
+        null,
+      m6Pct:
+        historicalContext
+          ?.returns
+          ?.m6 ??
+        null,
+      y1Pct:
+        historicalContext
+          ?.returns
+          ?.y1 ??
+        null
+    },
+    technical: {
+      trend:
+        historicalContext
+          ?.trend ||
+        'UNAVAILABLE',
+      timingState:
+        canonical.professional
+          ?.timingState ||
+        priceAction?.timingState ||
+        'UNAVAILABLE',
+      timingScore:
+        canonical.professional
+          ?.timingScore ??
+        priceAction?.timingScore ??
+        null,
+      setup:
+        priceAction?.setup ||
+        'NO_CLEAR_SETUP',
+      candlePattern:
+        priceAction
+          ?.candlePattern
+          ?.label ||
+        'NONE',
+      candlePolarity:
+        priceAction
+          ?.candlePattern
+          ?.polarity ||
+        'NEUTRAL',
+      support:
+        priceAction?.support ??
+        null,
+      resistance:
+        priceAction?.resistance ??
+        null,
+      rewardRisk:
+        priceAction?.rewardRisk ??
+        null,
+      atr14:
+        priceAction?.atr14 ??
+        null,
+      atrPct:
+        priceAction?.atrPct ??
+        null,
+      rsi14:
+        historicalContext
+          ?.technical
+          ?.rsi14 ??
+        null,
+      macdHistogram:
+        historicalContext
+          ?.technical
+          ?.macdHistogram ??
+        null,
+      volumeRatio20d:
+        historicalContext
+          ?.technical
+          ?.volumeRatio20d ??
+        null,
+      positives:
+        priceAction?.positives ||
+        [],
+      risks:
+        priceAction?.risks ||
+        []
+    },
+    reasons: {
+      thesis:
+        canonical.reason,
+      positives:
+        candidate.narrative
+          ?.positives ||
+        [],
+      risks:
+        candidate.narrative
+          ?.risks ||
+        []
+    },
+    diagnostics: {
+      overallScore,
+      dataQualityScore:
+        dataQuality.score,
+      legacyAction:
+        candidate.action,
+      fundamentalEvidenceState:
+        candidate.fundamentalEvidenceState
+    },
+    warnings: [
+      'This is shadow decision intelligence, not a trade instruction.',
+      'The single-stock strategy view does not place orders.'
+    ]
+  };
+}
+
 async function runDecisionLab(
   input
 ) {
@@ -27832,6 +28566,25 @@ async function handler(
       request.method ===
         'POST' &&
       action ===
+        'stock-strategy'
+    ) {
+      const body =
+        await readJsonRequestBody(
+          request
+        );
+
+      return sendJSON(
+        response,
+        await runSingleStockStrategy(
+          body
+        )
+      );
+    }
+
+    if (
+      request.method ===
+        'POST' &&
+      action ===
         'decision-lab'
     ) {
       const body =
@@ -30841,6 +31594,175 @@ pre {
   font-weight: 800;
 }
 
+.stockStrategyCard {
+  margin: 0 0 18px;
+}
+
+.stockStrategyControls {
+  display: grid;
+  grid-template-columns: minmax(180px, 1.4fr) minmax(130px, .8fr) minmax(130px, .8fr) auto;
+  gap: 10px;
+  align-items: end;
+  margin-top: 12px;
+}
+
+.stockStrategyControls label {
+  display: block;
+  margin-bottom: 6px;
+}
+
+.stockStrategyControls input,
+.stockStrategyControls select {
+  width: 100%;
+}
+
+.stockStrategyResult {
+  margin-top: 14px;
+  border-top: 1px solid #24364d;
+  padding-top: 14px;
+}
+
+.stockStrategyHeadline {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  align-items: flex-start;
+  margin-bottom: 12px;
+}
+
+.stockStrategyIdentity strong {
+  display: block;
+  font-size: 20px;
+  margin-bottom: 4px;
+}
+
+.stockStrategyIdentity span {
+  color: #91a4be;
+  font-size: 12px;
+}
+
+.stockStrategyBadges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  justify-content: flex-end;
+}
+
+.strategyBadge {
+  border: 1px solid #344865;
+  background: #111d2d;
+  border-radius: 999px;
+  padding: 6px 9px;
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: .04em;
+  white-space: nowrap;
+}
+
+.strategyBadge.good {
+  border-color: #315c4b;
+  background: #10251f;
+}
+
+.strategyBadge.warn {
+  border-color: #69572f;
+  background: #2a2415;
+}
+
+.strategyBadge.bad {
+  border-color: #603944;
+  background: #29161d;
+}
+
+.strategyMetricGrid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.strategyMetric {
+  border: 1px solid #24364d;
+  background: #101a28;
+  border-radius: 10px;
+  padding: 10px;
+  min-width: 0;
+}
+
+.strategyMetric span {
+  display: block;
+  color: #8498b3;
+  font-size: 10px;
+  margin-bottom: 5px;
+}
+
+.strategyMetric strong {
+  display: block;
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+
+.strategySections {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.strategySection {
+  border: 1px solid #24364d;
+  background: #101a28;
+  border-radius: 10px;
+  padding: 12px;
+}
+
+.strategySection h3 {
+  margin: 0 0 8px;
+  font-size: 13px;
+}
+
+.strategyLine {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 5px 0;
+  border-top: 1px solid #1d2a3d;
+  font-size: 11px;
+}
+
+.strategyLine:first-of-type {
+  border-top: 0;
+}
+
+.strategyLine span {
+  color: #8ea1ba;
+}
+
+.strategyReason {
+  color: #bdcada;
+  font-size: 12px;
+  line-height: 1.55;
+  margin: 8px 0 0;
+}
+
+.strategyRiskList {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  color: #9dafc6;
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.opportunityAnalyzeButton {
+  border: 0;
+  background: transparent;
+  color: #72b9e6;
+  padding: 0;
+  margin-left: 6px;
+  font-size: 10px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
 .decisionAudit {
   display: grid;
   grid-template-columns: repeat(6, minmax(0,1fr));
@@ -30883,6 +31805,15 @@ pre {
   .decisionAudit {
     grid-template-columns: repeat(3, minmax(0,1fr));
   }
+
+  .stockStrategyControls {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .strategyMetricGrid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
 }
 
 @media (max-width: 640px) {
@@ -30898,6 +31829,24 @@ pre {
     grid-column: 2;
     justify-self: start;
   }
+
+  .stockStrategyControls,
+  .strategySections {
+    grid-template-columns: 1fr;
+  }
+
+  .strategyMetricGrid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .stockStrategyHeadline {
+    flex-direction: column;
+  }
+
+  .stockStrategyBadges {
+    justify-content: flex-start;
+  }
+
 }
 
 </style>
@@ -31101,6 +32050,23 @@ Checking connection...
 <div class="panelHeader"><div><div class="eyebrow">CAPITAL DECISION</div><h2>What NOMAD would do now</h2></div></div>
 <div id="decisionResult" class="decisionResult">Run an analysis to generate the current ranked opportunity board and a separate whole-share allocation for your amount.</div>
 </div>
+</div>
+
+<div class="terminalCard stockStrategyCard">
+<div class="panelHeader">
+<div>
+<div class="eyebrow">STOCK STRATEGY</div>
+<h2>Analyze one company before you act</h2>
+<p class="muted">Use the same professional brain on a single PSX stock. NOMAD separates the objective market view from what you personally should do based on horizon, risk profile and existing holdings.</p>
+</div>
+</div>
+<div class="stockStrategyControls">
+<div><label>Stock</label><input id="strategySymbol" placeholder="Example: OGDC"></div>
+<div><label>Horizon</label><select id="strategyHorizon"><option value="long_term">Long-term</option><option value="short_term">Short-term</option></select></div>
+<div><label>Risk</label><select id="strategyRisk"><option value="balanced">Balanced</option><option value="conservative">Conservative</option><option value="aggressive">Aggressive</option></select></div>
+<button id="analyzeStockStrategy" class="primaryWide">Analyze stock</button>
+</div>
+<div id="stockStrategyResult" class="stockStrategyResult"><div class="terminalEmpty small">Enter a symbol to see thesis, performance, valuation, risk, technical timing and your personal action.</div></div>
 </div>
 
 <div class="decisionBoardHeader">
@@ -32446,6 +33412,15 @@ function openAppPage(
     normalizedAppPage(
       page
     );
+
+  // Clear page-scoped errors when the user navigates. A failed Research
+  // request must not leave a stale red error banner on Decision Center,
+  // Explore PSX, Portfolio, or any other page.
+  if ($('error')) {
+    $('error')
+      .textContent =
+        '';
+  }
 
   const updateLocation =
     options.updateLocation !==
@@ -42450,7 +43425,11 @@ function renderOpportunityList(
             item.companyName ||
             ''
           ) +
-          '</span></div>' +
+          '</span><button type="button" class="opportunityAnalyzeButton" data-strategy-symbol="' +
+          escapeHtml(
+            item.symbol
+          ) +
+          '">Analyze</button></div>' +
           '<div class="opportunityMeta">PKR ' +
           formatNumber(
             item.price,
@@ -42555,6 +43534,487 @@ function renderOpportunityList(
         );
       }
     ).join('');
+}
+
+function strategyValue(
+  value,
+  suffix = ''
+) {
+  return value === null ||
+    value === undefined ||
+    value === ''
+      ? '—'
+      : escapeHtml(
+          String(value)
+        ) +
+        suffix;
+}
+
+function strategyMetricCard(
+  label,
+  value
+) {
+  return (
+    '<div class="strategyMetric"><span>' +
+    escapeHtml(label) +
+    '</span><strong>' +
+    value +
+    '</strong></div>'
+  );
+}
+
+function renderStockStrategy(
+  result
+) {
+  const target =
+    $('stockStrategyResult');
+
+  if (!target) {
+    return;
+  }
+
+  const professional =
+    result?.professional ||
+    {};
+
+  const personal =
+    result?.personal ||
+    {};
+
+  const technical =
+    result?.technical ||
+    {};
+
+  const performance =
+    result?.performance ||
+    {};
+
+  const financial =
+    result?.financial ||
+    {};
+
+  const valuation =
+    result?.valuation ||
+    {};
+
+  const risk =
+    result?.risk ||
+    {};
+
+  const evidence =
+    result?.evidence ||
+    {};
+
+  const suitability =
+    result?.riskSuitability ||
+    {};
+
+  const actionable =
+    professional.marketAction === 'BUY' ||
+    professional.marketAction === 'ACCUMULATE';
+
+  const actionClass =
+    actionable
+      ? 'good'
+      : professional.marketAction === 'AVOID'
+        ? 'bad'
+        : 'warn';
+
+  const personalClass =
+    String(
+      personal.action ||
+      ''
+    ).includes('AVOID') ||
+    String(
+      personal.action ||
+      ''
+    ).includes('REDUCE')
+      ? 'bad'
+      : String(
+          personal.action ||
+          ''
+        ).includes('ADD') ||
+        personal.action === 'BUY' ||
+        personal.action === 'ACCUMULATE'
+          ? 'good'
+          : 'warn';
+
+  const suitabilityClass =
+    suitability.state === 'SUITABLE'
+      ? 'good'
+      : 'bad';
+
+  const price =
+    result?.market?.price;
+
+  const dayChange =
+    result?.market?.dayChangePct;
+
+  let html =
+    '<div class="stockStrategyHeadline">' +
+    '<div class="stockStrategyIdentity"><strong>' +
+    escapeHtml(
+      result?.identity?.symbol ||
+      ''
+    ) +
+    ' · ' +
+    escapeHtml(
+      result?.identity?.companyName ||
+      ''
+    ) +
+    '</strong><span>' +
+    escapeHtml(
+      result?.identity?.sector ||
+      ''
+    ) +
+    ' · PKR ' +
+    formatNumber(
+      price,
+      2
+    ) +
+    (
+      dayChange !== null &&
+      dayChange !== undefined
+        ? ' · Today ' +
+          formatPercent(
+            dayChange
+          )
+        : ''
+    ) +
+    '</span></div>' +
+    '<div class="stockStrategyBadges">' +
+    '<span class="strategyBadge ' +
+    actionClass +
+    '">Market: ' +
+    escapeHtml(
+      professional.marketAction ||
+      'UNRESOLVED'
+    ) +
+    '</span>' +
+    '<span class="strategyBadge ' +
+    personalClass +
+    '">You: ' +
+    escapeHtml(
+      personal.action ||
+      'UNRESOLVED'
+    ) +
+    '</span>' +
+    '<span class="strategyBadge ' +
+    suitabilityClass +
+    '">' +
+    escapeHtml(
+      suitability.state ||
+      'UNRESOLVED'
+    ) +
+    ' for ' +
+    escapeHtml(
+      result?.input?.risk ||
+      ''
+    ) +
+    '</span>' +
+    '</div></div>';
+
+  html +=
+    '<div class="strategyMetricGrid">' +
+    strategyMetricCard(
+      'Thesis',
+      strategyValue(
+        professional.thesisStatus
+      )
+    ) +
+    strategyMetricCard(
+      'Valuation',
+      strategyValue(
+        valuation.state
+      )
+    ) +
+    strategyMetricCard(
+      'Risk',
+      strategyValue(
+        risk.state
+      )
+    ) +
+    strategyMetricCard(
+      'Timing',
+      strategyValue(
+        technical.timingState
+      )
+    ) +
+    strategyMetricCard(
+      'Evidence',
+      strategyValue(
+        evidence.confidence
+      )
+    ) +
+    strategyMetricCard(
+      'Current holding',
+      personal.hasPosition
+        ? formatNumber(
+            personal.currentPortfolioWeightPct,
+            1
+          ) + '%'
+        : 'None'
+    ) +
+    '</div>';
+
+  html +=
+    '<p class="strategyReason"><strong>NOMAD view:</strong> ' +
+    escapeHtml(
+      professional.reason ||
+      ''
+    ) +
+    '</p>' +
+    '<p class="strategyReason"><strong>Your action:</strong> ' +
+    escapeHtml(
+      personal.reason ||
+      ''
+    ) +
+    '</p>';
+
+  html +=
+    '<div class="strategySections">' +
+    '<div class="strategySection"><h3>Performance & price action</h3>' +
+    '<div class="strategyLine"><span>5 sessions</span><strong>' +
+    formatPercent(
+      performance.d5Pct
+    ) +
+    '</strong></div>' +
+    '<div class="strategyLine"><span>1 month</span><strong>' +
+    formatPercent(
+      performance.m1Pct
+    ) +
+    '</strong></div>' +
+    '<div class="strategyLine"><span>3 months</span><strong>' +
+    formatPercent(
+      performance.m3Pct
+    ) +
+    '</strong></div>' +
+    '<div class="strategyLine"><span>1 year</span><strong>' +
+    formatPercent(
+      performance.y1Pct
+    ) +
+    '</strong></div>' +
+    '<div class="strategyLine"><span>Trend</span><strong>' +
+    strategyValue(
+      technical.trend
+    ) +
+    '</strong></div>' +
+    '<div class="strategyLine"><span>Setup</span><strong>' +
+    strategyValue(
+      technical.setup
+    ) +
+    '</strong></div>' +
+    '<div class="strategyLine"><span>Candle</span><strong>' +
+    strategyValue(
+      technical.candlePattern
+    ) +
+    '</strong></div>' +
+    '<div class="strategyLine"><span>Support</span><strong>' +
+    (
+      technical.support !== null &&
+      technical.support !== undefined
+        ? 'PKR ' +
+          formatNumber(
+            technical.support,
+            2
+          )
+        : '—'
+    ) +
+    '</strong></div>' +
+    '<div class="strategyLine"><span>Resistance</span><strong>' +
+    (
+      technical.resistance !== null &&
+      technical.resistance !== undefined
+        ? 'PKR ' +
+          formatNumber(
+            technical.resistance,
+            2
+          )
+        : '—'
+    ) +
+    '</strong></div>' +
+    '<div class="strategyLine"><span>Reward / risk</span><strong>' +
+    (
+      technical.rewardRisk !== null &&
+      technical.rewardRisk !== undefined
+        ? formatNumber(
+            technical.rewardRisk,
+            2
+          ) + 'x'
+        : '—'
+    ) +
+    '</strong></div>' +
+    '</div>' +
+    '<div class="strategySection"><h3>Professional evidence</h3>' +
+    '<div class="strategyLine"><span>Financial view</span><strong>' +
+    strategyValue(
+      financial.overall
+    ) +
+    '</strong></div>' +
+    '<div class="strategyLine"><span>Earnings quality</span><strong>' +
+    strategyValue(
+      financial.earningsQuality
+    ) +
+    '</strong></div>' +
+    '<div class="strategyLine"><span>Cash flow</span><strong>' +
+    strategyValue(
+      financial.cashFlowQuality
+    ) +
+    '</strong></div>' +
+    '<div class="strategyLine"><span>Balance sheet</span><strong>' +
+    strategyValue(
+      financial.balanceSheet
+    ) +
+    '</strong></div>' +
+    '<div class="strategyLine"><span>P/E</span><strong>' +
+    (
+      valuation.peRatio !== null &&
+      valuation.peRatio !== undefined
+        ? formatNumber(
+            valuation.peRatio,
+            2
+          ) + 'x'
+        : '—'
+    ) +
+    '</strong></div>' +
+    '<div class="strategyLine"><span>Dividend yield</span><strong>' +
+    formatPercent(
+      valuation.dividendYield
+    ) +
+    '</strong></div>' +
+    '<div class="strategyLine"><span>20D volatility</span><strong>' +
+    formatPercent(
+      risk.annualizedVolatility20dPct
+    ) +
+    '</strong></div>' +
+    '<div class="strategyLine"><span>52W max drawdown</span><strong>' +
+    formatPercent(
+      risk.maxDrawdown52wPct
+    ) +
+    '</strong></div>' +
+    '<div class="strategyLine"><span>Summary evidence</span><strong>' +
+    formatNumber(
+      evidence.summaryCoveragePct ||
+      0,
+      0
+    ) + '%</strong></div>' +
+    '<div class="strategyLine"><span>Extended evidence</span><strong>' +
+    formatNumber(
+      evidence.extendedCoveragePct ||
+      0,
+      0
+    ) + '%</strong></div>' +
+    '</div></div>';
+
+  const issues =
+    Array.isArray(
+      suitability.issues
+    )
+      ? suitability.issues
+      : [];
+
+  const risks =
+    Array.from(
+      new Set(
+        [
+          ...issues,
+          ...(result?.reasons?.risks || []),
+          ...(technical.risks || [])
+        ].filter(Boolean)
+      )
+    ).slice(0, 6);
+
+  if (risks.length) {
+    html +=
+      '<div class="strategySection" style="margin-top:10px"><h3>What NOMAD is watching</h3><ul class="strategyRiskList">' +
+      risks.map(
+        item =>
+          '<li>' +
+          escapeHtml(item) +
+          '</li>'
+      ).join('') +
+      '</ul></div>';
+  }
+
+  target.innerHTML =
+    html;
+}
+
+async function loadStockStrategy(
+  symbolOverride
+) {
+  const symbol =
+    String(
+      symbolOverride ||
+      $('strategySymbol')
+        ?.value ||
+      ''
+    )
+      .trim()
+      .toUpperCase();
+
+  if (!symbol) {
+    $('stockStrategyResult')
+      .innerHTML =
+        '<div class="terminalEmpty small">Enter a PSX symbol first.</div>';
+    return;
+  }
+
+  $('strategySymbol')
+    .value =
+      symbol;
+
+  const button =
+    $('analyzeStockStrategy');
+
+  const original =
+    button?.textContent ||
+    'Analyze stock';
+
+  if (button) {
+    button.disabled = true;
+    button.textContent =
+      'Analyzing...';
+  }
+
+  $('stockStrategyResult')
+    .innerHTML =
+      '<div class="terminalEmpty small">NOMAD is analyzing the company, evidence, valuation, risk, portfolio fit and price action...</div>';
+
+  try {
+    const result =
+      await apiPost(
+        'stock-strategy',
+        {
+          symbol,
+          horizon:
+            $('strategyHorizon')
+              .value,
+          risk:
+            $('strategyRisk')
+              .value
+        }
+      );
+
+    renderStockStrategy(
+      result
+    );
+  } catch (error) {
+    $('stockStrategyResult')
+      .innerHTML =
+        '<div class="terminalEmpty small">' +
+        escapeHtml(
+          error.message ||
+          'Stock strategy analysis failed.'
+        ) +
+        '</div>';
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent =
+        original;
+    }
+  }
 }
 
 function renderOpportunityBoard(
@@ -43160,6 +44620,90 @@ function renderShadowDecision(
   renderHomeDecisionSummary(
     summary
   );
+}
+
+if ($('analyzeStockStrategy')) {
+  $('analyzeStockStrategy')
+    .onclick =
+      () =>
+        loadStockStrategy();
+}
+
+if ($('strategySymbol')) {
+  $('strategySymbol')
+    .onkeydown =
+      event => {
+        if (event.key === 'Enter') {
+          loadStockStrategy();
+        }
+      };
+}
+
+if ($('decisionCenterPage')) {
+  $('decisionCenterPage')
+    .addEventListener(
+      'click',
+      event => {
+        const button =
+          event.target
+            ?.closest(
+              '[data-strategy-symbol]'
+            );
+
+        if (!button) {
+          return;
+        }
+
+        const symbol =
+          String(
+            button.dataset
+              .strategySymbol ||
+            ''
+          )
+            .trim()
+            .toUpperCase();
+
+        if (!symbol) {
+          return;
+        }
+
+        $('strategySymbol')
+          .value =
+            symbol;
+
+        loadStockStrategy(
+          symbol
+        );
+
+        $('stockStrategyResult')
+          ?.scrollIntoView({
+            behavior: 'smooth',
+            block: 'start'
+          });
+      }
+    );
+}
+
+if ($('decisionHorizon') && $('strategyHorizon')) {
+  $('decisionHorizon')
+    .addEventListener(
+      'change',
+      () => {
+        $('strategyHorizon').value =
+          $('decisionHorizon').value;
+      }
+    );
+}
+
+if ($('decisionRisk') && $('strategyRisk')) {
+  $('decisionRisk')
+    .addEventListener(
+      'change',
+      () => {
+        $('strategyRisk').value =
+          $('decisionRisk').value;
+      }
+    );
 }
 
 if ($('findBestOption')) {
