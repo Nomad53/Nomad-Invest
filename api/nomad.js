@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.3.2';
+const VERSION = '0.9.3.2.1';
 
 
 const SUPABASE_URL =
@@ -36734,6 +36734,10 @@ function openAppPage(
       );
   }
 
+  if (page === 'decision') {
+    populateDecisionSectors();
+  }
+
   if (page === 'explore') {
     loadExploreMarket(
       false
@@ -41022,7 +41026,7 @@ function populateSectors() {
         .join('');
 }
 
-function populateDecisionSectors() {
+async function populateDecisionSectors() {
   const target =
     $('decisionSector');
 
@@ -41030,21 +41034,76 @@ function populateDecisionSectors() {
     return;
   }
 
-  const sectors =
+  const currentValue =
+    target.value ||
+    target.dataset.pendingValue ||
+    '';
+
+  let sectors =
     [
       ...new Set(
         marketRows
           .map(
             row =>
-              row.sector
+              String(
+                row.sector ||
+                ''
+              ).trim()
           )
           .filter(
             value =>
               value &&
-              value !== 'Unknown'
+              value.toUpperCase() !==
+                'UNKNOWN'
           )
       )
     ].sort();
+
+  // Decision Center can be opened directly before Explore PSX has loaded.
+  // In that case marketRows is still empty, so fetch the canonical universe
+  // instead of leaving the Industry / Sector dropdown with only one option.
+  if (!sectors.length) {
+    try {
+      const universe =
+        await api(
+          'universe-master'
+        );
+
+      sectors =
+        [
+          ...new Set(
+            (
+              universe.entries ||
+              []
+            )
+              .filter(
+                entry =>
+                  entry &&
+                  (
+                    entry.recommendationEligible === true ||
+                    entry.universeClass === 'CORE_EQUITY'
+                  )
+              )
+              .map(
+                entry =>
+                  String(
+                    entry.sector ||
+                    ''
+                  ).trim()
+              )
+              .filter(
+                value =>
+                  value &&
+                  value.toUpperCase() !==
+                    'UNKNOWN'
+              )
+          )
+        ].sort();
+    } catch {
+      // Keep the default option if the universe request itself fails.
+      sectors = [];
+    }
+  }
 
   target.innerHTML =
     '<option value="">All industries</option>' +
@@ -41068,7 +41127,7 @@ function populateDecisionSectors() {
 
     const preferredSector =
       storedContext?.sector ||
-      target.dataset.pendingValue ||
+      currentValue ||
       '';
 
     if (
