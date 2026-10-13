@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.3.0';
+const VERSION = '0.9.3.1';
 
 
 const SUPABASE_URL =
@@ -16655,6 +16655,242 @@ function buildProfessionalTradePlan(
   };
 }
 
+function buildProfessionalConditionalTradePlan(
+  setup,
+  metrics = {},
+  currentPlan = null
+) {
+  const price = safeNumber(metrics.price);
+  const atr = safeNumber(metrics.atr14);
+  const support = safeNumber(metrics.support);
+  const resistance = safeNumber(metrics.resistance);
+  const breakoutLevel = safeNumber(metrics.breakoutLevel);
+
+  if (
+    price === null ||
+    price <= 0 ||
+    atr === null ||
+    atr <= 0
+  ) {
+    return null;
+  }
+
+  if (
+    setup === 'BREAKDOWN' ||
+    setup === 'DOWNTREND' ||
+    setup === 'NO_CLEAR_SETUP'
+  ) {
+    return null;
+  }
+
+  const minimumRR =
+    DECISION_TRADER_MIN_REWARD_RISK;
+
+  const baseStop =
+    safeNumber(currentPlan?.stop) ??
+    (
+      support !== null && support < price
+        ? support - atr * 0.25
+        : price - atr * 1.25
+    );
+
+  if (
+    baseStop === null ||
+    baseStop <= 0 ||
+    baseStop >= price
+  ) {
+    return null;
+  }
+
+  let state = null;
+  let activation = null;
+  let entryLow = null;
+  let entryHigh = null;
+  let stop = baseStop;
+  let target1 = null;
+  let targetSource = null;
+
+  if (
+    setup === 'TREND_PULLBACK' ||
+    setup === 'UPTREND_CONTINUATION' ||
+    setup === 'CONFIRMED_BREAKOUT'
+  ) {
+    if (
+      resistance === null ||
+      resistance <= baseStop
+    ) {
+      return null;
+    }
+
+    // Solve for the highest entry that still produces the minimum required R/R:
+    // (target - entry) / (entry - stop) >= minimumRR.
+    const maxEntryForRR =
+      (
+        resistance +
+        minimumRR * baseStop
+      ) /
+      (1 + minimumRR);
+
+    if (
+      !Number.isFinite(maxEntryForRR) ||
+      maxEntryForRR <= baseStop ||
+      maxEntryForRR >= price
+    ) {
+      return null;
+    }
+
+    // Avoid manufacturing a plan that requires an implausibly deep pullback.
+    if (
+      price - maxEntryForRR >
+        atr * 3.0
+    ) {
+      return null;
+    }
+
+    entryHigh =
+      maxEntryForRR * 0.998;
+    entryLow = Math.max(
+      baseStop + atr * 0.55,
+      entryHigh - atr * 0.40
+    );
+
+    if (entryLow >= entryHigh) {
+      entryLow = Math.max(
+        baseStop + atr * 0.35,
+        entryHigh - atr * 0.20
+      );
+    }
+
+    state =
+      setup === 'CONFIRMED_BREAKOUT'
+        ? 'WAIT_FOR_RETEST'
+        : 'WAIT_FOR_PULLBACK';
+    activation =
+      setup === 'CONFIRMED_BREAKOUT'
+        ? 'Enter only if price retests the defined zone while the breakout structure remains intact.'
+        : 'Enter only if price pulls back into the defined zone without breaking the stop/invalidation level.';
+    target1 = resistance;
+    targetSource = 'STRUCTURAL_RESISTANCE';
+  } else if (
+    setup === 'UNCONFIRMED_BREAKOUT'
+  ) {
+    if (
+      breakoutLevel === null ||
+      breakoutLevel <= 0
+    ) {
+      return null;
+    }
+
+    entryLow =
+      breakoutLevel + atr * 0.10;
+    entryHigh =
+      breakoutLevel + atr * 0.30;
+    stop =
+      breakoutLevel - atr * 0.90;
+
+    const entryReference =
+      (entryLow + entryHigh) / 2;
+    const riskPerShare =
+      entryReference - stop;
+
+    if (
+      riskPerShare <= 0
+    ) {
+      return null;
+    }
+
+    if (
+      resistance !== null &&
+      resistance > entryHigh &&
+      (
+        resistance - entryReference
+      ) /
+      riskPerShare >= minimumRR
+    ) {
+      target1 = resistance;
+      targetSource = 'STRUCTURAL_RESISTANCE';
+    } else {
+      target1 =
+        entryReference +
+        riskPerShare * 2.0;
+      targetSource =
+        'R_MULTIPLE_PROJECTION';
+    }
+
+    state =
+      'WAIT_FOR_BREAKOUT_CONFIRMATION';
+    activation =
+      'Enter only after price clears the breakout trigger with confirmation; do not anticipate the breakout.';
+  }
+
+  if (
+    entryLow === null ||
+    entryHigh === null ||
+    stop === null ||
+    target1 === null ||
+    !(stop < entryLow) ||
+    !(target1 > entryHigh)
+  ) {
+    return null;
+  }
+
+  const entryReference =
+    (entryLow + entryHigh) / 2;
+  const riskPerShare =
+    entryReference - stop;
+  const rewardRisk =
+    riskPerShare > 0
+      ? (target1 - entryReference) /
+        riskPerShare
+      : null;
+
+  if (
+    rewardRisk === null ||
+    rewardRisk < minimumRR
+  ) {
+    return null;
+  }
+
+  return {
+    complete: true,
+    state,
+    activation,
+    entryLow:
+      decisionRound(entryLow, 4),
+    entryHigh:
+      decisionRound(entryHigh, 4),
+    entryReference:
+      decisionRound(entryReference, 4),
+    stop:
+      decisionRound(stop, 4),
+    target1:
+      decisionRound(target1, 4),
+    target2:
+      decisionRound(
+        Math.max(
+          target1 + atr,
+          entryReference +
+            riskPerShare * 2.5
+        ),
+        4
+      ),
+    targetSource,
+    riskPerShare:
+      decisionRound(riskPerShare, 4),
+    riskPct:
+      decisionRound(
+        riskPerShare /
+        entryReference *
+        100,
+        2
+      ),
+    rewardRisk:
+      decisionRound(rewardRisk, 2),
+    reason:
+      "The current price does not justify entry, but this conditional level would restore NOMAD's minimum reward-to-risk without weakening the setup standard."
+  };
+}
+
 function buildProfessionalPriceAction(
   rows,
   metrics = {}
@@ -16929,21 +17165,30 @@ function buildProfessionalPriceAction(
     setup = 'DOWNTREND';
   }
 
+  const tradePlanMetrics = {
+    price,
+    atr14: latestAtr,
+    support: levels.support,
+    resistance: levels.resistance,
+    breakoutLevel:
+      Number.isFinite(prior20High)
+        ? prior20High
+        : null,
+    sma20,
+    sma50
+  };
+
   const tradePlan =
     buildProfessionalTradePlan(
       setup,
-      {
-        price,
-        atr14: latestAtr,
-        support: levels.support,
-        resistance: levels.resistance,
-        breakoutLevel:
-          Number.isFinite(prior20High)
-            ? prior20High
-            : null,
-        sma20,
-        sma50
-      }
+      tradePlanMetrics
+    );
+
+  const conditionalTradePlan =
+    buildProfessionalConditionalTradePlan(
+      setup,
+      tradePlanMetrics,
+      tradePlan
     );
 
   return {
@@ -16986,6 +17231,7 @@ function buildProfessionalPriceAction(
       decisionRound(score, 2),
     timingState,
     tradePlan,
+    conditionalTradePlan,
     positives:
       uniqueTextValues(positives),
     risks:
@@ -19807,7 +20053,7 @@ const DECISION_CENTER_MIN_TARGET_POSITIONS = 3;
 const DECISION_CENTER_MAX_TARGET_POSITIONS = 8;
 
 // 0.9.3.0 Trader Brain Foundation. Long-term 0.9.2.6 logic is intentionally frozen.
-const DECISION_HISTORICAL_CONTEXT_SCHEMA_VERSION = 'HC-0.9.3.0';
+const DECISION_HISTORICAL_CONTEXT_SCHEMA_VERSION = 'HC-0.9.3.1';
 const DECISION_TRADER_MIN_VALID_SESSIONS = 60;
 const DECISION_TRADER_MIN_REWARD_RISK = 1.5;
 const DECISION_TRADER_RISK_BUDGET_PCT = {
@@ -21004,34 +21250,121 @@ function decisionTraderScreeningScore(
   const oneYear =
     safeNumber(row?.change1yPct);
 
+  // Trader pre-screening should surface momentum and breakout candidates rather
+  // than suppressing them merely because today's move was large. The deeper
+  // OHLC engine still decides whether the move is extended or tradable.
   let moveQuality = 55;
   if (dayChange !== null) {
-    const absoluteMove = Math.abs(dayChange);
-    if (absoluteMove <= 5) {
-      moveQuality = 72;
-    } else if (absoluteMove <= 10) {
-      moveQuality = 62;
-    } else if (absoluteMove <= 15) {
-      moveQuality = 48;
+    if (dayChange >= 1 && dayChange <= 8) {
+      moveQuality = 82;
+    } else if (dayChange > 8 && dayChange <= 15) {
+      moveQuality = 74;
+    } else if (dayChange > 15) {
+      moveQuality = 58;
+    } else if (dayChange >= 0) {
+      moveQuality = 64;
+    } else if (dayChange >= -3) {
+      moveQuality = 55;
+    } else if (dayChange >= -8) {
+      moveQuality = 42;
     } else {
-      moveQuality = 30;
+      moveQuality = 28;
     }
   }
 
-  let stability = 55;
+  let trendPrior = 55;
   if (oneYear !== null) {
-    if (oneYear >= -30 && oneYear <= 120) {
-      stability = 68;
-    } else if (oneYear < -50 || oneYear > 250) {
-      stability = 35;
+    if (oneYear >= 0 && oneYear <= 150) {
+      trendPrior = 70;
+    } else if (oneYear > 150) {
+      trendPrior = 58;
+    } else if (oneYear >= -25) {
+      trendPrior = 52;
+    } else if (oneYear < -50) {
+      trendPrior = 30;
     }
   }
 
   return decisionRound(
-    liquidity * 0.50 +
-    size * 0.20 +
-    moveQuality * 0.20 +
-    stability * 0.10,
+    liquidity * 0.40 +
+    size * 0.10 +
+    moveQuality * 0.30 +
+    trendPrior * 0.20,
+    2
+  );
+}
+
+function decisionTraderHistoricalOpportunityScore(
+  historicalContext,
+  screeningScore,
+  riskScore
+) {
+  const priceAction =
+    historicalContext?.priceAction ||
+    {};
+
+  const setup =
+    priceAction.setup ||
+    'NO_CLEAR_SETUP';
+
+  const setupScore =
+    setup === 'CONFIRMED_BREAKOUT'
+      ? 95
+      : setup === 'TREND_PULLBACK'
+        ? 90
+        : setup === 'UPTREND_CONTINUATION'
+          ? 82
+          : setup === 'UNCONFIRMED_BREAKOUT'
+            ? 76
+            : setup === 'NO_CLEAR_SETUP'
+              ? 45
+              : setup === 'DOWNTREND'
+                ? 24
+                : setup === 'BREAKDOWN'
+                  ? 10
+                  : 40;
+
+  const currentRewardRisk =
+    safeNumber(
+      priceAction?.tradePlan?.rewardRisk
+    );
+  const conditionalRewardRisk =
+    safeNumber(
+      priceAction?.conditionalTradePlan
+        ?.rewardRisk
+    );
+
+  let planScore = 42;
+  if (
+    currentRewardRisk !== null &&
+    currentRewardRisk >=
+      DECISION_TRADER_MIN_REWARD_RISK
+  ) {
+    planScore = 95;
+  } else if (
+    conditionalRewardRisk !== null &&
+    conditionalRewardRisk >=
+      DECISION_TRADER_MIN_REWARD_RISK
+  ) {
+    planScore = 82;
+  } else if (
+    priceAction?.tradePlan?.complete
+  ) {
+    planScore = 58;
+  }
+
+  const timingScore =
+    safeNumber(priceAction?.timingScore) ||
+    0;
+
+  return decisionRound(
+    decisionClamp(
+      setupScore * 0.28 +
+      timingScore * 0.27 +
+      planScore * 0.22 +
+      (safeNumber(riskScore) || 0) * 0.13 +
+      (safeNumber(screeningScore) || 0) * 0.10
+    ),
     2
   );
 }
@@ -21748,6 +22081,10 @@ function decisionTraderEvidenceProfile(
     priceAction?.tradePlan ||
     null;
 
+  const conditionalTradePlan =
+    priceAction?.conditionalTradePlan ||
+    null;
+
   let score = 0;
   const missing = [];
 
@@ -21854,7 +22191,8 @@ function decisionTraderEvidenceProfile(
     score,
     technicalCoveragePct: score,
     tradePlanCoveragePct:
-      tradePlan?.complete
+      tradePlan?.complete ||
+      conditionalTradePlan?.complete
         ? 100
         : 0,
     // Generic aliases retained for storage/UI compatibility. In short-term
@@ -21865,13 +22203,15 @@ function decisionTraderEvidenceProfile(
         ? 100
         : 0,
     validationTier:
-      tradePlan?.complete
+      tradePlan?.complete ||
+      conditionalTradePlan?.complete
         ? 'TRADE_PLAN_DEFINED'
         : priceAction?.available
           ? 'TECHNICAL_CONTEXT_ONLY'
           : 'TECHNICAL_DATA_INCOMPLETE',
     setupCompleteness:
-      tradePlan?.complete
+      tradePlan?.complete ||
+      conditionalTradePlan?.complete
         ? 'COMPLETE'
         : 'INCOMPLETE',
     missing,
@@ -21919,6 +22259,10 @@ function professionalShortTermView(
     priceAction?.tradePlan ||
     null;
 
+  const conditionalTradePlan =
+    priceAction?.conditionalTradePlan ||
+    null;
+
   const traderEvidence =
     evidence?.framework ===
       'TRADER_TECHNICAL_EVIDENCE'
@@ -21960,14 +22304,24 @@ function professionalShortTermView(
                   ? 10
                   : 40;
 
+  const conditionalReady =
+    conditionalTradePlan?.complete === true &&
+    safeNumber(
+      conditionalTradePlan?.rewardRisk
+    ) !== null &&
+    safeNumber(
+      conditionalTradePlan?.rewardRisk
+    ) >= DECISION_TRADER_MIN_REWARD_RISK;
+
   const rankingScore =
     decisionRound(
       decisionClamp(
-        timingScore * 0.38 +
+        timingScore * 0.34 +
         setupQuality * 0.22 +
-        riskScore * 0.15 +
+        riskScore * 0.14 +
         liquidityScore * 0.10 +
-        technicalEvidenceScore * 0.15
+        technicalEvidenceScore * 0.12 +
+        (conditionalReady ? 8 : 0)
       ),
       2
     );
@@ -21993,6 +22347,7 @@ function professionalShortTermView(
       technicalEvidence:
         traderEvidence,
       tradePlan,
+      conditionalTradePlan,
       marketAction: 'RESEARCHING',
       opportunityTier: 'EVIDENCE_RESEARCH',
       reason:
@@ -22022,6 +22377,7 @@ function professionalShortTermView(
       technicalEvidence:
         traderEvidence,
       tradePlan,
+      conditionalTradePlan,
       marketAction: 'AVOID',
       opportunityTier: 'LOW_PRIORITY',
       reason:
@@ -22068,10 +22424,37 @@ function professionalShortTermView(
       technicalEvidence:
         traderEvidence,
       tradePlan,
+      conditionalTradePlan,
       marketAction: 'BUY',
       opportunityTier: 'PRIORITY_1',
       reason:
         'A defined short-term setup passes trend/price-action, risk, technical-evidence and reward-to-risk gates. Entry, invalidation and target are explicitly defined.'
+    };
+  }
+
+  if (conditionalReady) {
+    return {
+      framework: 'SHORT_TERM_TRADER',
+      thesisStatus: 'CONDITIONAL_SETUP',
+      timingScore,
+      timingState:
+        priceAction.timingState,
+      setup,
+      rewardRisk,
+      riskScore,
+      riskState:
+        professionalRiskState(
+          riskScore
+        ),
+      rankingScore,
+      technicalEvidence:
+        traderEvidence,
+      tradePlan,
+      conditionalTradePlan,
+      marketAction: 'WATCH',
+      opportunityTier: 'PRIORITY_2',
+      reason:
+        'No trade is justified at the current reference price, but NOMAD has a defined conditional entry with stop, target and reward-to-risk at or above the minimum threshold.'
     };
   }
 
@@ -22119,6 +22502,7 @@ function professionalShortTermView(
     technicalEvidence:
       traderEvidence,
     tradePlan,
+    conditionalTradePlan,
     marketAction: 'WATCH',
     opportunityTier: 'PRIORITY_2',
     reason
@@ -22677,7 +23061,14 @@ function decisionProfileSuitability(
         ?.annualizedVolatility20dPct
     );
 
+  const shortTermMode =
+    String(
+      candidate?.horizon ||
+      'long_term'
+    ) === 'short_term';
+
   if (
+    !shortTermMode &&
     volatility !== null &&
     volatility >
       riskPolicy.maxAnnualizedVolatilityPct
@@ -22687,11 +23078,62 @@ function decisionProfileSuitability(
     );
   }
 
-  const shortTermMode =
-    String(
-      candidate?.horizon ||
-      'long_term'
-    ) === 'short_term';
+  const traderPriceAction =
+    shortTermMode
+      ? candidate?.historicalContext
+          ?.priceAction ||
+        null
+      : null;
+
+  const currentTraderPlan =
+    traderPriceAction?.tradePlan ||
+    null;
+  const conditionalTraderPlan =
+    traderPriceAction?.conditionalTradePlan ||
+    null;
+
+  const currentTraderPlanActionable =
+    currentTraderPlan?.complete === true &&
+    safeNumber(
+      currentTraderPlan?.rewardRisk
+    ) !== null &&
+    safeNumber(
+      currentTraderPlan?.rewardRisk
+    ) >= DECISION_TRADER_MIN_REWARD_RISK;
+
+  const traderPlanForRisk =
+    currentTraderPlanActionable
+      ? currentTraderPlan
+      : conditionalTraderPlan?.complete === true
+        ? conditionalTraderPlan
+        : currentTraderPlan?.complete === true
+          ? currentTraderPlan
+          : null;
+
+  const traderStopRiskPct =
+    safeNumber(
+      traderPlanForRisk?.riskPct
+    );
+
+  const maxTraderStopRiskPct =
+    riskPolicy?.id ===
+      'RISK-CONSERVATIVE-0.1'
+      ? 7.5
+      : riskPolicy?.id ===
+          'RISK-AGGRESSIVE-0.1'
+        ? 14
+        : 10;
+
+  if (
+    shortTermMode &&
+    traderStopRiskPct !== null &&
+    traderStopRiskPct >
+      maxTraderStopRiskPct
+  ) {
+    issues.push(
+      'The defined stop distance is too wide for the selected short-term risk profile.'
+    );
+  }
 
   const applicableDataQualityScore =
     shortTermMode
@@ -22739,6 +23181,11 @@ function decisionProfileSuitability(
         riskPolicy.minAverageVolume30d,
       maxAnnualizedVolatilityPct:
         riskPolicy.maxAnnualizedVolatilityPct,
+      ...(shortTermMode
+        ? {
+            maxTraderStopRiskPct
+          }
+        : {}),
       minDataQualityScore:
         riskPolicy.minDataQualityScore,
       minRiskScore:
@@ -22749,6 +23196,11 @@ function decisionProfileSuitability(
         avgVolume,
       annualizedVolatility20dPct:
         volatility,
+      ...(shortTermMode
+        ? {
+            traderStopRiskPct
+          }
+        : {}),
       dataQualityScore:
         applicableDataQualityScore,
       riskScore:
@@ -26133,6 +26585,38 @@ async function runSingleStockStrategy(
         priceAction?.tradePlan
           ?.invalidation ||
         null,
+      conditionalPlanState:
+        priceAction?.conditionalTradePlan
+          ?.state ||
+        null,
+      conditionalActivation:
+        priceAction?.conditionalTradePlan
+          ?.activation ||
+        null,
+      conditionalEntryLow:
+        priceAction?.conditionalTradePlan
+          ?.entryLow ??
+        null,
+      conditionalEntryHigh:
+        priceAction?.conditionalTradePlan
+          ?.entryHigh ??
+        null,
+      conditionalStop:
+        priceAction?.conditionalTradePlan
+          ?.stop ??
+        null,
+      conditionalTarget1:
+        priceAction?.conditionalTradePlan
+          ?.target1 ??
+        null,
+      conditionalTarget2:
+        priceAction?.conditionalTradePlan
+          ?.target2 ??
+        null,
+      conditionalRewardRisk:
+        priceAction?.conditionalTradePlan
+          ?.rewardRisk ??
+        null,
       structureBias:
         priceAction?.structure
           ?.bias ||
@@ -26401,7 +26885,12 @@ async function runDecisionLab(
       count + 1
     );
 
-    if (shortList.length >= DECISION_CENTER_SHORTLIST_LIMIT) {
+    const shortlistLimit =
+      horizon === 'short_term'
+        ? 64
+        : DECISION_CENTER_SHORTLIST_LIMIT;
+
+    if (shortList.length >= shortlistLimit) {
       break;
     }
   }
@@ -26541,17 +27030,10 @@ async function runDecisionLab(
           deepProxyScore:
             decisionRound(
               horizon === 'short_term'
-                ? (
-                    item.screeningScore * 0.20 +
-                    (
-                      safeNumber(
-                        historicalContext
-                          ?.priceAction
-                          ?.timingScore
-                      ) ||
-                      entry.score
-                    ) * 0.50 +
-                    riskScore.score * 0.30
+                ? decisionTraderHistoricalOpportunityScore(
+                    historicalContext,
+                    item.screeningScore,
+                    riskScore.score
                   )
                 : (
                     item.screeningScore * 0.30 +
@@ -26947,6 +27429,16 @@ async function runDecisionLab(
   const researchRequiredCount =
     evidenceResearchCount;
 
+  const conditionalSetupCount =
+    horizon === 'short_term'
+      ? opportunityBoard.priority2.filter(
+          item =>
+            item?.professional
+              ?.thesisStatus ===
+              'CONDITIONAL_SETUP'
+        ).length
+      : 0;
+
   const decisionBlocked =
     candidates.length === 0 &&
     (
@@ -27001,11 +27493,19 @@ async function runDecisionLab(
     action = 'WATCH';
     headline =
       horizon === 'short_term'
-        ? 'No active short-term setup passes the full trade gate; the best current setups remain on watch.'
+        ? (
+            conditionalSetupCount > 0
+              ? 'No trade is active at the current reference price; conditional setups are defined for the next valid trigger.'
+              : 'No active short-term setup passes the full trade gate; the best current setups remain on watch.'
+          )
         : 'No Priority 1 idea passes the full standard; the best current ideas remain Priority 2.';
     reason =
       horizon === 'short_term'
-        ? 'These stocks have technical context worth monitoring, but setup confirmation, timing, reward-to-risk or trade-plan completeness is not yet strong enough for entry.'
+        ? (
+            conditionalSetupCount > 0
+              ? 'NOMAD will not lower the reward-to-risk threshold to manufacture a BUY. It has instead calculated pullback/retest or breakout-confirmation levels where selected setups become tradable with explicit stops and targets.'
+              : 'These stocks have technical context worth monitoring, but setup confirmation, timing, reward-to-risk or trade-plan completeness is not yet strong enough for entry.'
+          )
         : 'These companies remain worth monitoring, but one or more thesis, evidence, valuation or entry conditions do not pass the current shadow allocation gate.';
   } else if (
     researchRequiredCount > 0
@@ -27230,6 +27730,8 @@ async function runDecisionLab(
         comparableCount,
       actionableProfileFit:
         actionableSuitableCount,
+      conditionalSetups:
+        conditionalSetupCount,
       actionableResearchTarget:
         researchActionableTarget,
       evidenceResearch:
@@ -28681,6 +29183,86 @@ function runDecisionEngineSelfTests() {
     shortTermMissingPlan.marketAction,
     'BUY',
     'short-term mode must never BUY when entry/stop/target reward-to-risk is unresolved'
+  );
+
+  const conditionalTraderPlan =
+    buildProfessionalConditionalTradePlan(
+      'TREND_PULLBACK',
+      {
+        price: 110,
+        atr14: 2,
+        support: 98,
+        resistance: 116,
+        breakoutLevel: 112,
+        sma20: 104,
+        sma50: 100
+      },
+      {
+        complete: true,
+        stop: 97.5,
+        rewardRisk: 0.6
+      }
+    );
+
+  assert.ok(
+    conditionalTraderPlan?.complete === true &&
+    conditionalTraderPlan.rewardRisk >=
+      DECISION_TRADER_MIN_REWARD_RISK &&
+    conditionalTraderPlan.entryHigh < 110,
+    'Trader brain must be able to convert a poor current R/R into a conditional pullback entry without lowering the minimum R/R gate'
+  );
+
+  const shortTermHighVolCandidate = {
+    ...shortTermAllocationCandidate,
+    historicalContext: {
+      ...shortTermAllocationCandidate.historicalContext,
+      technical: {
+        ...shortTermAllocationCandidate.historicalContext.technical,
+        annualizedVolatility20dPct: 90
+      },
+      priceAction: {
+        ...shortTermAllocationCandidate.historicalContext.priceAction,
+        tradePlan: {
+          ...shortTermAllocationCandidate.historicalContext.priceAction.tradePlan,
+          riskPct: 5
+        }
+      }
+    }
+  };
+
+  const shortTermHighVolSuitability =
+    decisionProfileSuitability(
+      shortTermHighVolCandidate,
+      riskBalanced
+    );
+
+  assert.equal(
+    shortTermHighVolSuitability.issues.some(
+      issue =>
+        String(issue).includes('annualized volatility')
+    ),
+    false,
+    'Short-term profile suitability must not reject volatility by itself when stop-defined risk can be position-sized'
+  );
+
+  const longTermHighVolSuitability =
+    decisionProfileSuitability(
+      {
+        ...longTermProfessionalCandidate,
+        historicalContext: {
+          ...longTermProfessionalCandidate.historicalContext,
+          technical: {
+            annualizedVolatility20dPct: 90
+          }
+        }
+      },
+      riskBalanced
+    );
+
+  assert.equal(
+    longTermHighVolSuitability.state,
+    'NOT_SUITABLE',
+    'Long-term volatility profile gate must remain unchanged while the Trader brain uses stop-defined risk'
   );
 
   console.log(
@@ -43543,7 +44125,7 @@ async function loadExploreMarket(
                 marketClosedLabel(
                   marketStatus
                 ) +
-                ' · Latest session updated ' +
+                ' · Feed refreshed ' +
                 updatedLabel
               )
             : (
@@ -45590,6 +46172,27 @@ function renderOpportunityList(
                 )
               : ''
           ) +
+          (
+            professional.framework === 'SHORT_TERM_TRADER' &&
+            professional.conditionalTradePlan
+              ?.complete
+              ? ' · Conditional entry PKR ' +
+                formatNumber(
+                  professional.conditionalTradePlan.entryLow,
+                  2
+                ) +
+                '–' +
+                formatNumber(
+                  professional.conditionalTradePlan.entryHigh,
+                  2
+                ) +
+                ' · R/R ' +
+                formatNumber(
+                  professional.conditionalTradePlan.rewardRisk,
+                  2
+                ) + 'x'
+              : ''
+          ) +
           '</div>' +
           '<div class="opportunityReason">' +
           escapeHtml(
@@ -46002,6 +46605,44 @@ function renderStockStrategy(
           : '—'
       ) +
       '</strong></div>' +
+      (
+        technical.conditionalPlanState
+          ? '<div class="strategyLine"><span>Conditional plan</span><strong>' +
+            strategyValue(
+              technical.conditionalPlanState
+            ) +
+            '</strong></div>' +
+            '<div class="strategyLine"><span>Conditional entry</span><strong>PKR ' +
+            formatNumber(
+              technical.conditionalEntryLow,
+              2
+            ) +
+            ' – ' +
+            formatNumber(
+              technical.conditionalEntryHigh,
+              2
+            ) +
+            '</strong></div>' +
+            '<div class="strategyLine"><span>Conditional stop</span><strong>PKR ' +
+            formatNumber(
+              technical.conditionalStop,
+              2
+            ) +
+            '</strong></div>' +
+            '<div class="strategyLine"><span>Conditional target</span><strong>PKR ' +
+            formatNumber(
+              technical.conditionalTarget1,
+              2
+            ) +
+            '</strong></div>' +
+            '<div class="strategyLine"><span>Conditional R/R</span><strong>' +
+            formatNumber(
+              technical.conditionalRewardRisk,
+              2
+            ) +
+            'x</strong></div>'
+          : ''
+      ) +
       '</div>' +
       '<div class="strategySection"><h3>Trader evidence & risk</h3>' +
       '<div class="strategyLine"><span>Technical evidence</span><strong>' +
@@ -46096,6 +46737,13 @@ function renderStockStrategy(
       html +=
         '<p class="strategyReason"><strong>Invalidation:</strong> ' +
         escapeHtml(technical.invalidation) +
+        '</p>';
+    }
+
+    if (technical.conditionalActivation) {
+      html +=
+        '<p class="strategyReason"><strong>Conditional trigger:</strong> ' +
+        escapeHtml(technical.conditionalActivation) +
         '</p>';
     }
   } else {
@@ -46432,6 +47080,10 @@ function renderDecisionAudit(
     [
       'Actionable fit',
       screening.actionableProfileFit
+    ],
+    [
+      'Conditional setups',
+      screening.conditionalSetups
     ],
     [
       'Research target',
