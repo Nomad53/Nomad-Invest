@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.2.2';
+const VERSION = '0.9.2.4';
 
 
 const SUPABASE_URL =
@@ -19534,12 +19534,15 @@ const DECISION_FUNDAMENTAL_CACHE_FRESH_MS =
 const DECISION_FUNDAMENTAL_CACHE_FALLBACK_MS =
   14 * 24 * 60 * 60 * 1000;
 
-const DECISION_CENTER_SHORTLIST_LIMIT = 30;
+const DECISION_CENTER_SHORTLIST_LIMIT = 48;
 const DECISION_CENTER_COMPARABLE_TARGET = 18;
-const DECISION_CENTER_DEEP_ATTEMPT_LIMIT = 24;
+const DECISION_CENTER_DEEP_ATTEMPT_LIMIT = 42;
 const DECISION_CENTER_DEEP_BATCH_SIZE = 6;
+const DECISION_CENTER_MAX_SHORTLIST_PER_SECTOR = 4;
 const DECISION_CENTER_MIN_ANALYST_COVERAGE = 65;
 const DECISION_CENTER_MAX_DEPLOYMENT_PCT = 0.90;
+const DECISION_CENTER_MIN_TARGET_POSITIONS = 3;
+const DECISION_CENTER_MAX_TARGET_POSITIONS = 8;
 
 function decisionClamp(
   value,
@@ -22119,25 +22122,32 @@ function decisionCenterTargetPositionCount(
       0
     );
 
-  // Continuous scaling rather than a fixed "3 stocks" rule.
-  // Small accounts can remain concentrated because whole-share feasibility
-  // dominates. Larger portfolios require broader diversification, but NOMAD
-  // never fills slots with Research Required or Avoid names just to hit a count.
-  const capitalFactor =
-    Math.max(
-      1,
-      capital /
-      10000
-    );
+  // Locked professional portfolio-construction policy:
+  // 3 is the minimum diversification TARGET, never a forced allocation.
+  // The preferred count grows with capital, while the hard design ceiling is 8.
+  // If fewer than 3 stocks pass the analyst/evidence/profile/portfolio gates,
+  // NOMAD keeps the remainder in cash and reports a diversification exception.
+  let target = 3;
 
-  let target =
-    Math.ceil(
-      3 +
-      Math.log10(
-        capitalFactor
-      ) *
-      2.5
-    );
+  if (capital >= 25000) {
+    target = 4;
+  }
+
+  if (capital >= 100000) {
+    target = 5;
+  }
+
+  if (capital >= 300000) {
+    target = 6;
+  }
+
+  if (capital >= 750000) {
+    target = 7;
+  }
+
+  if (capital >= 2000000) {
+    target = 8;
+  }
 
   if (
     riskPolicy?.id ===
@@ -22154,9 +22164,9 @@ function decisionCenterTargetPositionCount(
   }
 
   return Math.max(
-    2,
+    DECISION_CENTER_MIN_TARGET_POSITIONS,
     Math.min(
-      10,
+      DECISION_CENTER_MAX_TARGET_POSITIONS,
       target
     )
   );
@@ -22168,11 +22178,11 @@ function decisionCenterDynamicCaps(
 ) {
   const count =
     Math.max(
-      2,
+      DECISION_CENTER_MIN_TARGET_POSITIONS,
       Number(
         targetPositions
       ) ||
-      2
+      DECISION_CENTER_MIN_TARGET_POSITIONS
     );
 
   let stockMultiplier = 1.35;
@@ -22423,12 +22433,24 @@ function decisionCenterAllocationCandidatePool(
         }
       );
 
+  // Keep a small ranked reserve beyond the preferred funded count so the
+  // allocator can backfill when a higher-ranked name cannot fit because of
+  // whole-share, stock-cap, sector-cap, or existing-portfolio constraints.
+  const reserveLimit =
+    Math.min(
+      eligible.length,
+      Math.max(
+        DECISION_CENTER_MIN_TARGET_POSITIONS,
+        Math.min(
+          12,
+          Number(targetPositions || 0) + 4
+        )
+      )
+    );
+
   return eligible.slice(
     0,
-    Math.max(
-      1,
-      targetPositions
-    )
+    reserveLimit
   );
 }
 
@@ -22524,6 +22546,16 @@ function allocateDecisionCenterOpportunities(
           2
         ),
       targetPositionCount,
+      minimumTargetPositions:
+        DECISION_CENTER_MIN_TARGET_POSITIONS,
+      maximumTargetPositions:
+        DECISION_CENTER_MAX_TARGET_POSITIONS,
+      achievedPositionCount: 0,
+      diversificationException: {
+        triggered: true,
+        reason:
+          'No profile-suitable actionable stock currently passes the full allocation gate, so NOMAD retains the capital in cash rather than forcing positions.'
+      },
       eligibleAllocationCandidates: 0,
       priorityOneAllocationCandidates: 0,
       priorityTwoAllocationCandidates: 0,
@@ -22574,6 +22606,13 @@ function allocateDecisionCenterOpportunities(
     const candidate
     of candidates
   ) {
+    if (
+      allocations.length >=
+        targetPositionCount
+    ) {
+      break;
+    }
+
     const pricePaisa =
       Math.round(
         Number(
@@ -23083,6 +23122,32 @@ function allocateDecisionCenterOpportunities(
       )
     );
 
+  const achievedPositionCount =
+    allocations.length;
+
+  const diversificationExceptionTriggered =
+    achievedPositionCount <
+      DECISION_CENTER_MIN_TARGET_POSITIONS;
+
+  let diversificationExceptionReason = null;
+
+  if (diversificationExceptionTriggered) {
+    if (
+      candidates.length <
+        DECISION_CENTER_MIN_TARGET_POSITIONS
+    ) {
+      diversificationExceptionReason =
+        'Only ' +
+        candidates.length +
+        ' profile-suitable actionable stock' +
+        (candidates.length === 1 ? '' : 's') +
+        ' passed the professional allocation gate after deeper research. NOMAD will not force a weaker third position; the remainder stays in cash.';
+    } else {
+      diversificationExceptionReason =
+        'At least three actionable stocks passed research, but whole-share affordability, existing holdings, stock caps, or sector caps prevented three prudent funded positions. NOMAD retains the remainder in cash rather than forcing exposure.';
+    }
+  }
+
   const unfundedPriorityOne =
     candidates
       .filter(
@@ -23146,6 +23211,17 @@ function allocateDecisionCenterOpportunities(
         2
       ),
     targetPositionCount,
+    minimumTargetPositions:
+      DECISION_CENTER_MIN_TARGET_POSITIONS,
+    maximumTargetPositions:
+      DECISION_CENTER_MAX_TARGET_POSITIONS,
+    achievedPositionCount,
+    diversificationException: {
+      triggered:
+        diversificationExceptionTriggered,
+      reason:
+        diversificationExceptionReason
+    },
     eligibleAllocationCandidates:
       candidates.length,
     priorityOneAllocationCandidates:
@@ -24575,6 +24651,18 @@ async function runSingleStockStrategy(
       ?.priceAction ||
     null;
 
+  const volatility =
+    safeNumber(
+      historicalContext
+        ?.technical
+        ?.annualizedVolatility20dPct
+    );
+
+  const avgVolume =
+    safeNumber(
+      candidate.averageVolume30d
+    );
+
   return {
     status: 'OK',
     build: VERSION,
@@ -24918,6 +25006,32 @@ async function runDecisionLab(
         : Promise.resolve([])
     ]);
 
+  const portfolioContext =
+    await buildDecisionPortfolioContext(
+      market
+    );
+
+  const researchCapitalBasePkr =
+    amount +
+    (
+      safeNumber(
+        portfolioContext?.currentValuePkr
+      ) ||
+      0
+    );
+
+  // Locked professional-PM behavior: the entered capital never changes the
+  // ranking, but it does determine how many suitable actionable ideas NOMAD
+  // should try to validate before accepting a large cash remainder.
+  const researchActionableTarget =
+    Math.min(
+      8,
+      decisionCenterTargetPositionCount(
+        researchCapitalBasePkr,
+        riskPolicy
+      )
+    );
+
   const eligibleRows =
     market.stocks
       .filter(
@@ -25003,7 +25117,10 @@ async function runDecisionLab(
       ) ||
       0;
 
-    if (count >= 3) {
+    if (
+      count >=
+        DECISION_CENTER_MAX_SHORTLIST_PER_SECTOR
+    ) {
       continue;
     }
 
@@ -25193,14 +25310,19 @@ async function runDecisionLab(
   const deepResults = [];
   const deepAttemptedItems = [];
   let comparableCount = 0;
+  let actionableSuitableCount = 0;
   let deepCursor = 0;
 
   while (
     deepCursor < historyReady.length &&
     deepAttemptedItems.length <
       DECISION_CENTER_DEEP_ATTEMPT_LIMIT &&
-    comparableCount <
-      DECISION_CENTER_COMPARABLE_TARGET
+    (
+      comparableCount <
+        DECISION_CENTER_COMPARABLE_TARGET ||
+      actionableSuitableCount <
+        researchActionableTarget
+    )
   ) {
     const remainingAttempts =
       DECISION_CENTER_DEEP_ATTEMPT_LIMIT -
@@ -25385,6 +25507,27 @@ async function runDecisionLab(
             ?.opportunityTier !==
             'EVIDENCE_RESEARCH'
       ).length;
+
+    actionableSuitableCount =
+      deepResults.filter(
+        candidate =>
+          candidate &&
+          !candidate.error &&
+          candidate.symbol &&
+          candidate.canonicalState
+            ?.allocationPermission
+            ?.allowed === true &&
+          candidate.profileSuitability
+            ?.state === 'SUITABLE' &&
+          safeNumber(candidate.price) !== null &&
+          safeNumber(candidate.price) <= amount &&
+          (
+            candidate.canonicalState
+              ?.marketAction === 'BUY' ||
+            candidate.canonicalState
+              ?.marketAction === 'ACCUMULATE'
+          )
+      ).length;
   }
 
   const deepShortList =
@@ -25410,11 +25553,6 @@ async function runDecisionLab(
   const opportunityBoard =
     buildDecisionOpportunityBoard(
       candidates
-    );
-
-  const portfolioContext =
-    await buildDecisionPortfolioContext(
-      market
     );
 
   const allocation =
@@ -25511,6 +25649,15 @@ async function runDecisionLab(
       'Interesting candidates exist and NOMAD is automatically researching the missing evidence.';
     reason =
       'Missing evidence is a research trigger, not a final verdict. NOMAD keeps these names visible, backfills additional candidates, and blocks allocation until the evidence state becomes actionable.';
+  }
+
+  if (
+    allocation.diversificationException
+      ?.triggered === true
+  ) {
+    reason +=
+      ' Diversification exception: ' +
+      allocation.diversificationException.reason;
   }
 
   const evidencePool =
@@ -25681,6 +25828,10 @@ async function runDecisionLab(
         deepAttemptedItems.length,
       comparableAnalyzed:
         comparableCount,
+      actionableProfileFit:
+        actionableSuitableCount,
+      actionableResearchTarget:
+        researchActionableTarget,
       evidenceResearch:
         evidenceResearchCount,
       deepAttemptLimit:
@@ -25734,6 +25885,18 @@ async function runDecisionLab(
       targetPositionCount:
         allocation.targetPositionCount ||
         0,
+      minimumTargetPositions:
+        allocation.minimumTargetPositions ||
+        DECISION_CENTER_MIN_TARGET_POSITIONS,
+      maximumTargetPositions:
+        allocation.maximumTargetPositions ||
+        DECISION_CENTER_MAX_TARGET_POSITIONS,
+      achievedPositionCount:
+        allocation.achievedPositionCount ||
+        0,
+      diversificationException:
+        allocation.diversificationException ||
+        { triggered: false, reason: null },
       eligibleAllocationCandidates:
         allocation.eligibleAllocationCandidates ||
         0,
@@ -25780,7 +25943,7 @@ async function runDecisionLab(
       'Allocations are planning principals only. Brokerage, levies, taxes and execution slippage are not yet included.',
       'No order-execution capability exists. The user remains the final decision maker.',
       'Current scoring rules remain supporting evidence only; Priority 1 now also requires the Financial Analyst evidence gate.',
-      'Opportunity ranking is independent of the entered budget. The allocator receives only canonical BUY/ACCUMULATE states with allocation permission; WATCH, active Evidence Research and Avoid are hard-blocked from receiving capital.',
+      'Opportunity ranking is independent of the entered budget. Portfolio construction targets at least three funded stocks and scales up to eight, but never forces a weak, unresolved, profile-unsuitable, unaffordable, or portfolio-incompatible name merely to hit the count.',
       ...(
         candidates.some(
           candidate =>
@@ -26402,6 +26565,169 @@ function runDecisionEngineSelfTests() {
     'Decision Center allocation must use positive whole shares'
   );
 
+  const profileFitBase = {
+    ...validatedDecisionCandidate,
+    symbol: 'PROFILEOK',
+    sector: 'Synthetic Sector A',
+    recommendationEligible: true,
+    averageVolume30d: 500000,
+    dataQuality: { score: 90 },
+    risk: { score: 72, liquidityScore: 80 },
+    historicalContext: {
+      available: true,
+      technical: {
+        annualizedVolatility20dPct: 40
+      },
+      priceAction: {
+        available: true,
+        timingScore: 74,
+        timingState: 'GOOD',
+        setup: 'TREND_PULLBACK',
+        rewardRisk: 2
+      }
+    }
+  };
+
+  const profileFailVolatility = {
+    ...profileFitBase,
+    symbol: 'PROFILEFAIL',
+    sector: 'Synthetic Sector B',
+    historicalContext: {
+      ...profileFitBase.historicalContext,
+      technical: {
+        annualizedVolatility20dPct: 85
+      }
+    }
+  };
+
+  assert.equal(
+    decisionProfileSuitability(
+      profileFitBase,
+      riskBalanced
+    ).state,
+    'SUITABLE',
+    'balanced profile must accept a candidate inside its hard volatility limit'
+  );
+
+  assert.equal(
+    decisionProfileSuitability(
+      profileFailVolatility,
+      riskBalanced
+    ).state,
+    'NOT_SUITABLE',
+    'balanced profile must reject a candidate above its hard volatility limit'
+  );
+
+  const profileGateBoard =
+    buildDecisionOpportunityBoard([
+      profileFitBase,
+      profileFailVolatility
+    ]);
+
+  const profileGateAllocation =
+    allocateDecisionCenterOpportunities(
+      profileGateBoard,
+      500000,
+      riskBalanced
+    );
+
+  assert.equal(
+    profileGateAllocation.allocations.some(
+      item =>
+        item.symbol === 'PROFILEFAIL'
+    ),
+    false,
+    'profile-unsuitable candidates must receive PKR 0 even when the market thesis is actionable'
+  );
+
+  const breadthCandidates =
+    Array.from(
+      { length: 8 },
+      (_, index) => ({
+        ...profileFitBase,
+        symbol: 'BREADTH' +
+          String(index + 1),
+        companyName:
+          'Breadth Candidate ' +
+          String(index + 1),
+        sector:
+          'Synthetic Sector ' +
+          String(index + 1),
+        price:
+          50 +
+          index * 5,
+        overallScore:
+          84 -
+          index * 0.5
+      })
+    );
+
+  const breadthBoard =
+    buildDecisionOpportunityBoard(
+      breadthCandidates
+    );
+
+  const breadthAllocation =
+    allocateDecisionCenterOpportunities(
+      breadthBoard,
+      500000,
+      riskBalanced
+    );
+
+  assert.equal(
+    decisionCenterTargetPositionCount(
+      500000,
+      riskBalanced
+    ),
+    6,
+    'a PKR 500k balanced portfolio should target six positions under the locked 3-to-8 construction policy'
+  );
+
+  assert.ok(
+    breadthAllocation.allocations.length >= 6,
+    'when enough suitable actionable ideas exist, a PKR 500k balanced plan should reach its six-position target'
+  );
+
+  assert.ok(
+    breadthAllocation.allocations.length <= 6,
+    'a PKR 500k balanced plan must not exceed its preferred six-position target'
+  );
+
+  assert.ok(
+    breadthAllocation.investedPct >= 75,
+    'when enough suitable actionable ideas exist, the allocator should deploy most of a PKR 500k balanced budget within its risk caps'
+  );
+
+  assert.equal(
+    breadthAllocation.diversificationException.triggered,
+    false,
+    'the diversification exception must stay off when at least three prudent positions can be funded'
+  );
+
+  const twoIdeaBoard =
+    buildDecisionOpportunityBoard(
+      breadthCandidates.slice(0, 2)
+    );
+
+  const twoIdeaAllocation =
+    allocateDecisionCenterOpportunities(
+      twoIdeaBoard,
+      500000,
+      riskBalanced
+    );
+
+  assert.equal(
+    twoIdeaAllocation.allocations.length,
+    2,
+    'NOMAD must not invent or force a third stock when only two stocks pass the professional gates'
+  );
+
+  assert.equal(
+    twoIdeaAllocation.diversificationException.triggered,
+    true,
+    'fewer than three prudent funded positions must produce an explicit diversification exception'
+  );
+
   const watchCandidate = {
     ...validatedDecisionCandidate,
     symbol: 'WATCHONLY',
@@ -26541,10 +26867,22 @@ function runDecisionEngineSelfTests() {
       riskBalanced
     );
 
+  assert.equal(
+    dynamicSmall,
+    3,
+    'the locked portfolio-construction policy must never target fewer than three stocks'
+  );
+
   assert.ok(
     dynamicLarge >
       dynamicSmall,
     'larger portfolios must target broader diversification than very small portfolios'
+  );
+
+  assert.ok(
+    dynamicLarge <=
+      DECISION_CENTER_MAX_TARGET_POSITIONS,
+    'the locked portfolio-construction policy must never target more than eight stocks'
   );
 
   const dynamicLargeCaps =
@@ -44216,6 +44554,14 @@ function renderDecisionAudit(
       screening.comparableAnalyzed
     ],
     [
+      'Actionable fit',
+      screening.actionableProfileFit
+    ],
+    [
+      'Research target',
+      screening.actionableResearchTarget
+    ],
+    [
       'Evidence research',
       screening.evidenceResearch
     ],
@@ -44472,14 +44818,28 @@ function renderShadowDecision(
       ?.targetPositionCount
   ) {
     html +=
-      '<div class="decisionMetaLine"><strong>Dynamic diversification:</strong> target up to ' +
+      '<div class="decisionMetaLine"><strong>Portfolio construction:</strong> target ' +
       formatNumber(
         result.allocationDiagnostics
           .targetPositionCount ||
         0,
         0
       ) +
-      ' positions for the combined capital base; ' +
+      ' positions (minimum target ' +
+      formatNumber(
+        result.allocationDiagnostics
+          .minimumTargetPositions ||
+        3,
+        0
+      ) +
+      ', maximum ' +
+      formatNumber(
+        result.allocationDiagnostics
+          .maximumTargetPositions ||
+        8,
+        0
+      ) +
+      '); ' +
       formatNumber(
         result.allocationDiagnostics
           .eligibleAllocationCandidates ||
@@ -44515,6 +44875,44 @@ function renderShadowDecision(
         1
       ) +
       '% per sector.</div>';
+
+    if (
+      result?.screening
+        ?.actionableResearchTarget
+    ) {
+      html +=
+        '<div class="decisionMetaLine"><strong>Capital-efficiency search:</strong> NOMAD continued deeper research until it found ' +
+        formatNumber(
+          result.screening
+            .actionableProfileFit ||
+          0,
+          0
+        ) +
+        ' profile-suitable actionable ideas against a research target of ' +
+        formatNumber(
+          result.screening
+            .actionableResearchTarget ||
+          0,
+          0
+        ) +
+        ', or exhausted the bounded deep-research budget. Cash is retained only after that search; WATCH, unresolved evidence and profile failures still receive PKR 0.</div>';
+    }
+
+    if (
+      result.allocationDiagnostics
+        ?.diversificationException
+        ?.triggered
+    ) {
+      html +=
+        '<div class="decisionMetaLine"><strong>Diversification exception:</strong> ' +
+        escapeHtml(
+          result.allocationDiagnostics
+            .diversificationException
+            .reason ||
+          'The minimum three-stock diversification target could not be reached without weakening the professional allocation gates.'
+        ) +
+        '</div>';
+    }
   }
 
   if (allocations.length) {
