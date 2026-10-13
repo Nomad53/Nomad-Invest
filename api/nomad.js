@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.2.5';
+const VERSION = '0.9.2.6';
 
 
 const SUPABASE_URL =
@@ -19757,7 +19757,7 @@ function scoreDecisionFundamentals(
         'Structured PSX fundamentals were unavailable during this decision run.'
       ],
       risks: [
-        'NOMAD will not issue a validated long-term buy without sufficient fundamental evidence.'
+        'NOMAD will not issue a fully supported long-term buy without sufficient fundamental evidence.'
       ]
     };
   }
@@ -20946,7 +20946,7 @@ function decisionCenterAnalystGate(
       state: 'RESEARCHING',
       validationTier: 'INCOMPLETE_SUMMARY',
       reason:
-        'Headline financial evidence is incomplete. NOMAD will keep researching the company and continue through the ranked universe instead of letting this missing evidence consume a validated-analysis slot.'
+        'Headline financial evidence is incomplete. NOMAD will keep researching the company and continue through the ranked universe instead of letting this missing evidence consume a deep-analysis slot.'
     };
   }
 
@@ -25976,7 +25976,7 @@ async function runDecisionLab(
 
   let action = 'WATCH';
   let headline =
-    'No validated Priority 1 allocation is available right now.';
+    'No Priority 1 allocation currently passes the shadow allocation gates.';
   let reason =
     'NOMAD keeps opportunities visible. Only canonical BUY or ACCUMULATE states that pass evidence, profile suitability and portfolio-fit gates may receive capital; WATCH, RESEARCHING and AVOID receive PKR 0.';
 
@@ -26031,10 +26031,10 @@ async function runDecisionLab(
         : 'PARTIAL_INVEST';
     headline =
       priorityOneCount === 1
-        ? 'One validated Priority 1 opportunity is currently actionable.'
-        : 'Validated Priority 1 opportunities are currently actionable.';
+        ? 'One Priority 1 opportunity currently passes the shadow allocation gates.'
+        : 'Priority 1 opportunities currently pass the shadow allocation gates.';
     reason =
-      'The capital allocator builds a portfolio-aware target from the strongest validated opportunities. Position sizes are conviction-weighted, profile-gated and constrained by stock/sector limits; existing holdings are applied to the combined post-investment portfolio before whole shares are calculated.';
+      'The capital allocator builds a portfolio-aware target from the strongest opportunities that passed the current shadow allocation gates. Position sizes are conviction-weighted, profile-gated and constrained by stock/sector limits; existing holdings are applied to the combined post-investment portfolio before whole shares are calculated.';
   } else if (
     priorityOneCount > 0
   ) {
@@ -26050,7 +26050,7 @@ async function runDecisionLab(
     headline =
       'No Priority 1 idea passes the full standard; the best current ideas remain Priority 2.';
     reason =
-      'These companies remain worth monitoring, but one or more thesis, evidence, valuation or entry conditions are not strong enough for a validated allocation.';
+      'These companies remain worth monitoring, but one or more thesis, evidence, valuation or entry conditions do not pass the current shadow allocation gate.';
   } else if (
     researchRequiredCount > 0
   ) {
@@ -44412,6 +44412,13 @@ function renderOpportunityList(
           ) +
           '">' +
           escapeHtml(
+            (
+              ['BUY', 'ACCUMULATE', 'WATCH', 'AVOID'].includes(
+                String(item.decisionCenterView || '').toUpperCase()
+              )
+                ? 'Market: '
+                : ''
+            ) +
             decisionActionLabel(
               item.decisionCenterView
             )
@@ -45111,7 +45118,7 @@ function renderDecisionAudit(
         ?.targetDeploymentPct
     ],
     [
-      'Avg conviction',
+      'Shadow conviction /100',
       result?.allocationDiagnostics
         ?.averageConvictionScore
     ],
