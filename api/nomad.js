@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.3.2.4';
+const VERSION = '0.9.3.2.5';
 
 
 const SUPABASE_URL =
@@ -33851,6 +33851,32 @@ select {
   color: var(--trade-text);
   border-color: #2a3b53;
   border-radius: 6px;
+  color-scheme: dark;
+}
+
+/* Keep Chrome / Edge autofill and focus states inside NOMAD's dark theme. */
+input:focus,
+select:focus {
+  background: #0d1725 !important;
+  color: var(--trade-text) !important;
+  border-color: var(--trade-accent) !important;
+  outline: none;
+  box-shadow: 0 0 0 1px rgba(59,130,246,.28);
+  caret-color: var(--trade-text);
+}
+
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus,
+input:-webkit-autofill:active,
+input:autofill {
+  -webkit-text-fill-color: var(--trade-text) !important;
+  caret-color: var(--trade-text) !important;
+  -webkit-box-shadow: 0 0 0 1000px #0d1725 inset !important;
+  box-shadow: 0 0 0 1000px #0d1725 inset !important;
+  border-color: var(--trade-accent) !important;
+  background-color: #0d1725 !important;
+  color: var(--trade-text) !important;
 }
 
 button {
@@ -35526,7 +35552,12 @@ Enter a symbol or click any company below.
 
 <input
   id="stockSymbol"
+  name="nomad-research-psx-symbol"
+  type="text"
   placeholder="Example: HBL"
+  autocomplete="off"
+  autocapitalize="characters"
+  spellcheck="false"
 >
 
 <div
