@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.3.2.1';
+const VERSION = '0.9.3.2.2';
 
 
 const SUPABASE_URL =
@@ -35274,7 +35274,7 @@ Checking connection...
 </div>
 </div>
 <div class="stockStrategyControls">
-<div><label>Stock</label><input id="strategySymbol" placeholder="Example: OGDC"></div>
+<div><label>Stock</label><input id="strategySymbol" type="text" placeholder="Example: OGDC" list="strategySymbolOptions" autocomplete="off" autocapitalize="characters" spellcheck="false"><datalist id="strategySymbolOptions"></datalist></div>
 <div><label>Horizon</label><select id="strategyHorizon"><option value="long_term">Long-term</option><option value="short_term">Short-term</option></select></div>
 <div><label>Risk</label><select id="strategyRisk"><option value="balanced">Balanced</option><option value="conservative">Conservative</option><option value="aggressive">Aggressive</option></select></div>
 <button id="analyzeStockStrategy" class="primaryWide">Analyze stock</button>
@@ -35988,6 +35988,9 @@ const PAGE_SIZE = 25;
 let metadataAuditRows = [];
 
 let metadataAuditUniverseRows = [];
+
+let decisionUniverseEntries = [];
+let decisionUniversePromise = null;
 
 let lastMetadataAuditResult =
   null;
@@ -36736,6 +36739,7 @@ function openAppPage(
 
   if (page === 'decision') {
     populateDecisionSectors();
+    populateStrategySymbolOptions();
   }
 
   if (page === 'explore') {
@@ -41026,6 +41030,142 @@ function populateSectors() {
         .join('');
 }
 
+async function loadDecisionUniverseEntries() {
+  if (decisionUniverseEntries.length) {
+    return decisionUniverseEntries;
+  }
+
+  if (!decisionUniversePromise) {
+    decisionUniversePromise =
+      api('universe-master')
+        .then(
+          universe => {
+            decisionUniverseEntries =
+              (universe.entries || [])
+                .filter(
+                  entry =>
+                    entry &&
+                    (
+                      entry.recommendationEligible === true ||
+                      entry.universeClass === 'CORE_EQUITY'
+                    )
+                );
+
+            return decisionUniverseEntries;
+          }
+        )
+        .catch(
+          error => {
+            decisionUniversePromise = null;
+            throw error;
+          }
+        );
+  }
+
+  return decisionUniversePromise;
+}
+
+async function populateStrategySymbolOptions() {
+  const target =
+    $('strategySymbolOptions');
+
+  if (!target) {
+    return;
+  }
+
+  try {
+    const entries =
+      await loadDecisionUniverseEntries();
+
+    target.innerHTML =
+      entries
+        .slice()
+        .sort(
+          (a, b) =>
+            String(a.symbol || '')
+              .localeCompare(
+                String(b.symbol || '')
+              )
+        )
+        .map(
+          entry =>
+            '<option value="' +
+            escapeHtml(
+              String(entry.symbol || '')
+                .trim()
+                .toUpperCase()
+            ) +
+            '">' +
+            escapeHtml(
+              entry.companyName ||
+              entry.symbol ||
+              ''
+            ) +
+            '</option>'
+        )
+        .join('');
+  } catch {
+    target.innerHTML = '';
+  }
+}
+
+async function resolveStrategySymbolInput(
+  rawValue
+) {
+  const raw =
+    String(rawValue || '')
+      .trim();
+
+  const normalized =
+    raw.toUpperCase();
+
+  if (!normalized) {
+    return '';
+  }
+
+  try {
+    const entries =
+      await loadDecisionUniverseEntries();
+
+    const exactSymbol =
+      entries.find(
+        entry =>
+          String(entry.symbol || '')
+            .trim()
+            .toUpperCase() ===
+          normalized
+      );
+
+    if (exactSymbol) {
+      return String(
+        exactSymbol.symbol
+      )
+        .trim()
+        .toUpperCase();
+    }
+
+    const exactName =
+      entries.find(
+        entry =>
+          String(entry.companyName || '')
+            .trim()
+            .toUpperCase() ===
+          normalized
+      );
+
+    if (exactName) {
+      return String(
+        exactName.symbol
+      )
+        .trim()
+        .toUpperCase();
+    }
+  } catch {}
+
+  // Fall back to the typed PSX symbol so the server remains the final validator.
+  return normalized;
+}
+
 async function populateDecisionSectors() {
   const target =
     $('decisionSector');
@@ -41060,30 +41200,16 @@ async function populateDecisionSectors() {
     ].sort();
 
   // Decision Center can be opened directly before Explore PSX has loaded.
-  // In that case marketRows is still empty, so fetch the canonical universe
-  // instead of leaving the Industry / Sector dropdown with only one option.
+  // In that case marketRows is still empty, so use the canonical universe.
   if (!sectors.length) {
     try {
-      const universe =
-        await api(
-          'universe-master'
-        );
+      const entries =
+        await loadDecisionUniverseEntries();
 
       sectors =
         [
           ...new Set(
-            (
-              universe.entries ||
-              []
-            )
-              .filter(
-                entry =>
-                  entry &&
-                  (
-                    entry.recommendationEligible === true ||
-                    entry.universeClass === 'CORE_EQUITY'
-                  )
-              )
+            entries
               .map(
                 entry =>
                   String(
@@ -47615,15 +47741,17 @@ function renderStockStrategy(
 async function loadStockStrategy(
   symbolOverride
 ) {
+  const typedValue =
+    typeof symbolOverride === 'string'
+      ? symbolOverride
+      : $('strategySymbol')
+          ?.value ||
+        '';
+
   const symbol =
-    String(
-      symbolOverride ||
-      $('strategySymbol')
-        ?.value ||
-      ''
-    )
-      .trim()
-      .toUpperCase();
+    await resolveStrategySymbolInput(
+      typedValue
+    );
 
   if (!symbol) {
     $('stockStrategyResult')
@@ -48499,17 +48627,40 @@ function renderShadowDecision(
 
 if ($('analyzeStockStrategy')) {
   $('analyzeStockStrategy')
+    .type =
+      'button';
+
+  $('analyzeStockStrategy')
     .onclick =
       () =>
-        loadStockStrategy();
+        loadStockStrategy(
+          $('strategySymbol')
+            ?.value ||
+          ''
+        );
 }
 
 if ($('strategySymbol')) {
   $('strategySymbol')
+    .addEventListener(
+      'input',
+      event => {
+        // Keep manual typing independent of Explore PSX navigation/state.
+        event.target.dataset.manualDraft =
+          event.target.value ||
+          '';
+      }
+    );
+
+  $('strategySymbol')
     .onkeydown =
       event => {
         if (event.key === 'Enter') {
-          loadStockStrategy();
+          event.preventDefault();
+          loadStockStrategy(
+            event.currentTarget.value ||
+            ''
+          );
         }
       };
 }
