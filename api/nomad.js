@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.0.1';
+const VERSION = '0.9.1';
 
 
 const SUPABASE_URL =
@@ -11846,7 +11846,9 @@ async function getQuote(
           data.change_1y_pct
         ),
 
-      range52: {
+      priceAction,
+
+    range52: {
         low:
           range52Low,
 
@@ -14907,6 +14909,21 @@ async function getTechnicalAnalysis(
       volumeRatio
     );
 
+  const priceAction =
+    buildProfessionalPriceAction(
+      rows,
+      {
+        price: latestClose,
+        sma20: latestSMA20,
+        sma50: latestSMA50,
+        sma200: latestSMA200,
+        rsi14: latestRSI,
+        macdHistogram: latestHistogram,
+        volumeRatio20d: volumeRatio,
+        return1m: momentum20Pct
+      }
+    );
+
   const chartRows =
     rows.slice(
       -260
@@ -15049,6 +15066,8 @@ async function getTechnicalAnalysis(
 
       low52
     },
+
+    priceAction,
 
     dataQuality: {
       canonicalSymbol:
@@ -16098,6 +16117,625 @@ function historicalConditionLabel(
   return 'Mixed';
 }
 
+
+/* =========================================================
+   PROFESSIONAL PRICE-ACTION + TRADER TIMING ENGINE - BUILD 0.9.1
+   Candlesticks are contextual evidence, never standalone buy signals.
+========================================================= */
+
+function professionalCandleSnapshot(row) {
+  if (!row) {
+    return null;
+  }
+
+  const open = safeNumber(row.open);
+  const high = safeNumber(row.high);
+  const low = safeNumber(row.low);
+  const close = safeNumber(row.close);
+  const volume = safeNumber(row.volume);
+
+  if (
+    open === null ||
+    high === null ||
+    low === null ||
+    close === null ||
+    high < low
+  ) {
+    return null;
+  }
+
+  const range = Math.max(0, high - low);
+  const body = Math.abs(close - open);
+  const upperWick = Math.max(0, high - Math.max(open, close));
+  const lowerWick = Math.max(0, Math.min(open, close) - low);
+
+  return {
+    date: row.date || null,
+    open,
+    high,
+    low,
+    close,
+    volume,
+    range,
+    body,
+    bodyPctOfRange:
+      range > 0
+        ? body / range * 100
+        : 0,
+    upperWick,
+    lowerWick,
+    direction:
+      close > open
+        ? 'BULLISH'
+        : close < open
+          ? 'BEARISH'
+          : 'FLAT'
+  };
+}
+
+function professionalCandlestickPattern(rows) {
+  const clean =
+    (Array.isArray(rows) ? rows : [])
+      .map(professionalCandleSnapshot)
+      .filter(Boolean);
+
+  if (!clean.length) {
+    return {
+      name: 'UNAVAILABLE',
+      polarity: 'NEUTRAL',
+      confidence: 'LOW',
+      explanation: 'Not enough valid OHLC data for candlestick analysis.'
+    };
+  }
+
+  const current = clean[clean.length - 1];
+  const previous = clean.length >= 2
+    ? clean[clean.length - 2]
+    : null;
+
+  const tinyBody =
+    current.range > 0 &&
+    current.bodyPctOfRange <= 10;
+
+  if (tinyBody) {
+    return {
+      name: 'DOJI',
+      polarity: 'NEUTRAL',
+      confidence: 'MEDIUM',
+      explanation: 'The latest candle shows indecision; context and confirmation matter more than the candle alone.'
+    };
+  }
+
+  if (
+    previous &&
+    previous.direction === 'BEARISH' &&
+    current.direction === 'BULLISH' &&
+    current.open <= previous.close &&
+    current.close >= previous.open
+  ) {
+    return {
+      name: 'BULLISH_ENGULFING',
+      polarity: 'BULLISH',
+      confidence: 'MEDIUM',
+      explanation: 'The latest bullish body engulfs the prior bearish body. It is meaningful only when aligned with support, trend and volume.'
+    };
+  }
+
+  if (
+    previous &&
+    previous.direction === 'BULLISH' &&
+    current.direction === 'BEARISH' &&
+    current.open >= previous.close &&
+    current.close <= previous.open
+  ) {
+    return {
+      name: 'BEARISH_ENGULFING',
+      polarity: 'BEARISH',
+      confidence: 'MEDIUM',
+      explanation: 'The latest bearish body engulfs the prior bullish body. Confirmation from structure and volume is required.'
+    };
+  }
+
+  if (
+    current.range > 0 &&
+    current.lowerWick >= Math.max(current.body * 2, current.range * 0.45) &&
+    current.upperWick <= Math.max(current.body, current.range * 0.20)
+  ) {
+    return {
+      name: 'HAMMER_LIKE',
+      polarity: 'BULLISH',
+      confidence: 'LOW',
+      explanation: 'The latest candle rejected lower prices. NOMAD treats this only as supporting evidence near a valid support zone.'
+    };
+  }
+
+  if (
+    current.range > 0 &&
+    current.upperWick >= Math.max(current.body * 2, current.range * 0.45) &&
+    current.lowerWick <= Math.max(current.body, current.range * 0.20)
+  ) {
+    return {
+      name: 'SHOOTING_STAR_LIKE',
+      polarity: 'BEARISH',
+      confidence: 'LOW',
+      explanation: 'The latest candle rejected higher prices. NOMAD treats this only as supporting evidence near resistance or after an extended rise.'
+    };
+  }
+
+  return {
+    name:
+      current.direction === 'BULLISH'
+        ? 'BULLISH_CANDLE'
+        : current.direction === 'BEARISH'
+          ? 'BEARISH_CANDLE'
+          : 'NEUTRAL_CANDLE',
+    polarity:
+      current.direction === 'BULLISH'
+        ? 'BULLISH'
+        : current.direction === 'BEARISH'
+          ? 'BEARISH'
+          : 'NEUTRAL',
+    confidence: 'LOW',
+    explanation: 'No high-information reversal candle was detected. NOMAD relies on the broader price structure.'
+  };
+}
+
+function professionalSwingPoints(rows, radius = 2) {
+  const list = Array.isArray(rows) ? rows : [];
+  const highs = [];
+  const lows = [];
+
+  for (
+    let index = radius;
+    index < list.length - radius;
+    index++
+  ) {
+    const currentHigh = safeNumber(list[index]?.high);
+    const currentLow = safeNumber(list[index]?.low);
+
+    if (currentHigh !== null) {
+      let isHigh = true;
+      for (let offset = 1; offset <= radius; offset++) {
+        const left = safeNumber(list[index - offset]?.high);
+        const right = safeNumber(list[index + offset]?.high);
+        if (
+          left === null ||
+          right === null ||
+          currentHigh < left ||
+          currentHigh < right
+        ) {
+          isHigh = false;
+          break;
+        }
+      }
+      if (isHigh) {
+        highs.push({
+          index,
+          date: list[index]?.date || null,
+          value: currentHigh
+        });
+      }
+    }
+
+    if (currentLow !== null) {
+      let isLow = true;
+      for (let offset = 1; offset <= radius; offset++) {
+        const left = safeNumber(list[index - offset]?.low);
+        const right = safeNumber(list[index + offset]?.low);
+        if (
+          left === null ||
+          right === null ||
+          currentLow > left ||
+          currentLow > right
+        ) {
+          isLow = false;
+          break;
+        }
+      }
+      if (isLow) {
+        lows.push({
+          index,
+          date: list[index]?.date || null,
+          value: currentLow
+        });
+      }
+    }
+  }
+
+  return { highs, lows };
+}
+
+function professionalTrendStructure(swings) {
+  const highs = swings?.highs || [];
+  const lows = swings?.lows || [];
+
+  const highA = highs.length >= 2 ? highs[highs.length - 2] : null;
+  const highB = highs.length >= 1 ? highs[highs.length - 1] : null;
+  const lowA = lows.length >= 2 ? lows[lows.length - 2] : null;
+  const lowB = lows.length >= 1 ? lows[lows.length - 1] : null;
+
+  if (highA && highB && lowA && lowB) {
+    if (
+      highB.value > highA.value &&
+      lowB.value > lowA.value
+    ) {
+      return {
+        state: 'HIGHER_HIGHS_HIGHER_LOWS',
+        bias: 'BULLISH',
+        description: 'Recent swing highs and swing lows are both rising.'
+      };
+    }
+
+    if (
+      highB.value < highA.value &&
+      lowB.value < lowA.value
+    ) {
+      return {
+        state: 'LOWER_HIGHS_LOWER_LOWS',
+        bias: 'BEARISH',
+        description: 'Recent swing highs and swing lows are both falling.'
+      };
+    }
+  }
+
+  return {
+    state: 'MIXED_STRUCTURE',
+    bias: 'NEUTRAL',
+    description: 'Recent swing structure is mixed or insufficiently developed.'
+  };
+}
+
+function professionalNearestLevels(price, swings, fallbackSupport, fallbackResistance) {
+  const current = safeNumber(price);
+  if (current === null || current <= 0) {
+    return {
+      support: safeNumber(fallbackSupport),
+      resistance: safeNumber(fallbackResistance)
+    };
+  }
+
+  const supportCandidates =
+    (swings?.lows || [])
+      .map(item => safeNumber(item.value))
+      .filter(value => value !== null && value < current)
+      .sort((a, b) => b - a);
+
+  const resistanceCandidates =
+    (swings?.highs || [])
+      .map(item => safeNumber(item.value))
+      .filter(value => value !== null && value > current)
+      .sort((a, b) => a - b);
+
+  return {
+    support:
+      supportCandidates[0] ??
+      safeNumber(fallbackSupport),
+    resistance:
+      resistanceCandidates[0] ??
+      safeNumber(fallbackResistance)
+  };
+}
+
+function buildProfessionalPriceAction(
+  rows,
+  metrics = {}
+) {
+  const list =
+    (Array.isArray(rows) ? rows : [])
+      .filter(
+        row =>
+          safeNumber(row?.close) !== null &&
+          safeNumber(row?.high) !== null &&
+          safeNumber(row?.low) !== null
+      );
+
+  if (list.length < 20) {
+    return {
+      available: false,
+      reason: 'At least 20 valid OHLC sessions are required for professional price-action analysis.'
+    };
+  }
+
+  const latest = professionalCandleSnapshot(list[list.length - 1]);
+  const price = safeNumber(metrics.price) ?? latest?.close ?? null;
+  const rsi = safeNumber(metrics.rsi14);
+  const macdHistogram = safeNumber(metrics.macdHistogram);
+  const volumeRatio = safeNumber(metrics.volumeRatio20d);
+  const sma20 = safeNumber(metrics.sma20);
+  const sma50 = safeNumber(metrics.sma50);
+  const sma200 = safeNumber(metrics.sma200);
+  const return1m = safeNumber(metrics.return1m);
+
+  const atrValues = atrSeries(list, 14);
+  const latestAtr =
+    atrValues.length
+      ? safeNumber(atrValues[atrValues.length - 1])
+      : null;
+
+  const atrPct =
+    latestAtr !== null &&
+    price !== null &&
+    price > 0
+      ? latestAtr / price * 100
+      : null;
+
+  const recentForSwings = list.slice(-90);
+  const swings = professionalSwingPoints(recentForSwings, 2);
+  const structure = professionalTrendStructure(swings);
+  const pattern = professionalCandlestickPattern(list.slice(-5));
+
+  const prior20 = list.slice(-21, -1);
+  const prior20High =
+    prior20.length
+      ? Math.max(...prior20.map(row => safeNumber(row.high) ?? -Infinity))
+      : null;
+  const prior20Low =
+    prior20.length
+      ? Math.min(...prior20.map(row => safeNumber(row.low) ?? Infinity))
+      : null;
+
+  const breakout =
+    price !== null &&
+    prior20High !== null &&
+    Number.isFinite(prior20High) &&
+    price > prior20High * 1.002;
+
+  const breakdown =
+    price !== null &&
+    prior20Low !== null &&
+    Number.isFinite(prior20Low) &&
+    price < prior20Low * 0.998;
+
+  const volumeConfirmed =
+    volumeRatio !== null &&
+    volumeRatio >= 1.20;
+
+  const uptrend =
+    structure.bias === 'BULLISH' ||
+    (
+      price !== null &&
+      sma20 !== null &&
+      sma50 !== null &&
+      price > sma20 &&
+      sma20 >= sma50
+    );
+
+  const downtrend =
+    structure.bias === 'BEARISH' ||
+    (
+      price !== null &&
+      sma20 !== null &&
+      sma50 !== null &&
+      price < sma20 &&
+      sma20 <= sma50
+    );
+
+  const nearAverage =
+    price !== null &&
+    (
+      (
+        sma20 !== null &&
+        Math.abs(price - sma20) / Math.max(0.000001, price) <= 0.035
+      ) ||
+      (
+        sma50 !== null &&
+        Math.abs(price - sma50) / Math.max(0.000001, price) <= 0.045
+      )
+    );
+
+  const pullback =
+    uptrend &&
+    nearAverage &&
+    !breakdown &&
+    (
+      return1m === null ||
+      return1m > -10
+    );
+
+  const extended =
+    (
+      rsi !== null &&
+      rsi >= 72
+    ) ||
+    (
+      price !== null &&
+      sma20 !== null &&
+      latestAtr !== null &&
+      price - sma20 > latestAtr * 2.2
+    );
+
+  const fallbackSupport =
+    prior20Low !== null && Number.isFinite(prior20Low)
+      ? prior20Low
+      : null;
+  const fallbackResistance =
+    prior20High !== null && Number.isFinite(prior20High)
+      ? prior20High
+      : null;
+
+  const levels = professionalNearestLevels(
+    price,
+    swings,
+    fallbackSupport,
+    fallbackResistance
+  );
+
+  const riskDistance =
+    price !== null &&
+    levels.support !== null &&
+    levels.support < price
+      ? price - levels.support
+      : null;
+
+  const rewardDistance =
+    price !== null &&
+    levels.resistance !== null &&
+    levels.resistance > price
+      ? levels.resistance - price
+      : null;
+
+  const rewardRisk =
+    riskDistance !== null &&
+    rewardDistance !== null &&
+    riskDistance > 0
+      ? rewardDistance / riskDistance
+      : null;
+
+  let score = 50;
+  const positives = [];
+  const risks = [];
+
+  if (structure.bias === 'BULLISH') {
+    score += 14;
+    positives.push('Swing structure is bullish with higher highs and higher lows.');
+  } else if (structure.bias === 'BEARISH') {
+    score -= 14;
+    risks.push('Swing structure is bearish with lower highs and lower lows.');
+  }
+
+  if (breakout) {
+    score += volumeConfirmed ? 14 : 7;
+    positives.push(
+      volumeConfirmed
+        ? 'Price has broken above the prior 20-session high with volume confirmation.'
+        : 'Price has broken above the prior 20-session high, but volume confirmation is limited.'
+    );
+  }
+
+  if (breakdown) {
+    score -= 22;
+    risks.push('Price has broken below the prior 20-session low.');
+  }
+
+  if (pullback) {
+    score += 10;
+    positives.push('Price is pulling back toward a key moving-average zone while the broader trend remains constructive.');
+  }
+
+  if (pattern.polarity === 'BULLISH') {
+    score += 6;
+    positives.push('Latest candlestick behavior provides bullish supporting evidence.');
+  } else if (pattern.polarity === 'BEARISH') {
+    score -= 6;
+    risks.push('Latest candlestick behavior provides bearish supporting evidence.');
+  }
+
+  if (rsi !== null) {
+    if (rsi >= 40 && rsi <= 65) {
+      score += 5;
+    } else if (rsi >= 72) {
+      score -= 9;
+      risks.push('RSI indicates the entry may be extended.');
+    } else if (rsi <= 28) {
+      score -= 3;
+      risks.push('Very low RSI is treated as weakness unless price structure confirms a reversal.');
+    }
+  }
+
+  if (macdHistogram !== null) {
+    if (macdHistogram > 0) {
+      score += 4;
+    } else if (macdHistogram < 0) {
+      score -= 4;
+    }
+  }
+
+  if (volumeConfirmed) {
+    score += 4;
+    positives.push('Current participation is above the recent 20-session volume average.');
+  }
+
+  if (extended) {
+    score -= 10;
+    risks.push('Price is extended relative to momentum or its short-term moving average.');
+  }
+
+  if (
+    rewardRisk !== null &&
+    rewardRisk >= 2
+  ) {
+    score += 5;
+    positives.push('Nearest technical reward-to-risk is at least 2:1.');
+  } else if (
+    rewardRisk !== null &&
+    rewardRisk < 1
+  ) {
+    score -= 8;
+    risks.push('Nearest technical reward-to-risk is below 1:1.');
+  }
+
+  score = decisionClamp(score);
+
+  const timingState =
+    score >= 72
+      ? 'GOOD'
+      : score >= 58
+        ? 'FAIR'
+        : score >= 42
+          ? 'POOR'
+          : 'RISKY';
+
+  let setup = 'NO_CLEAR_SETUP';
+  if (breakout && volumeConfirmed) {
+    setup = 'CONFIRMED_BREAKOUT';
+  } else if (breakout) {
+    setup = 'UNCONFIRMED_BREAKOUT';
+  } else if (pullback) {
+    setup = 'TREND_PULLBACK';
+  } else if (breakdown) {
+    setup = 'BREAKDOWN';
+  } else if (uptrend) {
+    setup = 'UPTREND_CONTINUATION';
+  } else if (downtrend) {
+    setup = 'DOWNTREND';
+  }
+
+  return {
+    available: true,
+    asOf: latest?.date || null,
+    setup,
+    structure,
+    candlePattern: pattern,
+    breakout: {
+      active: breakout,
+      volumeConfirmed,
+      prior20High:
+        Number.isFinite(prior20High)
+          ? decisionRound(prior20High, 4)
+          : null
+    },
+    breakdown: {
+      active: breakdown,
+      prior20Low:
+        Number.isFinite(prior20Low)
+          ? decisionRound(prior20Low, 4)
+          : null
+    },
+    pullback: {
+      active: pullback,
+      nearMovingAverage: nearAverage
+    },
+    extended,
+    support:
+      decisionRound(levels.support, 4),
+    resistance:
+      decisionRound(levels.resistance, 4),
+    atr14:
+      decisionRound(latestAtr, 4),
+    atrPct:
+      decisionRound(atrPct, 2),
+    rewardRisk:
+      decisionRound(rewardRisk, 2),
+    timingScore:
+      decisionRound(score, 2),
+    timingState,
+    positives:
+      uniqueTextValues(positives),
+    risks:
+      uniqueTextValues(risks)
+  };
+}
+
 function buildHistoricalContext(
   symbol,
   rows,
@@ -16487,6 +17125,21 @@ function buildHistoricalContext(
       }
     }
   }
+
+  const priceAction =
+    buildProfessionalPriceAction(
+      rows,
+      {
+        price,
+        sma20,
+        sma50,
+        sma200,
+        rsi14: latestRsi,
+        macdHistogram: latestMacdHistogram,
+        volumeRatio20d,
+        return1m
+      }
+    );
 
   const flags = [];
 
@@ -18813,7 +19466,7 @@ async function readJsonRequestBody(
 
 const DECISION_MODELS = {
   long_term: {
-    id: 'NOMAD-LT-0.1',
+    id: 'NOMAD-LT-PRO-0.9.1',
     horizon: 'long_term',
     status: 'SHADOW_UNVALIDATED',
     realMoneyEligible: false,
@@ -18826,7 +19479,7 @@ const DECISION_MODELS = {
     }
   },
   short_term: {
-    id: 'NOMAD-ST-0.1',
+    id: 'NOMAD-ST-PRO-0.9.1',
     horizon: 'short_term',
     status: 'SHADOW_UNVALIDATED',
     realMoneyEligible: false,
@@ -20476,6 +21129,407 @@ function decisionEvidenceProfile(
   };
 }
 
+
+/* =========================================================
+   PROFESSIONAL INVESTOR / TRADER DECISION FRAMEWORK - BUILD 0.9.1
+   Long-term and short-term are separate analytical frameworks.
+========================================================= */
+
+function professionalStateScore(state, mapping) {
+  const key = String(state || '').toUpperCase();
+  return Object.prototype.hasOwnProperty.call(mapping, key)
+    ? mapping[key]
+    : 50;
+}
+
+function professionalFinancialQualityScore(analyst) {
+  if (!analyst) {
+    return 30;
+  }
+
+  const overall = professionalStateScore(
+    analyst.overallFinancialView?.state,
+    {
+      STRONG: 92,
+      GOOD: 82,
+      ACCEPTABLE: 68,
+      MIXED: 52,
+      WEAK: 25,
+      UNRELIABLE: 55
+    }
+  );
+
+  const earnings = professionalStateScore(
+    analyst.views?.earningsQuality?.state,
+    {
+      STRONG: 92,
+      GOOD: 82,
+      ACCEPTABLE: 70,
+      IMPROVING: 78,
+      QUESTIONABLE: 42,
+      WEAK: 25,
+      UNRELIABLE: 60
+    }
+  );
+
+  const cash = professionalStateScore(
+    analyst.views?.cashFlowQuality?.state,
+    {
+      STRONG: 90,
+      GOOD: 80,
+      ACCEPTABLE: 68,
+      EVIDENCE_AVAILABLE: 65,
+      QUESTIONABLE: 40,
+      WEAK: 22,
+      UNRELIABLE: 60
+    }
+  );
+
+  const balance = professionalStateScore(
+    analyst.views?.balanceSheet?.state,
+    {
+      STRONG: 90,
+      GOOD: 80,
+      ACCEPTABLE: 68,
+      EVIDENCE_AVAILABLE: 65,
+      QUESTIONABLE: 42,
+      WEAK: 25,
+      UNRELIABLE: 60
+    }
+  );
+
+  return decisionRound(
+    decisionClamp(
+      overall * 0.40 +
+      earnings * 0.25 +
+      cash * 0.20 +
+      balance * 0.15
+    ),
+    2
+  );
+}
+
+function professionalValuationState(score) {
+  const value = safeNumber(score) ?? 0;
+  if (value >= 78) return 'ATTRACTIVE';
+  if (value >= 62) return 'REASONABLE';
+  if (value >= 48) return 'FAIR';
+  return 'EXPENSIVE_OR_UNCLEAR';
+}
+
+function professionalRiskState(score) {
+  const value = safeNumber(score) ?? 0;
+  if (value >= 72) return 'LOW_TO_MODERATE';
+  if (value >= 55) return 'ACCEPTABLE';
+  if (value >= 40) return 'ELEVATED';
+  return 'HIGH';
+}
+
+function professionalLongTermView(
+  candidate,
+  analystGate,
+  evidence
+) {
+  const analyst = candidate?.analystCore || null;
+  const financialScore =
+    professionalFinancialQualityScore(analyst);
+  const valuationScore =
+    safeNumber(candidate?.valuation?.score) || 0;
+  const riskScore =
+    safeNumber(candidate?.risk?.score) || 0;
+  const timingScore =
+    safeNumber(
+      candidate?.historicalContext
+        ?.priceAction
+        ?.timingScore
+    ) ??
+    safeNumber(candidate?.entry?.score) ??
+    50;
+  const timingState =
+    candidate?.historicalContext
+      ?.priceAction
+      ?.timingState ||
+    (
+      timingScore >= 72
+        ? 'GOOD'
+        : timingScore >= 58
+          ? 'FAIR'
+          : timingScore >= 42
+            ? 'POOR'
+            : 'RISKY'
+    );
+
+  const thesisScore =
+    decisionRound(
+      decisionClamp(
+        financialScore * 0.45 +
+        valuationScore * 0.25 +
+        riskScore * 0.15 +
+        evidence.score * 0.15
+      ),
+      2
+    );
+
+  const rankingScore =
+    decisionRound(
+      decisionClamp(
+        thesisScore * 0.90 +
+        timingScore * 0.10
+      ),
+      2
+    );
+
+  let thesisStatus =
+    financialScore >= 78
+      ? 'STRONG'
+      : financialScore >= 64
+        ? 'ACCEPTABLE'
+        : financialScore >= 48
+          ? 'MIXED'
+          : 'WEAK';
+
+  let marketAction = 'WATCH';
+  let opportunityTier = 'PRIORITY_2';
+  let reason = 'The long-term thesis is not yet strong enough for new capital.';
+
+  if (analystGate.state === 'RESEARCHING') {
+    thesisStatus = 'UNRESOLVED';
+    return {
+      framework: 'LONG_TERM_INVESTOR',
+      thesisStatus,
+      financialScore,
+      valuationScore,
+      valuationState: professionalValuationState(valuationScore),
+      riskScore,
+      riskState: professionalRiskState(riskScore),
+      timingScore,
+      timingState,
+      rankingScore,
+      marketAction: 'WATCH',
+      opportunityTier: 'EVIDENCE_RESEARCH',
+      reason: analystGate.reason
+    };
+  }
+
+  if (
+    analystGate.state === 'REJECT' ||
+    financialScore < 42 ||
+    riskScore < 38
+  ) {
+    return {
+      framework: 'LONG_TERM_INVESTOR',
+      thesisStatus: financialScore < 42 ? 'WEAK' : thesisStatus,
+      financialScore,
+      valuationScore,
+      valuationState: professionalValuationState(valuationScore),
+      riskScore,
+      riskState: professionalRiskState(riskScore),
+      timingScore,
+      timingState,
+      rankingScore,
+      marketAction: 'AVOID',
+      opportunityTier: 'LOW_PRIORITY',
+      reason:
+        analystGate.state === 'REJECT'
+          ? analystGate.reason
+          : financialScore < 42
+            ? 'Long-term financial quality is too weak for a new position.'
+            : 'Risk and liquidity are too weak for a long-term allocation.'
+    };
+  }
+
+  const thesisStrong =
+    thesisScore >= 68 &&
+    financialScore >= 65 &&
+    valuationScore >= 55 &&
+    riskScore >= 48;
+
+  const highConviction =
+    thesisScore >= 76 &&
+    financialScore >= 72 &&
+    valuationScore >= 62 &&
+    evidence.confidence !== 'UNRESOLVED';
+
+  if (thesisStrong) {
+    if (timingState === 'GOOD') {
+      marketAction =
+        analystGate.state === 'VALIDATED' &&
+        highConviction
+          ? 'BUY'
+          : 'ACCUMULATE';
+      opportunityTier = 'PRIORITY_1';
+      reason =
+        marketAction === 'BUY'
+          ? 'The long-term thesis, valuation, risk and current technical timing all support a new position.'
+          : 'The long-term thesis is attractive, but NOMAD prefers staged exposure because conviction or evidence is not yet complete.';
+    } else if (timingState === 'FAIR') {
+      marketAction = 'ACCUMULATE';
+      opportunityTier = 'PRIORITY_1';
+      reason = 'The long-term thesis is attractive. Entry timing is acceptable but not strong enough to justify aggressive deployment.';
+    } else {
+      marketAction = 'WATCH';
+      opportunityTier = 'PRIORITY_2';
+      reason = 'The long-term thesis remains attractive, but current price action is poor or extended. NOMAD prefers to wait for a better entry rather than abandon the thesis.';
+    }
+  } else if (
+    thesisScore >= 58 &&
+    financialScore >= 55
+  ) {
+    marketAction = 'WATCH';
+    opportunityTier = 'PRIORITY_2';
+    reason = 'The company remains a credible long-term candidate, but expected return, evidence or financial quality is not yet strong enough for new capital.';
+  }
+
+  return {
+    framework: 'LONG_TERM_INVESTOR',
+    thesisStatus,
+    financialScore,
+    valuationScore,
+    valuationState: professionalValuationState(valuationScore),
+    riskScore,
+    riskState: professionalRiskState(riskScore),
+    timingScore,
+    timingState,
+    rankingScore,
+    marketAction,
+    opportunityTier,
+    reason
+  };
+}
+
+function professionalShortTermView(
+  candidate,
+  analystGate,
+  evidence
+) {
+  const priceAction =
+    candidate?.historicalContext
+      ?.priceAction ||
+    null;
+
+  const timingScore =
+    safeNumber(priceAction?.timingScore) ??
+    safeNumber(candidate?.entry?.score) ??
+    0;
+  const riskScore =
+    safeNumber(candidate?.risk?.score) || 0;
+  const dataQuality =
+    safeNumber(candidate?.dataQuality?.score) || 0;
+  const liquidityScore =
+    safeNumber(candidate?.risk?.liquidityScore) || 0;
+  const fundamentalSafety =
+    safeNumber(candidate?.fundamental?.score) || 50;
+  const rewardRisk =
+    safeNumber(priceAction?.rewardRisk);
+  const setup =
+    priceAction?.setup ||
+    'NO_CLEAR_SETUP';
+
+  const rankingScore =
+    decisionRound(
+      decisionClamp(
+        timingScore * 0.50 +
+        riskScore * 0.20 +
+        liquidityScore * 0.12 +
+        dataQuality * 0.10 +
+        fundamentalSafety * 0.08
+      ),
+      2
+    );
+
+  if (!priceAction?.available) {
+    return {
+      framework: 'SHORT_TERM_TRADER',
+      thesisStatus: 'NO_SETUP_DATA',
+      timingScore,
+      timingState: 'UNAVAILABLE',
+      setup,
+      rewardRisk,
+      riskScore,
+      rankingScore,
+      marketAction: 'WATCH',
+      opportunityTier: 'EVIDENCE_RESEARCH',
+      reason: 'Short-term OHLC price-action evidence is unavailable.'
+    };
+  }
+
+  if (
+    setup === 'BREAKDOWN' ||
+    riskScore < 35 ||
+    dataQuality < 60
+  ) {
+    return {
+      framework: 'SHORT_TERM_TRADER',
+      thesisStatus: 'UNFAVORABLE_SETUP',
+      timingScore,
+      timingState: priceAction.timingState,
+      setup,
+      rewardRisk,
+      riskScore,
+      rankingScore,
+      marketAction: 'AVOID',
+      opportunityTier: 'LOW_PRIORITY',
+      reason:
+        setup === 'BREAKDOWN'
+          ? 'Price structure is in a confirmed breakdown state.'
+          : 'Short-term risk or data quality is below the trader framework minimum.'
+    };
+  }
+
+  const actionableSetup =
+    (
+      setup === 'CONFIRMED_BREAKOUT' ||
+      setup === 'TREND_PULLBACK' ||
+      setup === 'UPTREND_CONTINUATION'
+    ) &&
+    timingScore >= 68 &&
+    riskScore >= 45 &&
+    (
+      rewardRisk === null ||
+      rewardRisk >= 1.5
+    );
+
+  if (actionableSetup) {
+    return {
+      framework: 'SHORT_TERM_TRADER',
+      thesisStatus: 'ACTIVE_SETUP',
+      timingScore,
+      timingState: priceAction.timingState,
+      setup,
+      rewardRisk,
+      riskScore,
+      rankingScore,
+      marketAction: 'BUY',
+      opportunityTier: 'PRIORITY_1',
+      reason: 'A defined short-term setup, acceptable risk, liquidity and technical timing support a trade candidate.'
+    };
+  }
+
+  return {
+    framework: 'SHORT_TERM_TRADER',
+    thesisStatus: 'WATCH_SETUP',
+    timingScore,
+    timingState: priceAction.timingState,
+    setup,
+    rewardRisk,
+    riskScore,
+    rankingScore,
+    marketAction: 'WATCH',
+    opportunityTier: 'PRIORITY_2',
+    reason: 'The stock is technically interesting, but the setup or reward-to-risk is not yet strong enough for a new trade.'
+  };
+}
+
+function professionalDecisionView(
+  candidate,
+  analystGate,
+  evidence
+) {
+  return String(candidate?.horizon || 'long_term') === 'short_term'
+    ? professionalShortTermView(candidate, analystGate, evidence)
+    : professionalLongTermView(candidate, analystGate, evidence);
+}
+
 function decisionCanonicalCompanyState(
   candidate
 ) {
@@ -20490,129 +21544,56 @@ function decisionCanonicalCompanyState(
       analystGate
     );
 
-  const legacyAction =
-    String(
-      candidate?.action ||
-      'WAIT'
+  const professional =
+    professionalDecisionView(
+      candidate,
+      analystGate,
+      evidence
     );
 
-  let marketAction = 'WATCH';
-  let opportunityTier =
-    'PRIORITY_2';
-  let researchState =
-    'COMPLETE';
-  let reason =
-    candidate?.actionReason ||
-    'The company remains under review.';
+  const researchState =
+    professional.opportunityTier ===
+      'EVIDENCE_RESEARCH'
+      ? 'ACTIVE'
+      : 'COMPLETE';
 
-  if (
-    analystGate.state ===
-      'RESEARCHING'
-  ) {
-    marketAction = 'WATCH';
-    opportunityTier =
-      'EVIDENCE_RESEARCH';
-    researchState = 'ACTIVE';
-    reason = analystGate.reason;
-  } else if (
-    analystGate.state === 'REJECT' ||
-    legacyAction === 'AVOID'
-  ) {
-    marketAction = 'AVOID';
-    opportunityTier =
-      'LOW_PRIORITY';
-    reason =
-      analystGate.state === 'REJECT'
-        ? analystGate.reason
-        : (
-            candidate?.actionReason ||
-            'The current risk/reward does not pass the analyst standard.'
-          );
-  } else if (
-    analystGate.state === 'VALIDATED' &&
-    legacyAction === 'BUY_NOW'
-  ) {
-    marketAction = 'BUY';
-    opportunityTier =
-      'PRIORITY_1';
-    reason =
-      'Validated analyst evidence and current entry/risk conditions support a new position.';
-  } else if (
-    analystGate.state === 'VALIDATED' &&
-    legacyAction === 'STAGED_BUY'
-  ) {
-    marketAction = 'ACCUMULATE';
-    opportunityTier =
-      'PRIORITY_1';
-    reason =
-      'The thesis is validated, but NOMAD prefers staged exposure at the current entry.';
-  } else if (
-    analystGate.state ===
-      'PARTIALLY_VALIDATED' &&
-    (
-      legacyAction === 'BUY_NOW' ||
-      legacyAction === 'STAGED_BUY'
-    )
-  ) {
-    marketAction = 'ACCUMULATE';
-    opportunityTier =
-      'PRIORITY_1';
-    reason = analystGate.reason;
-  } else if (
-    analystGate.state === 'REVIEW' &&
-    (
-      legacyAction === 'BUY_NOW' ||
-      legacyAction === 'STAGED_BUY'
-    )
-  ) {
-    marketAction = 'ACCUMULATE';
-    opportunityTier =
-      'PRIORITY_2';
-    reason = analystGate.reason;
-  } else {
-    marketAction = 'WATCH';
-    opportunityTier =
-      'PRIORITY_2';
-    reason =
-      legacyAction === 'WAIT'
-        ? (
-            candidate?.actionReason ||
-            analystGate.reason
-          )
-        : analystGate.reason;
-  }
+  const marketAction =
+    professional.marketAction;
+
+  const opportunityTier =
+    professional.opportunityTier;
 
   const allocationAllowed =
     (
       marketAction === 'BUY' ||
       marketAction === 'ACCUMULATE'
     ) &&
-    (
-      analystGate.state === 'VALIDATED' ||
-      analystGate.state ===
-        'PARTIALLY_VALIDATED' ||
-      analystGate.state === 'REVIEW'
-    ) &&
     researchState !== 'ACTIVE';
 
   const allocationReason =
     allocationAllowed
-      ? 'The canonical market action is actionable and the evidence state is sufficient for the current shadow allocator.'
+      ? 'The professional framework produced an actionable market state and evidence research is complete.'
       : marketAction === 'WATCH'
         ? 'WATCH is never allowed to receive new capital.'
         : researchState === 'ACTIVE'
           ? 'Automatic evidence research is still active, so allocation is blocked.'
-          : 'The current canonical state does not permit a new-money allocation.';
+          : 'The professional framework does not permit a new-money allocation.';
 
   return {
     securityState:
       'ACTIVE_CANDIDATE',
     evidence,
     analystGate,
+    professional,
     researchState,
     marketAction,
     opportunityTier,
-    reason,
+    reason:
+      professional.reason,
+    rankingScore:
+      professional.rankingScore,
+    thesisStatus:
+      professional.thesisStatus,
     allocationPermission: {
       allowed:
         allocationAllowed,
@@ -20643,32 +21624,14 @@ function decisionCenterCandidateView(
 
   const rankScore =
     decisionRound(
+      safeNumber(
+        canonicalState.rankingScore
+      ) ??
       (
         safeNumber(
           candidate?.overallScore
         ) ||
         0
-      ) +
-      (
-        canonicalState.opportunityTier ===
-          'PRIORITY_1'
-          ? 5
-          : canonicalState.opportunityTier ===
-              'PRIORITY_2'
-            ? 2
-            : 0
-      ) +
-      Math.min(
-        4,
-        canonicalState.evidence.score /
-          100 *
-          4
-      ) +
-      Math.min(
-        2,
-        coverage /
-          100 *
-          2
       ),
       2
     );
@@ -20723,6 +21686,10 @@ function decisionCenterSummary(
       canonical.analystGate,
     canonicalState:
       canonical,
+    professional:
+      canonical.professional || null,
+    thesisStatus:
+      canonical.thesisStatus || null,
     allocationPermission:
       canonical.allocationPermission,
     opportunityRankScore:
@@ -23524,6 +24491,7 @@ async function runDecisionLab(
             );
 
           const candidate = {
+            horizon,
             symbol:
               item.row.symbol,
             companyName:
@@ -24424,6 +25392,20 @@ function runDecisionEngineSelfTests() {
     companyName: 'Validated Company',
     sector: 'Engineering',
     price: 100,
+    horizon: 'long_term',
+    valuation: { score: 78 },
+    risk: { score: 72, liquidityScore: 80 },
+    dataQuality: { score: 90 },
+    historicalContext: {
+      available: true,
+      priceAction: {
+        available: true,
+        timingScore: 74,
+        timingState: 'GOOD',
+        setup: 'TREND_PULLBACK',
+        rewardRisk: 2
+      }
+    },
     analystCore: {
       company: {
         financialSector: false
@@ -24620,7 +25602,17 @@ function runDecisionEngineSelfTests() {
     ...validatedDecisionCandidate,
     symbol: 'WATCHONLY',
     action: 'WAIT',
-    actionReason: 'Synthetic watch state.'
+    actionReason: 'Synthetic watch state.',
+    historicalContext: {
+      available: true,
+      priceAction: {
+        available: true,
+        timingScore: 35,
+        timingState: 'RISKY',
+        setup: 'NO_CLEAR_SETUP',
+        rewardRisk: 0.7
+      }
+    }
   };
 
   const watchBoard =
@@ -24788,6 +25780,132 @@ function runDecisionEngineSelfTests() {
     marketPulseSynthetic.breadth,
     { advancers: 1, decliners: 1, unchanged: 1 },
     'market breadth must use the canonical Official PSX active-equity scope'
+  );
+
+  const syntheticPriceRows = [];
+  for (let index = 0; index < 80; index++) {
+    const base = 100 + index * 0.35;
+    syntheticPriceRows.push({
+      date: '2026-01-' + String((index % 28) + 1).padStart(2, '0'),
+      open: base - 0.5,
+      high: base + 1.2,
+      low: base - 1.0,
+      close: base + 0.4,
+      volume: 100000 + index * 1000
+    });
+  }
+
+  const professionalPA =
+    buildProfessionalPriceAction(
+      syntheticPriceRows,
+      {
+        price: syntheticPriceRows[syntheticPriceRows.length - 1].close,
+        sma20: 122,
+        sma50: 116,
+        sma200: 105,
+        rsi14: 58,
+        macdHistogram: 0.8,
+        volumeRatio20d: 1.3,
+        return1m: 6
+      }
+    );
+
+  assert.equal(
+    professionalPA.available,
+    true,
+    'professional price-action engine must analyze valid OHLC history'
+  );
+
+  assert.ok(
+    ['GOOD', 'FAIR', 'POOR', 'RISKY'].includes(
+      professionalPA.timingState
+    ),
+    'professional price-action engine must return a timing state'
+  );
+
+  const longTermProfessionalCandidate = {
+    ...validatedDecisionCandidate,
+    horizon: 'long_term',
+    valuation: { score: 78 },
+    risk: { score: 72, liquidityScore: 80 },
+    dataQuality: { score: 90 },
+    historicalContext: {
+      available: true,
+      priceAction: {
+        available: true,
+        timingScore: 76,
+        timingState: 'GOOD',
+        setup: 'TREND_PULLBACK',
+        rewardRisk: 2
+      }
+    }
+  };
+
+  const longTermProfessionalState =
+    decisionCanonicalCompanyState(
+      longTermProfessionalCandidate
+    );
+
+  assert.equal(
+    longTermProfessionalState.professional.framework,
+    'LONG_TERM_INVESTOR',
+    'long-term mode must use the dedicated investor framework'
+  );
+
+  assert.ok(
+    ['BUY', 'ACCUMULATE'].includes(
+      longTermProfessionalState.marketAction
+    ),
+    'strong long-term thesis with good timing must be actionable'
+  );
+
+  const poorTimingLongTerm =
+    decisionCanonicalCompanyState({
+      ...longTermProfessionalCandidate,
+      historicalContext: {
+        available: true,
+        priceAction: {
+          available: true,
+          timingScore: 35,
+          timingState: 'RISKY',
+          setup: 'NO_CLEAR_SETUP',
+          rewardRisk: 0.7
+        }
+      }
+    });
+
+  assert.equal(
+    poorTimingLongTerm.marketAction,
+    'WATCH',
+    'poor long-term timing should wait for entry rather than destroy a strong thesis'
+  );
+
+  const shortTermProfessionalState =
+    decisionCanonicalCompanyState({
+      ...longTermProfessionalCandidate,
+      horizon: 'short_term',
+      historicalContext: {
+        available: true,
+        priceAction: {
+          available: true,
+          timingScore: 82,
+          timingState: 'GOOD',
+          setup: 'CONFIRMED_BREAKOUT',
+          rewardRisk: 2.2
+        }
+      }
+    });
+
+  assert.equal(
+    shortTermProfessionalState.professional.framework,
+    'SHORT_TERM_TRADER',
+    'short-term mode must use the dedicated trader framework'
+  );
+
+  assert.equal(
+    shortTermProfessionalState.marketAction,
+    'BUY',
+    'confirmed short-term setup with acceptable reward-to-risk must be actionable'
   );
 
   console.log(
@@ -41311,6 +42429,10 @@ function renderOpportunityList(
           item.analyst ||
           {};
 
+        const professional =
+          item.professional ||
+          {};
+
         return (
           '<div class="opportunityRow">' +
           '<div class="opportunityRank">#' +
@@ -41371,6 +42493,31 @@ function renderOpportunityList(
                   analyst.extendedCoveragePct,
                   0
                 ) + '%'
+              : ''
+          ) +
+          (
+            professional.thesisStatus
+              ? ' · Thesis ' +
+                escapeHtml(
+                  professional.thesisStatus
+                )
+              : ''
+          ) +
+          (
+            professional.timingState
+              ? ' · Timing ' +
+                escapeHtml(
+                  professional.timingState
+                )
+              : ''
+          ) +
+          (
+            professional.setup &&
+            professional.framework === 'SHORT_TERM_TRADER'
+              ? ' · Setup ' +
+                escapeHtml(
+                  professional.setup
+                )
               : ''
           ) +
           '</div>' +
