@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.2.1';
+const VERSION = '0.9.2.2';
 
 
 const SUPABASE_URL =
@@ -21690,6 +21690,9 @@ function decisionCenterSummary(
       canonical.thesisStatus || null,
     allocationPermission:
       canonical.allocationPermission,
+    profileSuitability:
+      candidate.profileSuitability ||
+      null,
     opportunityRankScore:
       candidate.opportunityRankScore,
     overallScore:
@@ -21990,6 +21993,119 @@ async function buildDecisionPortfolioContext(
   }
 }
 
+function decisionProfileSuitability(
+  candidate,
+  riskPolicy
+) {
+  const issues = [];
+
+  if (
+    candidate?.recommendationEligible ===
+      false
+  ) {
+    issues.push(
+      'This security is not eligible for NOMAD new-money recommendations.'
+    );
+  }
+
+  if (
+    (candidate?.statusCodes || [])
+      .includes('NC')
+  ) {
+    issues.push(
+      'PSX non-compliant-segment status is present.'
+    );
+  }
+
+  const avgVolume =
+    safeNumber(
+      candidate?.averageVolume30d
+    );
+
+  if (
+    avgVolume === null ||
+    avgVolume <
+      riskPolicy.minAverageVolume30d
+  ) {
+    issues.push(
+      '30-day liquidity is below the selected risk profile minimum.'
+    );
+  }
+
+  const volatility =
+    safeNumber(
+      candidate?.historicalContext
+        ?.technical
+        ?.annualizedVolatility20dPct
+    );
+
+  if (
+    volatility !== null &&
+    volatility >
+      riskPolicy.maxAnnualizedVolatilityPct
+  ) {
+    issues.push(
+      'Recent annualized volatility exceeds the selected risk profile limit.'
+    );
+  }
+
+  if (
+    safeNumber(
+      candidate?.dataQuality?.score
+    ) <
+      riskPolicy.minDataQualityScore
+  ) {
+    issues.push(
+      'Data quality is below the selected risk profile minimum.'
+    );
+  }
+
+  if (
+    safeNumber(
+      candidate?.risk?.score
+    ) <
+      riskPolicy.minRiskScore
+  ) {
+    issues.push(
+      'Risk quality is below the selected risk profile minimum.'
+    );
+  }
+
+  return {
+    state:
+      issues.length
+        ? 'NOT_SUITABLE'
+        : 'SUITABLE',
+    issues,
+    profileId:
+      riskPolicy.id,
+    thresholds: {
+      minAverageVolume30d:
+        riskPolicy.minAverageVolume30d,
+      maxAnnualizedVolatilityPct:
+        riskPolicy.maxAnnualizedVolatilityPct,
+      minDataQualityScore:
+        riskPolicy.minDataQualityScore,
+      minRiskScore:
+        riskPolicy.minRiskScore
+    },
+    observations: {
+      averageVolume30d:
+        avgVolume,
+      annualizedVolatility20dPct:
+        volatility,
+      dataQualityScore:
+        safeNumber(
+          candidate?.dataQuality?.score
+        ),
+      riskScore:
+        safeNumber(
+          candidate?.risk?.score
+        )
+    }
+  };
+}
+
 function decisionCenterTargetPositionCount(
   totalCapitalPkr,
   riskPolicy
@@ -22159,20 +22275,38 @@ function decisionCenterAllocationCandidatePool(
 
   const eligible =
     all
+      .map(
+        item => ({
+          item,
+          profileSuitability:
+            item?.profileSuitability ||
+            decisionProfileSuitability(
+              item,
+              riskPolicy
+            )
+        })
+      )
       .filter(
-        item =>
-          item?.canonicalState
+        wrapped =>
+          wrapped.item?.canonicalState
             ?.allocationPermission
             ?.allowed === true &&
+          wrapped.profileSuitability
+            ?.state === 'SUITABLE' &&
           (
-            item.canonicalState
+            wrapped.item.canonicalState
               ?.marketAction === 'BUY' ||
-            item.canonicalState
+            wrapped.item.canonicalState
               ?.marketAction === 'ACCUMULATE'
           )
       )
       .map(
-        item => {
+        wrapped => {
+          const item =
+            wrapped.item;
+
+          const profileSuitability =
+            wrapped.profileSuitability;
           const action =
             item.canonicalState
               .marketAction;
@@ -22259,6 +22393,7 @@ function decisionCenterAllocationCandidatePool(
 
           return {
             ...item,
+            profileSuitability,
             allocationTier:
               tier,
             allocationStrengthMultiplier,
@@ -24257,6 +24392,9 @@ async function runSingleStockStrategy(
     horizon,
     riskProfile:
       risk,
+    recommendationEligible:
+      marketRow.recommendationEligible ===
+        true,
     symbol:
       canonicalSymbol,
     companyName:
@@ -24328,84 +24466,20 @@ async function runSingleStockStrategy(
       candidate
     );
 
-  const volatility =
-    safeNumber(
-      historicalContext
-        ?.technical
-        ?.annualizedVolatility20dPct
+  const profileSuitability =
+    decisionProfileSuitability(
+      candidate,
+      riskPolicy
     );
 
-  const avgVolume =
-    safeNumber(
-      marketRow.averageVolume30d
-    );
+  candidate.profileSuitability =
+    profileSuitability;
 
-  const suitabilityIssues = [];
-
-  if (
-    marketRow.recommendationEligible !==
-      true
-  ) {
-    suitabilityIssues.push(
-      'This security is not eligible for NOMAD new-money recommendations.'
-    );
-  }
-
-  if (
-    (marketRow.statusCodes || [])
-      .includes('NC')
-  ) {
-    suitabilityIssues.push(
-      'PSX non-compliant-segment status is present.'
-    );
-  }
-
-  if (
-    avgVolume === null ||
-    avgVolume <
-      riskPolicy.minAverageVolume30d
-  ) {
-    suitabilityIssues.push(
-      '30-day liquidity is below the selected risk profile minimum.'
-    );
-  }
-
-  if (
-    volatility !== null &&
-    volatility >
-      riskPolicy.maxAnnualizedVolatilityPct
-  ) {
-    suitabilityIssues.push(
-      'Recent annualized volatility exceeds the selected risk profile limit.'
-    );
-  }
-
-  if (
-    safeNumber(
-      dataQuality.score
-    ) <
-      riskPolicy.minDataQualityScore
-  ) {
-    suitabilityIssues.push(
-      'Data quality is below the selected risk profile minimum.'
-    );
-  }
-
-  if (
-    safeNumber(
-      riskScore.score
-    ) <
-      riskPolicy.minRiskScore
-  ) {
-    suitabilityIssues.push(
-      'Risk quality is below the selected risk profile minimum.'
-    );
-  }
+  const suitabilityIssues =
+    profileSuitability.issues;
 
   const riskSuitability =
-    suitabilityIssues.length
-      ? 'NOT_SUITABLE'
-      : 'SUITABLE';
+    profileSuitability.state;
 
   const portfolioContext =
     await buildDecisionPortfolioContext(
@@ -24573,22 +24647,9 @@ async function runSingleStockStrategy(
         )
     },
     riskSuitability: {
-      state:
-        riskSuitability,
-      issues:
-        suitabilityIssues,
+      ...profileSuitability,
       profile:
-        risk,
-      thresholds: {
-        minAverageVolume30d:
-          riskPolicy.minAverageVolume30d,
-        maxAnnualizedVolatilityPct:
-          riskPolicy.maxAnnualizedVolatilityPct,
-        minDataQualityScore:
-          riskPolicy.minDataQualityScore,
-        minRiskScore:
-          riskPolicy.minRiskScore
-      }
+        risk
     },
     evidence:
       canonical.evidence,
@@ -25226,6 +25287,9 @@ async function runDecisionLab(
 
           const candidate = {
             horizon,
+            recommendationEligible:
+              item.row.recommendationEligible ===
+                true,
             symbol:
               item.row.symbol,
             companyName:
@@ -25295,6 +25359,12 @@ async function runDecisionLab(
           candidate.canonicalState =
             decisionCanonicalCompanyState(
               candidate
+            );
+
+          candidate.profileSuitability =
+            decisionProfileSuitability(
+              candidate,
+              riskPolicy
             );
 
           return candidate;
@@ -43491,6 +43561,16 @@ function renderOpportunityList(
               : ''
           ) +
           (
+            item.profileSuitability?.state
+              ? ' · Profile ' +
+                escapeHtml(
+                  item.profileSuitability.state === 'SUITABLE'
+                    ? 'SUITABLE'
+                    : 'NOT SUITABLE'
+                )
+              : ''
+          ) +
+          (
             professional.setup &&
             professional.framework === 'SHORT_TERM_TRADER'
               ? ' · Setup ' +
@@ -43729,9 +43809,15 @@ function renderStockStrategy(
       )
     ) +
     strategyMetricCard(
-      'Risk',
+      'Company risk',
       strategyValue(
         risk.state
+      )
+    ) +
+    strategyMetricCard(
+      'Your risk fit',
+      strategyValue(
+        suitability.state
       )
     ) +
     strategyMetricCard(
@@ -45004,6 +45090,8 @@ module.exports.decisionEngine = {
     decisionCenterAnalystGate,
   canonicalState:
     decisionCanonicalCompanyState,
+  profileSuitability:
+    decisionProfileSuitability,
   candidateAction:
     decisionCandidateAction
 };
