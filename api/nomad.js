@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.3.2.3';
+const VERSION = '0.9.3.2.4';
 
 
 const SUPABASE_URL =
@@ -7644,6 +7644,194 @@ async function getLiveForContext(
     ],
     context.canonicalSymbol
   );
+}
+
+async function getOfficialLivePriceFallback(
+  context,
+  marketStatus = null,
+  fallbackReason = null
+) {
+  const snapshot =
+    await getPSXCompanySnapshot(
+      context.canonicalSymbol
+    );
+
+  const quote =
+    snapshot?.quote ||
+    {};
+
+  const price =
+    safeNumber(
+      quote.price
+    );
+
+  if (
+    price === null ||
+    price <= 0
+  ) {
+    bad(
+      `Official PSX price is unavailable for ${context.canonicalSymbol}.`,
+      502
+    );
+  }
+
+  const timestamp =
+    quote.asOf ||
+    snapshot?.fetchedAt ||
+    new Date()
+      .toISOString();
+
+  const timestampValue =
+    Date.parse(
+      timestamp
+    );
+
+  const ageSeconds =
+    Number.isFinite(
+      timestampValue
+    )
+      ? Math.max(
+          0,
+          Math.round(
+            (
+              Date.now() -
+              timestampValue
+            ) /
+            1000
+          )
+        )
+      : null;
+
+  const closed =
+    Boolean(
+      marketStatus?.known &&
+      !marketStatus.isOpen
+    );
+
+  return {
+    symbol:
+      context.canonicalSymbol,
+
+    providerSymbol:
+      context.canonicalSymbol,
+
+    provider:
+      'Official PSX Data Portal',
+
+    sourceType:
+      'Official PSX company quote',
+
+    marketStatus:
+      marketStatus ||
+      {
+        known: false,
+        isOpen: false,
+        status: 'UNKNOWN',
+        statusText: 'Market status unavailable',
+        holidayName: null
+      },
+
+    feedState:
+      closed
+        ? 'CLOSED'
+        : 'DELAYED',
+
+    feedLabel:
+      closed
+        ? 'Official PSX closing price'
+        : 'Official PSX fallback',
+
+    fallbackReason:
+      fallbackReason
+        ? String(
+            fallbackReason
+          )
+        : null,
+
+    price,
+
+    timestamp,
+
+    ageSeconds,
+
+    sessionDate:
+      quote.asOfDateKey ||
+      dateKeyFromDate(
+        timestamp
+      ) ||
+      null,
+
+    session: {
+      open:
+        safeNumber(
+          quote.open
+        ),
+
+      high:
+        safeNumber(
+          quote.high
+        ),
+
+      low:
+        safeNumber(
+          quote.low
+        ),
+
+      close:
+        price,
+
+      volume:
+        safeNumber(
+          quote.volume
+        ),
+
+      candles:
+        null
+    },
+
+    data: []
+  };
+}
+
+async function getOverviewLiveForContext(
+  context
+) {
+  let marketStatus = null;
+
+  try {
+    marketStatus =
+      await getPyPSXMarketStatus();
+  } catch {
+    marketStatus =
+      null;
+  }
+
+  // When the market is closed, the completed Official PSX session is
+  // canonical. Do not make an unnecessary pyPSX intraday request.
+  if (
+    marketStatus?.known &&
+    !marketStatus.isOpen
+  ) {
+    return getOfficialLivePriceFallback(
+      context,
+      marketStatus
+    );
+  }
+
+  try {
+    return await getLiveForContext(
+      context
+    );
+  } catch (error) {
+    // pyPSX is secondary. A temporary intraday-provider failure must not
+    // turn an otherwise valid Official PSX quote into a research error.
+    return getOfficialLivePriceFallback(
+      context,
+      marketStatus,
+      error?.message ||
+      'Secondary intraday feed unavailable.'
+    );
+  }
 }
 
 /* =========================================================
@@ -31889,7 +32077,7 @@ async function handler(
         );
 
       const result =
-        await getLiveForContext(
+        await getOverviewLiveForContext(
           context
         );
 
@@ -39420,14 +39608,38 @@ async function refreshLiveOverview(
     if (
       !silent
     ) {
-      $('liveStatus')
-        .innerHTML =
-          '<span class="feedWarning">' +
-          'Latest pyPSX price unavailable: ' +
-          escapeHtml(
-            error.message
-          ) +
-          '</span>';
+      const officialPrice =
+        Number(
+          lastQuoteResult
+            ?.decision
+            ?.price
+        );
+
+      if (
+        Number.isFinite(
+          officialPrice
+        ) &&
+        officialPrice > 0
+      ) {
+        $('liveStatus')
+          .innerHTML =
+            '<span class="feedDot delayed"></span>' +
+            '<span class="feedPrice">Official PSX quote: PKR ' +
+            formatNumber(
+              officialPrice
+            ) +
+            '</span>' +
+            '<span class="feedMeta">Secondary intraday feed unavailable</span>';
+      } else {
+        $('liveStatus')
+          .innerHTML =
+            '<span class="feedWarning">' +
+            'Latest market price unavailable: ' +
+            escapeHtml(
+              error.message
+            ) +
+            '</span>';
+      }
     }
 
     return null;
