@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.2.4';
+const VERSION = '0.9.2.5';
 
 
 const SUPABASE_URL =
@@ -21306,7 +21306,7 @@ function professionalLongTermView(
       timingScore,
       timingState,
       rankingScore,
-      marketAction: 'WATCH',
+      marketAction: 'RESEARCHING',
       opportunityTier: 'EVIDENCE_RESEARCH',
       reason: analystGate.reason
     };
@@ -21351,6 +21351,15 @@ function professionalLongTermView(
     valuationScore >= 62 &&
     evidence.confidence !== 'UNRESOLVED';
 
+  const thesisDescription =
+    thesisStatus === 'STRONG'
+      ? 'strong'
+      : thesisStatus === 'ACCEPTABLE'
+        ? 'acceptable'
+        : thesisStatus === 'MIXED'
+          ? 'mixed'
+          : 'weak';
+
   if (thesisStrong) {
     if (timingState === 'GOOD') {
       marketAction =
@@ -21362,15 +21371,15 @@ function professionalLongTermView(
       reason =
         marketAction === 'BUY'
           ? 'The long-term thesis, valuation, risk and current technical timing all support a new position.'
-          : 'The long-term thesis is attractive, but NOMAD prefers staged exposure because conviction or evidence is not yet complete.';
+          : 'The long-term thesis is ' + thesisDescription + ', but NOMAD prefers staged exposure because conviction or evidence is not yet complete.';
     } else if (timingState === 'FAIR') {
       marketAction = 'ACCUMULATE';
       opportunityTier = 'PRIORITY_1';
-      reason = 'The long-term thesis is attractive. Entry timing is acceptable but not strong enough to justify aggressive deployment.';
+      reason = 'The long-term thesis is ' + thesisDescription + '. Entry timing is acceptable but not strong enough to justify aggressive deployment.';
     } else {
       marketAction = 'WATCH';
       opportunityTier = 'PRIORITY_2';
-      reason = 'The long-term thesis remains attractive, but current price action is poor or extended. NOMAD prefers to wait for a better entry rather than abandon the thesis.';
+      reason = 'The long-term thesis remains ' + thesisDescription + ', but current price action is poor or extended. NOMAD prefers to wait for a better entry rather than abandon the thesis.';
     }
   } else if (
     thesisScore >= 58 &&
@@ -21448,7 +21457,7 @@ function professionalShortTermView(
       rewardRisk,
       riskScore,
       rankingScore,
-      marketAction: 'WATCH',
+      marketAction: 'RESEARCHING',
       opportunityTier: 'EVIDENCE_RESEARCH',
       reason: 'Short-term OHLC price-action evidence is unavailable.'
     };
@@ -21574,10 +21583,10 @@ function decisionCanonicalCompanyState(
   const allocationReason =
     allocationAllowed
       ? 'The professional framework produced an actionable market state and evidence research is complete.'
-      : marketAction === 'WATCH'
-        ? 'WATCH is never allowed to receive new capital.'
-        : researchState === 'ACTIVE'
-          ? 'Automatic evidence research is still active, so allocation is blocked.'
+      : researchState === 'ACTIVE'
+        ? 'Automatic evidence research is still active, so allocation is blocked.'
+        : marketAction === 'WATCH'
+          ? 'WATCH is never allowed to receive new capital.'
           : 'The professional framework does not permit a new-money allocation.';
 
   return {
@@ -22242,6 +22251,339 @@ function decisionCenterDynamicCaps(
   };
 }
 
+function decisionCenterCandidateConviction(
+  candidate
+) {
+  const professional =
+    candidate?.canonicalState
+      ?.professional ||
+    candidate?.professional ||
+    {};
+
+  const evidenceScore =
+    safeNumber(
+      candidate?.canonicalState
+        ?.evidence?.score
+    ) ??
+    safeNumber(
+      candidate?.analyst?.evidenceScore
+    ) ??
+    50;
+
+  const rankingScore =
+    safeNumber(
+      candidate?.opportunityRankScore
+    ) ??
+    safeNumber(
+      professional?.rankingScore
+    ) ??
+    50;
+
+  const riskScore =
+    safeNumber(
+      professional?.riskScore
+    ) ??
+    safeNumber(
+      candidate?.risk?.score
+    ) ??
+    50;
+
+  if (
+    professional?.framework ===
+      'SHORT_TERM_TRADER'
+  ) {
+    const timingScore =
+      safeNumber(
+        professional?.timingScore
+      ) ??
+      safeNumber(
+        candidate?.entry?.score
+      ) ??
+      50;
+
+    const liquidityScore =
+      safeNumber(
+        candidate?.risk?.liquidityScore
+      ) ??
+      50;
+
+    return decisionRound(
+      decisionClamp(
+        rankingScore * 0.25 +
+        timingScore * 0.35 +
+        riskScore * 0.20 +
+        liquidityScore * 0.10 +
+        evidenceScore * 0.10
+      ),
+      2
+    );
+  }
+
+  const financialScore =
+    safeNumber(
+      professional?.financialScore
+    ) ??
+    safeNumber(
+      candidate?.fundamental?.score
+    ) ??
+    50;
+
+  const valuationScore =
+    safeNumber(
+      professional?.valuationScore
+    ) ??
+    safeNumber(
+      candidate?.valuation?.score
+    ) ??
+    50;
+
+  const timingScore =
+    safeNumber(
+      professional?.timingScore
+    ) ??
+    safeNumber(
+      candidate?.entry?.score
+    ) ??
+    50;
+
+  return decisionRound(
+    decisionClamp(
+      rankingScore * 0.30 +
+      financialScore * 0.20 +
+      valuationScore * 0.15 +
+      riskScore * 0.15 +
+      timingScore * 0.10 +
+      evidenceScore * 0.10
+    ),
+    2
+  );
+}
+
+function decisionCenterDeploymentPlan(
+  candidates,
+  targetPositions,
+  riskPolicy
+) {
+  const list =
+    Array.isArray(candidates)
+      ? candidates
+      : [];
+
+  if (!list.length) {
+    return {
+      targetDeploymentPct: 0,
+      intentionalCashReservePct: 100,
+      averageConvictionScore: 0,
+      averageExtendedCoveragePct: 0,
+      reason:
+        'No profile-suitable actionable opportunities passed the professional allocation gate.'
+    };
+  }
+
+  const averageConvictionScore =
+    list.reduce(
+      (sum, candidate) =>
+        sum +
+        (
+          safeNumber(
+            candidate.allocationConvictionScore
+          ) ||
+          decisionCenterCandidateConviction(
+            candidate
+          )
+        ),
+      0
+    ) /
+    list.length;
+
+  const averageExtendedCoveragePct =
+    list.reduce(
+      (sum, candidate) =>
+        sum +
+        (
+          safeNumber(
+            candidate?.canonicalState
+              ?.evidence
+              ?.extendedCoveragePct
+          ) ||
+          0
+        ),
+      0
+    ) /
+    list.length;
+
+  const confidenceValues =
+    list.map(
+      candidate =>
+        String(
+          candidate?.canonicalState
+            ?.evidence
+            ?.confidence ||
+          'LOW'
+        )
+    );
+
+  const mediumOrBetterRatio =
+    confidenceValues.filter(
+      value =>
+        value === 'HIGH' ||
+        value === 'MEDIUM'
+    ).length /
+    list.length;
+
+  let baseDeploymentPct = 0.86;
+
+  if (
+    riskPolicy?.id ===
+      'RISK-CONSERVATIVE-0.1'
+  ) {
+    baseDeploymentPct = 0.76;
+  } else if (
+    riskPolicy?.id ===
+      'RISK-AGGRESSIVE-0.1'
+  ) {
+    baseDeploymentPct = 0.90;
+  }
+
+  const target =
+    Math.max(
+      DECISION_CENTER_MIN_TARGET_POSITIONS,
+      Number(targetPositions) ||
+      DECISION_CENTER_MIN_TARGET_POSITIONS
+    );
+
+  const breadthRatio =
+    Math.min(
+      1,
+      list.length /
+      target
+    );
+
+  let breadthPenalty = 0;
+
+  if (list.length === 1) {
+    breadthPenalty = 0.24;
+  } else if (list.length === 2) {
+    breadthPenalty = 0.15;
+  } else if (breadthRatio < 1) {
+    breadthPenalty =
+      (1 - breadthRatio) *
+      0.10;
+  }
+
+  const evidencePenalty =
+    mediumOrBetterRatio >= 0.99
+      ? 0
+      : mediumOrBetterRatio >= 0.66
+        ? 0.025
+        : 0.08;
+
+  const extendedEvidencePenalty =
+    averageExtendedCoveragePct >= 67
+      ? 0
+      : averageExtendedCoveragePct >= 25
+        ? 0.02
+        : 0.04;
+
+  const convictionAdjustment =
+    Math.max(
+      -0.05,
+      Math.min(
+        0.05,
+        (
+          averageConvictionScore -
+          70
+        ) /
+        300
+      )
+    );
+
+  const minimumDeploymentPct =
+    list.length >= 3
+      ? 0.62
+      : list.length === 2
+        ? 0.42
+        : 0.28;
+
+  const targetDeploymentPct =
+    Math.max(
+      minimumDeploymentPct,
+      Math.min(
+        DECISION_CENTER_MAX_DEPLOYMENT_PCT,
+        baseDeploymentPct +
+        convictionAdjustment -
+        breadthPenalty -
+        evidencePenalty -
+        extendedEvidencePenalty
+      )
+    );
+
+  const roundedDeploymentPct =
+    decisionRound(
+      targetDeploymentPct *
+      100,
+      2
+    );
+
+  const reservePct =
+    decisionRound(
+      100 -
+      roundedDeploymentPct,
+      2
+    );
+
+  const reasons = [];
+
+  if (list.length < target) {
+    reasons.push(
+      'Only ' +
+      list.length +
+      ' suitable actionable idea' +
+      (list.length === 1 ? '' : 's') +
+      ' passed against a target of ' +
+      target +
+      '.'
+    );
+  }
+
+  if (averageExtendedCoveragePct < 67) {
+    reasons.push(
+      'Extended financial validation is incomplete across the funded opportunity set.'
+    );
+  }
+
+  if (averageConvictionScore < 72) {
+    reasons.push(
+      'Average conviction is not high enough to justify maximum deployment.'
+    );
+  }
+
+  if (!reasons.length) {
+    reasons.push(
+      'Opportunity breadth, conviction and evidence support a high deployment level while preserving a deliberate liquidity reserve.'
+    );
+  }
+
+  return {
+    targetDeploymentPct:
+      roundedDeploymentPct,
+    intentionalCashReservePct:
+      reservePct,
+    averageConvictionScore:
+      decisionRound(
+        averageConvictionScore,
+        2
+      ),
+    averageExtendedCoveragePct:
+      decisionRound(
+        averageExtendedCoveragePct,
+        2
+      ),
+    reason:
+      reasons.join(' ')
+  };
+}
+
 function decisionCenterFinancialSectorCandidate(
   candidate
 ) {
@@ -22375,6 +22717,11 @@ function decisionCenterAllocationCandidatePool(
             100 *
             0.18;
 
+          const allocationConvictionScore =
+            decisionCenterCandidateConviction(
+              item
+            );
+
           const allocationStrengthMultiplier =
             actionMultiplier *
             tierMultiplier *
@@ -22406,6 +22753,7 @@ function decisionCenterAllocationCandidatePool(
             profileSuitability,
             allocationTier:
               tier,
+            allocationConvictionScore,
             allocationStrengthMultiplier,
             allocationCapMultiplier
           };
@@ -22495,18 +22843,6 @@ function allocateDecisionCenterOpportunities(
       riskPolicy
     );
 
-  const dynamicCaps =
-    decisionCenterDynamicCaps(
-      targetPositionCount,
-      riskPolicy
-    );
-
-  const deployCap =
-    Math.floor(
-      budgetPaisa *
-      DECISION_CENTER_MAX_DEPLOYMENT_PCT
-    );
-
   const existingSymbolValues =
     portfolioContext?.symbolValues ||
     {};
@@ -22522,6 +22858,38 @@ function allocateDecisionCenterOpportunities(
       targetPositionCount
     );
 
+  const sizingPositionCount =
+    Math.max(
+      DECISION_CENTER_MIN_TARGET_POSITIONS,
+      Math.min(
+        targetPositionCount,
+        Math.max(
+          DECISION_CENTER_MIN_TARGET_POSITIONS,
+          candidates.length
+        )
+      )
+    );
+
+  const dynamicCaps =
+    decisionCenterDynamicCaps(
+      sizingPositionCount,
+      riskPolicy
+    );
+
+  const deploymentPlan =
+    decisionCenterDeploymentPlan(
+      candidates,
+      targetPositionCount,
+      riskPolicy
+    );
+
+  const deployCap =
+    Math.floor(
+      budgetPaisa *
+      deploymentPlan.targetDeploymentPct /
+      100
+    );
+
   if (!candidates.length) {
     return {
       allocations: [],
@@ -22533,8 +22901,7 @@ function allocateDecisionCenterOpportunities(
         ),
       investedPct: 0,
       deploymentCapPct:
-        DECISION_CENTER_MAX_DEPLOYMENT_PCT *
-        100,
+        deploymentPlan.targetDeploymentPct,
       portfolioAware:
         Boolean(
           portfolioContext?.holdingCount
@@ -22546,6 +22913,15 @@ function allocateDecisionCenterOpportunities(
           2
         ),
       targetPositionCount,
+      sizingPositionCount,
+      targetDeploymentPct:
+        deploymentPlan.targetDeploymentPct,
+      intentionalCashReservePct:
+        deploymentPlan.intentionalCashReservePct,
+      averageConvictionScore:
+        deploymentPlan.averageConvictionScore,
+      cashReserveReason:
+        deploymentPlan.reason,
       minimumTargetPositions:
         DECISION_CENTER_MIN_TARGET_POSITIONS,
       maximumTargetPositions:
@@ -22586,9 +22962,11 @@ function allocateDecisionCenterOpportunities(
         Math.max(
           1,
           safeNumber(
-            candidate.opportunityRankScore
+            candidate.allocationConvictionScore
           ) ||
-          1
+          decisionCenterCandidateConviction(
+            candidate
+          )
         ) *
         candidate.allocationStrengthMultiplier,
       0
@@ -22634,9 +23012,11 @@ function allocateDecisionCenterOpportunities(
       Math.max(
         1,
         safeNumber(
-          candidate.opportunityRankScore
+          candidate.allocationConvictionScore
         ) ||
-        1
+        decisionCenterCandidateConviction(
+          candidate
+        )
       ) *
       candidate.allocationStrengthMultiplier;
 
@@ -22880,6 +23260,8 @@ function allocateDecisionCenterOpportunities(
         candidate.overallScore,
       opportunityRankScore:
         candidate.opportunityRankScore,
+      allocationConvictionScore:
+        candidate.allocationConvictionScore,
       evidenceStrength:
         candidate.analystCore
           ?.coverage
@@ -23198,8 +23580,7 @@ function allocateDecisionCenterOpportunities(
         2
       ),
     deploymentCapPct:
-      DECISION_CENTER_MAX_DEPLOYMENT_PCT *
-      100,
+      deploymentPlan.targetDeploymentPct,
     portfolioAware:
       Boolean(
         portfolioContext?.holdingCount
@@ -23211,6 +23592,15 @@ function allocateDecisionCenterOpportunities(
         2
       ),
     targetPositionCount,
+    sizingPositionCount,
+    targetDeploymentPct:
+      deploymentPlan.targetDeploymentPct,
+    intentionalCashReservePct:
+      deploymentPlan.intentionalCashReservePct,
+    averageConvictionScore:
+      deploymentPlan.averageConvictionScore,
+    cashReserveReason:
+      deploymentPlan.reason,
     minimumTargetPositions:
       DECISION_CENTER_MIN_TARGET_POSITIONS,
     maximumTargetPositions:
@@ -24594,13 +24984,21 @@ async function runSingleStockStrategy(
     canonical.reason;
 
   if (
+    canonical.researchState ===
+      'ACTIVE'
+  ) {
+    personalAction =
+      existingValue > 0
+        ? 'HOLD_RESEARCH'
+        : 'NO_ACTION_YET';
+    personalReason =
+      canonical.reason;
+  } else if (
     riskSuitability ===
       'NOT_SUITABLE'
   ) {
     personalAction =
-      existingValue > 0
-        ? 'DO_NOT_ADD'
-        : 'AVOID_FOR_PROFILE';
+      'DO_NOT_ADD';
     personalReason =
       suitabilityIssues.join(' ');
   } else if (
@@ -24751,6 +25149,19 @@ async function runSingleStockStrategy(
           ?.overallFinancialView
           ?.state ||
         'UNAVAILABLE',
+      headlineView:
+        candidate.analystCore
+          ?.overallFinancialView
+          ?.state ||
+        'UNAVAILABLE',
+      deepValidation:
+        canonical.evidence
+          ?.extendedCoveragePct >= 67
+          ? 'VALIDATED'
+          : canonical.evidence
+              ?.extendedCoveragePct > 0
+            ? 'PARTIAL'
+            : 'INCOMPLETE',
       earningsQuality:
         candidate.analystCore
           ?.views
@@ -25567,7 +25978,7 @@ async function runDecisionLab(
   let headline =
     'No validated Priority 1 allocation is available right now.';
   let reason =
-    'NOMAD keeps opportunities visible. Priority 1 receives normal target sizing; financially validated Priority 2 ideas may receive smaller provisional sizing when that improves diversification without weakening the evidence standard.';
+    'NOMAD keeps opportunities visible. Only canonical BUY or ACCUMULATE states that pass evidence, profile suitability and portfolio-fit gates may receive capital; WATCH, RESEARCHING and AVOID receive PKR 0.';
 
   const dataBlockedCount =
     candidates.filter(
@@ -25623,7 +26034,7 @@ async function runDecisionLab(
         ? 'One validated Priority 1 opportunity is currently actionable.'
         : 'Validated Priority 1 opportunities are currently actionable.';
     reason =
-      'The capital allocator built a portfolio-aware target from the strongest validated opportunities. Priority 1 receives normal sizing, while eligible Priority 2 ideas can receive smaller provisional exposure. Existing holdings, stock caps and sector caps are applied to the combined post-investment portfolio before whole shares are calculated.';
+      'The capital allocator builds a portfolio-aware target from the strongest validated opportunities. Position sizes are conviction-weighted, profile-gated and constrained by stock/sector limits; existing holdings are applied to the combined post-investment portfolio before whole shares are calculated.';
   } else if (
     priorityOneCount > 0
   ) {
@@ -25885,6 +26296,22 @@ async function runDecisionLab(
       targetPositionCount:
         allocation.targetPositionCount ||
         0,
+      sizingPositionCount:
+        allocation.sizingPositionCount ||
+        0,
+      targetDeploymentPct:
+        allocation.targetDeploymentPct ??
+        allocation.deploymentCapPct ??
+        0,
+      intentionalCashReservePct:
+        allocation.intentionalCashReservePct ??
+        0,
+      averageConvictionScore:
+        allocation.averageConvictionScore ??
+        0,
+      cashReserveReason:
+        allocation.cashReserveReason ||
+        '',
       minimumTargetPositions:
         allocation.minimumTargetPositions ||
         DECISION_CENTER_MIN_TARGET_POSITIONS,
@@ -26658,7 +27085,12 @@ function runDecisionEngineSelfTests() {
           index * 5,
         overallScore:
           84 -
-          index * 0.5
+          index * 0.5,
+        valuation: {
+          score:
+            84 -
+            index * 3
+        }
       })
     );
 
@@ -26696,6 +27128,19 @@ function runDecisionEngineSelfTests() {
   assert.ok(
     breadthAllocation.investedPct >= 75,
     'when enough suitable actionable ideas exist, the allocator should deploy most of a PKR 500k balanced budget within its risk caps'
+  );
+
+
+  assert.ok(
+    new Set(
+      breadthAllocation.allocations.map(
+        item =>
+          Math.round(
+            item.principalPkr
+          )
+      )
+    ).size > 1,
+    'professional position sizing should not default every surviving stock to the same rupee weight when conviction differs'
   );
 
   assert.equal(
@@ -26774,6 +27219,25 @@ function runDecisionEngineSelfTests() {
     researchCanonical.allocationPermission.allowed,
     false,
     'active Evidence Research must always block allocation'
+  );
+
+
+  assert.equal(
+    researchCanonical.marketAction,
+    'RESEARCHING',
+    'missing evidence must be represented as RESEARCHING rather than WATCH'
+  );
+
+  assert.ok(
+    breadthAllocation.targetDeploymentPct >= 75 &&
+    breadthAllocation.targetDeploymentPct <= 90,
+    'a broad validated balanced opportunity set should produce an intentional high-but-not-forced deployment target'
+  );
+
+  assert.ok(
+    twoIdeaAllocation.targetDeploymentPct <
+      breadthAllocation.targetDeploymentPct,
+    'a thin two-stock opportunity set must retain more intentional cash than a broad validated set'
   );
 
   assert.ok(
@@ -43752,6 +44216,11 @@ function decisionActionLabel(
       'EVIDENCE RESEARCH',
     EVIDENCE_RESEARCH:
       'EVIDENCE RESEARCH',
+    RESEARCHING: 'RESEARCHING',
+    NO_ACTION_YET: 'NO ACTION YET',
+    HOLD_RESEARCH: 'HOLD / RESEARCH',
+    ADD_CANDIDATE: 'ADD',
+    REVIEW_REDUCE: 'REVIEW / REDUCE',
     WAIT: 'WAIT',
     WAIT_DATA: 'WAIT / DATA',
     DATA_BLOCKED: 'DATA BLOCKED',
@@ -43848,7 +44317,7 @@ function renderOpportunityList(
             item.sector ||
             'Unknown sector'
           ) +
-          ' · Analyst ' +
+          ' · Headline financials ' +
           escapeHtml(
             analyst.financialView ||
             'UNAVAILABLE'
@@ -43981,6 +44450,75 @@ function strategyMetricCard(
   );
 }
 
+function strategyRiskKey(
+  value
+) {
+  const text =
+    String(value || '')
+      .toLowerCase()
+      .replace(/[^a-z0-9 ]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+  if (
+    text.includes('annualized volatility') &&
+    text.includes('profile')
+  ) {
+    return 'profile-volatility';
+  }
+
+  if (
+    text.includes('moving average') &&
+    (
+      text.includes('short') ||
+      text.includes('medium')
+    )
+  ) {
+    return 'moving-average-structure';
+  }
+
+  if (
+    text.includes('fundamental metric coverage')
+  ) {
+    return 'fundamental-coverage';
+  }
+
+  return text;
+}
+
+function uniqueStrategyRisks(
+  values
+) {
+  const seen = new Set();
+  const output = [];
+
+  for (
+    const value
+    of values || []
+  ) {
+    if (!value) {
+      continue;
+    }
+
+    const key =
+      strategyRiskKey(
+        value
+      );
+
+    if (
+      !key ||
+      seen.has(key)
+    ) {
+      continue;
+    }
+
+    seen.add(key);
+    output.push(value);
+  }
+
+  return output;
+}
+
 function renderStockStrategy(
   result
 ) {
@@ -44105,16 +44643,20 @@ function renderStockStrategy(
     actionClass +
     '">Market: ' +
     escapeHtml(
-      professional.marketAction ||
-      'UNRESOLVED'
+      decisionActionLabel(
+        professional.marketAction ||
+        'UNRESOLVED'
+      )
     ) +
     '</span>' +
     '<span class="strategyBadge ' +
     personalClass +
     '">You: ' +
     escapeHtml(
-      personal.action ||
-      'UNRESOLVED'
+      decisionActionLabel(
+        personal.action ||
+        'UNRESOLVED'
+      )
     ) +
     '</span>' +
     '<span class="strategyBadge ' +
@@ -44270,9 +44812,15 @@ function renderStockStrategy(
     '</strong></div>' +
     '</div>' +
     '<div class="strategySection"><h3>Professional evidence</h3>' +
-    '<div class="strategyLine"><span>Financial view</span><strong>' +
+    '<div class="strategyLine"><span>Headline financials</span><strong>' +
     strategyValue(
+      financial.headlineView ||
       financial.overall
+    ) +
+    '</strong></div>' +
+    '<div class="strategyLine"><span>Deep financial validation</span><strong>' +
+    strategyValue(
+      financial.deepValidation
     ) +
     '</strong></div>' +
     '<div class="strategyLine"><span>Earnings quality</span><strong>' +
@@ -44338,15 +44886,11 @@ function renderStockStrategy(
       : [];
 
   const risks =
-    Array.from(
-      new Set(
-        [
-          ...issues,
-          ...(result?.reasons?.risks || []),
-          ...(technical.risks || [])
-        ].filter(Boolean)
-      )
-    ).slice(0, 6);
+    uniqueStrategyRisks([
+      ...issues,
+      ...(result?.reasons?.risks || []),
+      ...(technical.risks || [])
+    ]).slice(0, 6);
 
   if (risks.length) {
     html +=
@@ -44560,6 +45104,16 @@ function renderDecisionAudit(
     [
       'Research target',
       screening.actionableResearchTarget
+    ],
+    [
+      'Target deploy %',
+      result?.allocationDiagnostics
+        ?.targetDeploymentPct
+    ],
+    [
+      'Avg conviction',
+      result?.allocationDiagnostics
+        ?.averageConvictionScore
     ],
     [
       'Evidence research',
@@ -44875,6 +45429,42 @@ function renderShadowDecision(
         1
       ) +
       '% per sector.</div>';
+
+    if (
+      result?.allocationDiagnostics
+        ?.targetDeploymentPct !==
+        undefined
+    ) {
+      html +=
+        '<div class="decisionMetaLine"><strong>Intentional deployment:</strong> target ' +
+        formatNumber(
+          result.allocationDiagnostics
+            .targetDeploymentPct ||
+          0,
+          1
+        ) +
+        '% deployed · deliberate cash reserve ' +
+        formatNumber(
+          result.allocationDiagnostics
+            .intentionalCashReservePct ||
+          0,
+          1
+        ) +
+        '% · average conviction ' +
+        formatNumber(
+          result.allocationDiagnostics
+            .averageConvictionScore ||
+          0,
+          1
+        ) +
+        '/100. ' +
+        escapeHtml(
+          result.allocationDiagnostics
+            .cashReserveReason ||
+          ''
+        ) +
+        '</div>';
+    }
 
     if (
       result?.screening
