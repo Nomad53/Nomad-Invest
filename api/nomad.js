@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.2.6';
+const VERSION = '0.9.3.0';
 
 
 const SUPABASE_URL =
@@ -16414,6 +16414,247 @@ function professionalNearestLevels(price, swings, fallbackSupport, fallbackResis
   };
 }
 
+function buildProfessionalTradePlan(
+  setup,
+  metrics = {}
+) {
+  const price = safeNumber(metrics.price);
+  const atr = safeNumber(metrics.atr14);
+  const support = safeNumber(metrics.support);
+  const resistance = safeNumber(metrics.resistance);
+  const breakoutLevel = safeNumber(metrics.breakoutLevel);
+  const sma20 = safeNumber(metrics.sma20);
+  const sma50 = safeNumber(metrics.sma50);
+
+  if (
+    price === null ||
+    price <= 0 ||
+    atr === null ||
+    atr <= 0
+  ) {
+    return {
+      complete: false,
+      state: 'INCOMPLETE',
+      reason: 'A current price and valid ATR are required to define a professional trade plan.'
+    };
+  }
+
+  if (
+    setup === 'BREAKDOWN' ||
+    setup === 'DOWNTREND' ||
+    setup === 'NO_CLEAR_SETUP'
+  ) {
+    return {
+      complete: false,
+      state: 'NO_LONG_SETUP',
+      reason: 'No professional long trade plan is created while price structure is bearish or lacks a clear setup.'
+    };
+  }
+
+  let entryLow = null;
+  let entryHigh = null;
+  let stop = null;
+  let invalidation = null;
+  let planStyle = null;
+
+  if (
+    setup === 'CONFIRMED_BREAKOUT' ||
+    setup === 'UNCONFIRMED_BREAKOUT'
+  ) {
+    const trigger = breakoutLevel !== null
+      ? breakoutLevel
+      : price;
+
+    entryLow = Math.max(
+      trigger,
+      price - atr * 0.15
+    );
+    entryHigh = Math.max(
+      price,
+      trigger
+    ) + atr * 0.35;
+
+    const structuralStop =
+      support !== null && support < entryLow
+        ? support - atr * 0.15
+        : null;
+
+    const breakoutStop =
+      trigger - atr * 1.0;
+
+    stop =
+      structuralStop !== null &&
+      structuralStop > breakoutStop
+        ? structuralStop
+        : breakoutStop;
+
+    invalidation =
+      'Breakout thesis fails if price closes back below the breakout/stop zone.';
+    planStyle =
+      setup === 'CONFIRMED_BREAKOUT'
+        ? 'BREAKOUT_ENTRY'
+        : 'CONDITIONAL_BREAKOUT_ENTRY';
+  } else if (setup === 'TREND_PULLBACK') {
+    const movingAverageAnchor =
+      [sma20, sma50]
+        .filter(
+          value =>
+            value !== null &&
+            value > 0 &&
+            value <= price * 1.04
+        )
+        .sort((a, b) => b - a)[0] ||
+      null;
+
+    const anchor =
+      movingAverageAnchor !== null
+        ? movingAverageAnchor
+        : price;
+
+    entryLow = Math.min(
+      price,
+      anchor
+    ) - atr * 0.15;
+    entryHigh = price + atr * 0.20;
+
+    stop =
+      support !== null && support < entryLow
+        ? support - atr * 0.30
+        : entryLow - atr * 1.20;
+
+    invalidation =
+      'Pullback thesis fails if price loses the defined support/stop zone.';
+    planStyle = 'PULLBACK_ENTRY';
+  } else if (setup === 'UPTREND_CONTINUATION') {
+    entryLow = price - atr * 0.25;
+    entryHigh = price + atr * 0.20;
+    stop =
+      support !== null && support < entryLow
+        ? support - atr * 0.25
+        : entryLow - atr * 1.25;
+    invalidation =
+      'Continuation thesis fails if price breaks the defined support/stop zone.';
+    planStyle = 'CONTINUATION_ENTRY';
+  }
+
+  if (
+    entryLow === null ||
+    entryHigh === null ||
+    stop === null ||
+    !(stop < entryLow)
+  ) {
+    return {
+      complete: false,
+      state: 'INCOMPLETE',
+      reason: 'NOMAD could not define a coherent entry and invalidation level from the current structure.'
+    };
+  }
+
+  const entryReference =
+    (entryLow + entryHigh) / 2;
+
+  const riskPerShare =
+    entryReference - stop;
+
+  if (
+    !Number.isFinite(riskPerShare) ||
+    riskPerShare <= 0
+  ) {
+    return {
+      complete: false,
+      state: 'INCOMPLETE',
+      reason: 'The calculated stop does not create a valid positive per-share risk.'
+    };
+  }
+
+  let target1 =
+    resistance !== null &&
+    resistance > entryReference
+      ? resistance
+      : null;
+
+  let targetSource =
+    target1 !== null
+      ? 'STRUCTURAL_RESISTANCE'
+      : null;
+
+  // A confirmed breakout may legitimately have no nearby overhead swing level.
+  // In that case NOMAD may display a 2R planning objective, but labels it as a
+  // risk-multiple projection rather than pretending it is observed resistance.
+  if (
+    target1 === null &&
+    setup === 'CONFIRMED_BREAKOUT'
+  ) {
+    target1 =
+      entryReference +
+      riskPerShare * 2;
+    targetSource = 'R_MULTIPLE_PROJECTION';
+  }
+
+  const rewardRisk =
+    target1 !== null &&
+    target1 > entryReference
+      ? (target1 - entryReference) /
+        riskPerShare
+      : null;
+
+  const target2 =
+    target1 !== null &&
+    rewardRisk !== null &&
+    rewardRisk >= DECISION_TRADER_MIN_REWARD_RISK
+      ? Math.max(
+          target1 + atr,
+          entryReference +
+            riskPerShare * 2.5
+        )
+      : null;
+
+  return {
+    complete:
+      rewardRisk !== null,
+    state:
+      rewardRisk === null
+        ? 'TARGET_UNRESOLVED'
+        : rewardRisk >= DECISION_TRADER_MIN_REWARD_RISK
+          ? 'DEFINED'
+          : 'POOR_REWARD_RISK',
+    style: planStyle,
+    entryLow:
+      decisionRound(entryLow, 4),
+    entryHigh:
+      decisionRound(entryHigh, 4),
+    entryReference:
+      decisionRound(entryReference, 4),
+    stop:
+      decisionRound(stop, 4),
+    invalidation,
+    target1:
+      decisionRound(target1, 4),
+    target2:
+      decisionRound(target2, 4),
+    targetSource,
+    riskPerShare:
+      decisionRound(riskPerShare, 4),
+    riskPct:
+      decisionRound(
+        entryReference > 0
+          ? riskPerShare /
+            entryReference *
+            100
+          : null,
+        2
+      ),
+    rewardRisk:
+      decisionRound(rewardRisk, 2),
+    reason:
+      rewardRisk === null
+        ? 'No defensible target is currently available, so the setup is incomplete.'
+        : rewardRisk < DECISION_TRADER_MIN_REWARD_RISK
+          ? 'The defined setup does not meet NOMAD\'s minimum reward-to-risk requirement.'
+          : 'Entry, invalidation and target are all defined from current price structure and volatility.'
+  };
+}
+
 function buildProfessionalPriceAction(
   rows,
   metrics = {}
@@ -16688,6 +16929,23 @@ function buildProfessionalPriceAction(
     setup = 'DOWNTREND';
   }
 
+  const tradePlan =
+    buildProfessionalTradePlan(
+      setup,
+      {
+        price,
+        atr14: latestAtr,
+        support: levels.support,
+        resistance: levels.resistance,
+        breakoutLevel:
+          Number.isFinite(prior20High)
+            ? prior20High
+            : null,
+        sma20,
+        sma50
+      }
+    );
+
   return {
     available: true,
     asOf: latest?.date || null,
@@ -16727,6 +16985,7 @@ function buildProfessionalPriceAction(
     timingScore:
       decisionRound(score, 2),
     timingState,
+    tradePlan,
     positives:
       uniqueTextValues(positives),
     risks:
@@ -17249,6 +17508,8 @@ function buildHistoricalContext(
   return {
     symbol,
     available: true,
+    contextSchemaVersion:
+      DECISION_HISTORICAL_CONTEXT_SCHEMA_VERSION,
     asOf:
       rows[rows.length - 1]?.date ||
       null,
@@ -17361,6 +17622,7 @@ function buildHistoricalContext(
           2
         )
     },
+    priceAction,
     range52: {
       high:
         roundMemoryNumber(
@@ -19477,7 +19739,7 @@ const DECISION_MODELS = {
     }
   },
   short_term: {
-    id: 'NOMAD-ST-PRO-0.9.1',
+    id: 'NOMAD-ST-PRO-0.9.3',
     horizon: 'short_term',
     status: 'SHADOW_UNVALIDATED',
     realMoneyEligible: false,
@@ -19543,6 +19805,16 @@ const DECISION_CENTER_MIN_ANALYST_COVERAGE = 65;
 const DECISION_CENTER_MAX_DEPLOYMENT_PCT = 0.90;
 const DECISION_CENTER_MIN_TARGET_POSITIONS = 3;
 const DECISION_CENTER_MAX_TARGET_POSITIONS = 8;
+
+// 0.9.3.0 Trader Brain Foundation. Long-term 0.9.2.6 logic is intentionally frozen.
+const DECISION_HISTORICAL_CONTEXT_SCHEMA_VERSION = 'HC-0.9.3.0';
+const DECISION_TRADER_MIN_VALID_SESSIONS = 60;
+const DECISION_TRADER_MIN_REWARD_RISK = 1.5;
+const DECISION_TRADER_RISK_BUDGET_PCT = {
+  conservative: 0.0075,
+  balanced: 0.01,
+  aggressive: 0.015
+};
 
 function decisionClamp(
   value,
@@ -20705,6 +20977,65 @@ function decisionScreeningScore(
   );
 }
 
+function decisionTraderScreeningScore(
+  row,
+  eligibleRows
+) {
+  const liquidity =
+    decisionPercentile(
+      row?.averageVolume30d,
+      (eligibleRows || []).map(
+        item => item.averageVolume30d
+      ),
+      true
+    );
+
+  const size =
+    decisionPercentile(
+      row?.marketCap,
+      (eligibleRows || []).map(
+        item => item.marketCap
+      ),
+      true
+    );
+
+  const dayChange =
+    safeNumber(row?.dayChangePct);
+  const oneYear =
+    safeNumber(row?.change1yPct);
+
+  let moveQuality = 55;
+  if (dayChange !== null) {
+    const absoluteMove = Math.abs(dayChange);
+    if (absoluteMove <= 5) {
+      moveQuality = 72;
+    } else if (absoluteMove <= 10) {
+      moveQuality = 62;
+    } else if (absoluteMove <= 15) {
+      moveQuality = 48;
+    } else {
+      moveQuality = 30;
+    }
+  }
+
+  let stability = 55;
+  if (oneYear !== null) {
+    if (oneYear >= -30 && oneYear <= 120) {
+      stability = 68;
+    } else if (oneYear < -50 || oneYear > 250) {
+      stability = 35;
+    }
+  }
+
+  return decisionRound(
+    liquidity * 0.50 +
+    size * 0.20 +
+    moveQuality * 0.20 +
+    stability * 0.10,
+    2
+  );
+}
+
 function decisionCandidateAction(
   candidate,
   model,
@@ -21238,27 +21569,21 @@ function professionalLongTermView(
     safeNumber(candidate?.valuation?.score) || 0;
   const riskScore =
     safeNumber(candidate?.risk?.score) || 0;
+  // Long-term 0.9.2.6 behavior is intentionally frozen. The shared
+  // historical context now exposes richer priceAction for the Trader brain,
+  // but the Investor brain continues to use its pre-existing entry score so
+  // short-term plumbing cannot silently change long-term rankings/actions.
   const timingScore =
-    safeNumber(
-      candidate?.historicalContext
-        ?.priceAction
-        ?.timingScore
-    ) ??
     safeNumber(candidate?.entry?.score) ??
     50;
   const timingState =
-    candidate?.historicalContext
-      ?.priceAction
-      ?.timingState ||
-    (
-      timingScore >= 72
-        ? 'GOOD'
-        : timingScore >= 58
-          ? 'FAIR'
-          : timingScore >= 42
-            ? 'POOR'
-            : 'RISKY'
-    );
+    timingScore >= 72
+      ? 'GOOD'
+      : timingScore >= 58
+        ? 'FAIR'
+        : timingScore >= 42
+          ? 'POOR'
+          : 'RISKY';
 
   const thesisScore =
     decisionRound(
@@ -21407,6 +21732,179 @@ function professionalLongTermView(
   };
 }
 
+function decisionTraderEvidenceProfile(
+  candidate
+) {
+  const context =
+    candidate?.historicalContext ||
+    null;
+  const priceAction =
+    context?.priceAction ||
+    null;
+  const technical =
+    context?.technical ||
+    {};
+  const tradePlan =
+    priceAction?.tradePlan ||
+    null;
+
+  let score = 0;
+  const missing = [];
+
+  if (context?.available) {
+    score += 15;
+  } else {
+    missing.push('daily OHLC history');
+  }
+
+  if (
+    safeNumber(context?.validSessions) >=
+      DECISION_TRADER_MIN_VALID_SESSIONS
+  ) {
+    score += 10;
+  } else {
+    missing.push('sufficient recent sessions');
+  }
+
+  if (priceAction?.available) {
+    score += 15;
+  } else {
+    missing.push('price-action structure');
+  }
+
+  if (safeNumber(technical.rsi14) !== null) {
+    score += 8;
+  } else {
+    missing.push('RSI');
+  }
+
+  if (safeNumber(technical.macdHistogram) !== null) {
+    score += 8;
+  } else {
+    missing.push('MACD');
+  }
+
+  if (safeNumber(technical.volumeRatio20d) !== null) {
+    score += 8;
+  } else {
+    missing.push('volume confirmation');
+  }
+
+  if (safeNumber(priceAction?.atr14) !== null) {
+    score += 8;
+  } else {
+    missing.push('ATR');
+  }
+
+  if (safeNumber(priceAction?.support) !== null) {
+    score += 6;
+  } else {
+    missing.push('support');
+  }
+
+  if (safeNumber(priceAction?.resistance) !== null) {
+    score += 6;
+  } else {
+    missing.push('resistance');
+  }
+
+  if (tradePlan?.complete) {
+    score += 10;
+  } else {
+    missing.push('complete entry/stop/target plan');
+  }
+
+  const asOfMs =
+    Date.parse(context?.asOf || '');
+  const ageDays =
+    Number.isFinite(asOfMs)
+      ? Math.max(
+          0,
+          (Date.now() - asOfMs) /
+            (24 * 60 * 60 * 1000)
+        )
+      : null;
+
+  if (
+    ageDays !== null &&
+    ageDays <= 5
+  ) {
+    score += 6;
+  } else {
+    missing.push('recent technical session');
+  }
+
+  score = decisionRound(
+    decisionClamp(score),
+    2
+  );
+
+  const confidence =
+    score >= 85
+      ? 'HIGH'
+      : score >= 70
+        ? 'MEDIUM'
+        : score >= 50
+          ? 'LOW'
+          : 'UNRESOLVED';
+
+  return {
+    framework: 'TRADER_TECHNICAL_EVIDENCE',
+    confidence,
+    score,
+    technicalCoveragePct: score,
+    tradePlanCoveragePct:
+      tradePlan?.complete
+        ? 100
+        : 0,
+    // Generic aliases retained for storage/UI compatibility. In short-term
+    // mode these represent technical evidence, not financial-statement depth.
+    summaryCoveragePct: score,
+    extendedCoveragePct:
+      tradePlan?.complete
+        ? 100
+        : 0,
+    validationTier:
+      tradePlan?.complete
+        ? 'TRADE_PLAN_DEFINED'
+        : priceAction?.available
+          ? 'TECHNICAL_CONTEXT_ONLY'
+          : 'TECHNICAL_DATA_INCOMPLETE',
+    setupCompleteness:
+      tradePlan?.complete
+        ? 'COMPLETE'
+        : 'INCOMPLETE',
+    missing,
+    validSessions:
+      safeNumber(context?.validSessions),
+    asOf:
+      context?.asOf ||
+      null,
+    ageDays:
+      decisionRound(ageDays, 2)
+  };
+}
+
+function decisionTraderRiskBudgetPct(
+  riskPolicy
+) {
+  if (
+    riskPolicy?.id ===
+      'RISK-CONSERVATIVE-0.1'
+  ) {
+    return DECISION_TRADER_RISK_BUDGET_PCT.conservative;
+  }
+
+  if (
+    riskPolicy?.id ===
+      'RISK-AGGRESSIVE-0.1'
+  ) {
+    return DECISION_TRADER_RISK_BUDGET_PCT.aggressive;
+  }
+
+  return DECISION_TRADER_RISK_BUDGET_PCT.balanced;
+}
+
 function professionalShortTermView(
   candidate,
   analystGate,
@@ -21417,37 +21915,68 @@ function professionalShortTermView(
       ?.priceAction ||
     null;
 
+  const tradePlan =
+    priceAction?.tradePlan ||
+    null;
+
+  const traderEvidence =
+    evidence?.framework ===
+      'TRADER_TECHNICAL_EVIDENCE'
+      ? evidence
+      : decisionTraderEvidenceProfile(
+          candidate
+        );
+
   const timingScore =
     safeNumber(priceAction?.timingScore) ??
     safeNumber(candidate?.entry?.score) ??
     0;
   const riskScore =
     safeNumber(candidate?.risk?.score) || 0;
-  const dataQuality =
-    safeNumber(candidate?.dataQuality?.score) || 0;
   const liquidityScore =
     safeNumber(candidate?.risk?.liquidityScore) || 0;
-  const fundamentalSafety =
-    safeNumber(candidate?.fundamental?.score) || 50;
+  const technicalEvidenceScore =
+    safeNumber(traderEvidence?.score) || 0;
   const rewardRisk =
-    safeNumber(priceAction?.rewardRisk);
+    safeNumber(tradePlan?.rewardRisk);
   const setup =
     priceAction?.setup ||
     'NO_CLEAR_SETUP';
 
+  const setupQuality =
+    setup === 'CONFIRMED_BREAKOUT'
+      ? 95
+      : setup === 'TREND_PULLBACK'
+        ? 88
+        : setup === 'UPTREND_CONTINUATION'
+          ? 76
+          : setup === 'UNCONFIRMED_BREAKOUT'
+            ? 62
+            : setup === 'NO_CLEAR_SETUP'
+              ? 45
+              : setup === 'DOWNTREND'
+                ? 25
+                : setup === 'BREAKDOWN'
+                  ? 10
+                  : 40;
+
   const rankingScore =
     decisionRound(
       decisionClamp(
-        timingScore * 0.50 +
-        riskScore * 0.20 +
-        liquidityScore * 0.12 +
-        dataQuality * 0.10 +
-        fundamentalSafety * 0.08
+        timingScore * 0.38 +
+        setupQuality * 0.22 +
+        riskScore * 0.15 +
+        liquidityScore * 0.10 +
+        technicalEvidenceScore * 0.15
       ),
       2
     );
 
-  if (!priceAction?.available) {
+  if (
+    !priceAction?.available ||
+    traderEvidence.confidence ===
+      'UNRESOLVED'
+  ) {
     return {
       framework: 'SHORT_TERM_TRADER',
       thesisStatus: 'NO_SETUP_DATA',
@@ -21456,35 +21985,57 @@ function professionalShortTermView(
       setup,
       rewardRisk,
       riskScore,
+      riskState:
+        professionalRiskState(
+          riskScore
+        ),
       rankingScore,
+      technicalEvidence:
+        traderEvidence,
+      tradePlan,
       marketAction: 'RESEARCHING',
       opportunityTier: 'EVIDENCE_RESEARCH',
-      reason: 'Short-term OHLC price-action evidence is unavailable.'
+      reason:
+        'Short-term technical evidence is incomplete. NOMAD is refreshing OHLC, momentum, volume and price-action context before forming a trade view.'
     };
   }
 
   if (
     setup === 'BREAKDOWN' ||
-    riskScore < 35 ||
-    dataQuality < 60
+    setup === 'DOWNTREND' ||
+    riskScore < 35
   ) {
     return {
       framework: 'SHORT_TERM_TRADER',
       thesisStatus: 'UNFAVORABLE_SETUP',
       timingScore,
-      timingState: priceAction.timingState,
+      timingState:
+        priceAction.timingState,
       setup,
       rewardRisk,
       riskScore,
+      riskState:
+        professionalRiskState(
+          riskScore
+        ),
       rankingScore,
+      technicalEvidence:
+        traderEvidence,
+      tradePlan,
       marketAction: 'AVOID',
       opportunityTier: 'LOW_PRIORITY',
       reason:
         setup === 'BREAKDOWN'
-          ? 'Price structure is in a confirmed breakdown state.'
-          : 'Short-term risk or data quality is below the trader framework minimum.'
+          ? 'Price structure is in a confirmed breakdown state, so NOMAD will not initiate a long trade.'
+          : setup === 'DOWNTREND'
+            ? 'The current short-term structure is bearish. NOMAD waits for a new bullish setup rather than buying weakness.'
+            : 'Short-term market/liquidity risk is below the trader framework minimum.'
     };
   }
+
+  const definedTradePlan =
+    tradePlan?.complete === true &&
+    rewardRisk !== null;
 
   const actionableSetup =
     (
@@ -21494,39 +22045,83 @@ function professionalShortTermView(
     ) &&
     timingScore >= 68 &&
     riskScore >= 45 &&
-    (
-      rewardRisk === null ||
-      rewardRisk >= 1.5
-    );
+    technicalEvidenceScore >= 70 &&
+    definedTradePlan &&
+    rewardRisk >=
+      DECISION_TRADER_MIN_REWARD_RISK;
 
   if (actionableSetup) {
     return {
       framework: 'SHORT_TERM_TRADER',
       thesisStatus: 'ACTIVE_SETUP',
       timingScore,
-      timingState: priceAction.timingState,
+      timingState:
+        priceAction.timingState,
       setup,
       rewardRisk,
       riskScore,
+      riskState:
+        professionalRiskState(
+          riskScore
+        ),
       rankingScore,
+      technicalEvidence:
+        traderEvidence,
+      tradePlan,
       marketAction: 'BUY',
       opportunityTier: 'PRIORITY_1',
-      reason: 'A defined short-term setup, acceptable risk, liquidity and technical timing support a trade candidate.'
+      reason:
+        'A defined short-term setup passes trend/price-action, risk, technical-evidence and reward-to-risk gates. Entry, invalidation and target are explicitly defined.'
     };
+  }
+
+  let reason =
+    'The stock is technically interesting, but the setup does not yet pass the full short-term trade gate.';
+
+  if (!definedTradePlan) {
+    reason =
+      'Technical context is available, but NOMAD cannot yet define a complete entry, invalidation and target. No trade is permitted without a complete plan.';
+  } else if (
+    rewardRisk <
+      DECISION_TRADER_MIN_REWARD_RISK
+  ) {
+    reason =
+      'The setup is visible, but the defined reward-to-risk is below NOMAD\'s minimum ' +
+      DECISION_TRADER_MIN_REWARD_RISK +
+      ':1 trade threshold.';
+  } else if (
+    setup === 'UNCONFIRMED_BREAKOUT'
+  ) {
+    reason =
+      'Price is attempting a breakout, but confirmation is incomplete. NOMAD waits for confirmation rather than chasing the move.';
+  } else if (timingScore < 68) {
+    reason =
+      'The setup exists, but current momentum/price-action timing is not strong enough for entry.';
   }
 
   return {
     framework: 'SHORT_TERM_TRADER',
-    thesisStatus: 'WATCH_SETUP',
+    thesisStatus:
+      definedTradePlan
+        ? 'WATCH_SETUP'
+        : 'SETUP_INCOMPLETE',
     timingScore,
-    timingState: priceAction.timingState,
+    timingState:
+      priceAction.timingState,
     setup,
     rewardRisk,
     riskScore,
+    riskState:
+      professionalRiskState(
+        riskScore
+      ),
     rankingScore,
+    technicalEvidence:
+      traderEvidence,
+    tradePlan,
     marketAction: 'WATCH',
     opportunityTier: 'PRIORITY_2',
-    reason: 'The stock is technically interesting, but the setup or reward-to-risk is not yet strong enough for a new trade.'
+    reason
   };
 }
 
@@ -21543,16 +22138,33 @@ function professionalDecisionView(
 function decisionCanonicalCompanyState(
   candidate
 ) {
+  const shortTermMode =
+    String(
+      candidate?.horizon ||
+      'long_term'
+    ) === 'short_term';
+
   const analystGate =
-    decisionCenterAnalystGate(
-      candidate
-    );
+    shortTermMode
+      ? {
+          state: 'NOT_REQUIRED',
+          validationTier: 'TRADER_TECHNICAL',
+          reason:
+            'Short-term market action is driven by technical setup evidence. Financial evidence remains secondary context and does not block a trade merely because it is incomplete.'
+        }
+      : decisionCenterAnalystGate(
+          candidate
+        );
 
   const evidence =
-    decisionEvidenceProfile(
-      candidate,
-      analystGate
-    );
+    shortTermMode
+      ? decisionTraderEvidenceProfile(
+          candidate
+        )
+      : decisionEvidenceProfile(
+          candidate,
+          analystGate
+        );
 
   const professional =
     professionalDecisionView(
@@ -21766,13 +22378,27 @@ function decisionCenterSummary(
         'UNAVAILABLE'
     },
     positives:
-      candidate.narrative
-        ?.positives ||
-      [],
+      canonical.professional
+        ?.framework ===
+        'SHORT_TERM_TRADER'
+        ? candidate.historicalContext
+            ?.priceAction
+            ?.positives ||
+          []
+        : candidate.narrative
+            ?.positives ||
+          [],
     risks:
-      candidate.narrative
-        ?.risks ||
-      []
+      canonical.professional
+        ?.framework ===
+        'SHORT_TERM_TRADER'
+        ? candidate.historicalContext
+            ?.priceAction
+            ?.risks ||
+          []
+        : candidate.narrative
+            ?.risks ||
+          []
   };
 }
 
@@ -22061,14 +22687,31 @@ function decisionProfileSuitability(
     );
   }
 
+  const shortTermMode =
+    String(
+      candidate?.horizon ||
+      'long_term'
+    ) === 'short_term';
+
+  const applicableDataQualityScore =
+    shortTermMode
+      ? safeNumber(
+          decisionTraderEvidenceProfile(
+            candidate
+          ).score
+        )
+      : safeNumber(
+          candidate?.dataQuality?.score
+        );
+
   if (
-    safeNumber(
-      candidate?.dataQuality?.score
-    ) <
+    applicableDataQualityScore <
       riskPolicy.minDataQualityScore
   ) {
     issues.push(
-      'Data quality is below the selected risk profile minimum.'
+      shortTermMode
+        ? 'Technical evidence quality is below the selected risk profile minimum.'
+        : 'Data quality is below the selected risk profile minimum.'
     );
   }
 
@@ -22107,9 +22750,7 @@ function decisionProfileSuitability(
       annualizedVolatility20dPct:
         volatility,
       dataQualityScore:
-        safeNumber(
-          candidate?.dataQuality?.score
-        ),
+        applicableDataQualityScore,
       riskScore:
         safeNumber(
           candidate?.risk?.score
@@ -23094,6 +23735,55 @@ function allocateDecisionCenterOpportunities(
         existingSectorSpent
       );
 
+    const shortTermCandidate =
+      candidate?.canonicalState
+        ?.professional
+        ?.framework ===
+        'SHORT_TERM_TRADER';
+
+    const traderRiskBudgetPct =
+      shortTermCandidate
+        ? decisionTraderRiskBudgetPct(
+            riskPolicy
+          )
+        : null;
+
+    const traderRiskPerShare =
+      shortTermCandidate
+        ? safeNumber(
+            candidate?.canonicalState
+              ?.professional
+              ?.tradePlan
+              ?.riskPerShare
+          )
+        : null;
+
+    const traderRiskShareCap =
+      shortTermCandidate &&
+      traderRiskPerShare !== null &&
+      traderRiskPerShare > 0
+        ? Math.floor(
+            (
+              budgetPaisa /
+              100 *
+              traderRiskBudgetPct
+            ) /
+            traderRiskPerShare
+          )
+        : null;
+
+    const traderRiskValueCap =
+      shortTermCandidate
+        ? Math.max(
+            0,
+            (
+              traderRiskShareCap ||
+              0
+            ) *
+            pricePaisa
+          )
+        : Number.MAX_SAFE_INTEGER;
+
     const allowed =
       Math.max(
         0,
@@ -23101,7 +23791,8 @@ function allocateDecisionCenterOpportunities(
           remainingDeploy,
           proportionalTarget,
           stockGap,
-          sectorGap
+          sectorGap,
+          traderRiskValueCap
         )
       );
 
@@ -23115,7 +23806,10 @@ function allocateDecisionCenterOpportunities(
       let personalAction =
         'NO_ADD';
       let personalReason =
-        'The opportunity remains ranked, but this new capital cannot fit one whole share inside the current target-weight and sector limits.';
+        shortTermCandidate &&
+        traderRiskValueCap < pricePaisa
+          ? 'One whole share would exceed the selected profile\'s stop-based per-trade risk budget, so NOMAD does not force the trade.'
+          : 'The opportunity remains ranked, but this new capital cannot fit one whole share inside the current target-weight and sector limits.';
 
       if (
         existingStockValuePaisa >=
@@ -23208,6 +23902,54 @@ function allocateDecisionCenterOpportunities(
           candidate.price,
           2
         ),
+      traderPlan:
+        shortTermCandidate
+          ? {
+              setup:
+                candidate.canonicalState
+                  ?.professional
+                  ?.setup ||
+                null,
+              entryLow:
+                candidate.canonicalState
+                  ?.professional
+                  ?.tradePlan
+                  ?.entryLow ??
+                null,
+              entryHigh:
+                candidate.canonicalState
+                  ?.professional
+                  ?.tradePlan
+                  ?.entryHigh ??
+                null,
+              stop:
+                candidate.canonicalState
+                  ?.professional
+                  ?.tradePlan
+                  ?.stop ??
+                null,
+              target1:
+                candidate.canonicalState
+                  ?.professional
+                  ?.tradePlan
+                  ?.target1 ??
+                null,
+              rewardRisk:
+                candidate.canonicalState
+                  ?.professional
+                  ?.tradePlan
+                  ?.rewardRisk ??
+                null,
+              riskPerShare:
+                traderRiskPerShare,
+              riskBudgetPct:
+                decisionRound(
+                  traderRiskBudgetPct *
+                  100,
+                  2
+                )
+            }
+          : null,
       principalPkr:
         decisionRound(
           spent /
@@ -23268,13 +24010,15 @@ function allocateDecisionCenterOpportunities(
           ?.coreCoveragePct ??
         null,
       note:
-        candidate.allocationTier ===
-          'PRIORITY_2'
-          ? 'Actionable Priority 2 position: the canonical market action is ACCUMULATE, evidence passes the allocation gate, and NOMAD deliberately sizes it below Priority 1.'
-          : candidate.decisionCenterView ===
-              'ACCUMULATE'
-            ? 'Staged Priority 1 exposure: the analyst thesis passes, but NOMAD is not sizing this as a full position yet.'
-            : 'Priority 1 shadow allocation. Brokerage, taxes, levies and execution slippage are not included.'
+        shortTermCandidate
+          ? 'Short-term shadow trade candidate: position value is capped by the defined stop distance and the selected profile\'s per-trade risk budget. Brokerage, taxes, levies and execution slippage are not included.'
+          : candidate.allocationTier ===
+              'PRIORITY_2'
+            ? 'Actionable Priority 2 position: the canonical market action is ACCUMULATE, evidence passes the allocation gate, and NOMAD deliberately sizes it below Priority 1.'
+            : candidate.decisionCenterView ===
+                'ACCUMULATE'
+              ? 'Staged Priority 1 exposure: the analyst thesis passes, but NOMAD is not sizing this as a full position yet.'
+              : 'Priority 1 shadow allocation. Brokerage, taxes, levies and execution slippage are not included.'
     });
 
     personalActions.push({
@@ -23315,12 +24059,14 @@ function allocateDecisionCenterOpportunities(
           2
         ),
       reason:
-        existingStockValuePaisa > 0
-          ? 'The holding is below NOMAD\'s current target exposure, so some of the new capital can be added without breaching stock or sector limits.'
-          : candidate.allocationTier ===
-              'PRIORITY_2'
-            ? 'The canonical market action is actionable, but this is a lower-priority opportunity, so NOMAD limits the position size.'
-            : 'The opportunity passes the current allocation gate and fits the portfolio diversification limits.'
+        shortTermCandidate
+          ? 'The trade setup passes the Trader brain and the position fits the selected profile\'s stop-based risk budget plus portfolio concentration limits.'
+          : existingStockValuePaisa > 0
+            ? 'The holding is below NOMAD\'s current target exposure, so some of the new capital can be added without breaching stock or sector limits.'
+            : candidate.allocationTier ===
+                'PRIORITY_2'
+              ? 'The canonical market action is actionable, but this is a lower-priority opportunity, so NOMAD limits the position size.'
+              : 'The opportunity passes the current allocation gate and fits the portfolio diversification limits.'
     });
   }
 
@@ -23419,6 +24165,39 @@ function allocateDecisionCenterOpportunities(
           dynamicCaps.sectorCapPct
         );
 
+      const shortTermCandidate =
+        candidate?.canonicalState
+          ?.professional
+          ?.framework ===
+          'SHORT_TERM_TRADER';
+
+      const traderRiskPerShare =
+        shortTermCandidate
+          ? safeNumber(
+              candidate?.canonicalState
+                ?.professional
+                ?.tradePlan
+                ?.riskPerShare
+            )
+          : null;
+
+      const traderRiskValueCap =
+        shortTermCandidate &&
+        traderRiskPerShare !== null &&
+        traderRiskPerShare > 0
+          ? Math.floor(
+              (
+                budgetPaisa /
+                100 *
+                decisionTraderRiskBudgetPct(
+                  riskPolicy
+                ) /
+                traderRiskPerShare
+              )
+            ) *
+            pricePaisa
+          : Number.MAX_SAFE_INTEGER;
+
       if (
         existingStockValuePaisa +
           currentSpent +
@@ -23427,7 +24206,10 @@ function allocateDecisionCenterOpportunities(
         existingSectorValuePaisa +
           sectorCurrent +
           pricePaisa >
-            sectorTotalCap
+            sectorTotalCap ||
+        currentSpent +
+          pricePaisa >
+            traderRiskValueCap
       ) {
         continue;
       }
@@ -23773,6 +24555,9 @@ async function decisionHistoricalContext(
 
   if (
     cachedContext?.available &&
+    cachedContext?.contextSchemaVersion ===
+      DECISION_HISTORICAL_CONTEXT_SCHEMA_VERSION &&
+    cachedContext?.priceAction &&
     Number.isFinite(
       evaluatedAt
     ) &&
@@ -25002,6 +25787,15 @@ async function runSingleStockStrategy(
     personalReason =
       suitabilityIssues.join(' ');
   } else if (
+    horizon === 'short_term' &&
+    existingValue <= 0 &&
+    canonical.marketAction ===
+      'WATCH'
+  ) {
+    personalAction = 'WAIT';
+    personalReason =
+      canonical.reason;
+  } else if (
     existingValue > 0
   ) {
     if (
@@ -25155,11 +25949,17 @@ async function runSingleStockStrategy(
           ?.state ||
         'UNAVAILABLE',
       deepValidation:
-        canonical.evidence
-          ?.extendedCoveragePct >= 67
+        safeNumber(
+          candidate.analystCore
+            ?.coverage
+            ?.extendedCoveragePct
+        ) >= 67
           ? 'VALIDATED'
-          : canonical.evidence
-              ?.extendedCoveragePct > 0
+          : safeNumber(
+              candidate.analystCore
+                ?.coverage
+                ?.extendedCoveragePct
+            ) > 0
             ? 'PARTIAL'
             : 'INCOMPLETE',
       earningsQuality:
@@ -25289,8 +26089,54 @@ async function runSingleStockStrategy(
         priceAction?.resistance ??
         null,
       rewardRisk:
+        priceAction?.tradePlan
+          ?.rewardRisk ??
         priceAction?.rewardRisk ??
         null,
+      entryLow:
+        priceAction?.tradePlan
+          ?.entryLow ??
+        null,
+      entryHigh:
+        priceAction?.tradePlan
+          ?.entryHigh ??
+        null,
+      stop:
+        priceAction?.tradePlan
+          ?.stop ??
+        null,
+      target1:
+        priceAction?.tradePlan
+          ?.target1 ??
+        null,
+      target2:
+        priceAction?.tradePlan
+          ?.target2 ??
+        null,
+      riskPerShare:
+        priceAction?.tradePlan
+          ?.riskPerShare ??
+        null,
+      riskPct:
+        priceAction?.tradePlan
+          ?.riskPct ??
+        null,
+      targetSource:
+        priceAction?.tradePlan
+          ?.targetSource ||
+        null,
+      tradePlanState:
+        priceAction?.tradePlan
+          ?.state ||
+        'INCOMPLETE',
+      invalidation:
+        priceAction?.tradePlan
+          ?.invalidation ||
+        null,
+      structureBias:
+        priceAction?.structure
+          ?.bias ||
+        'UNAVAILABLE',
       atr14:
         priceAction?.atr14 ??
         null,
@@ -25323,13 +26169,19 @@ async function runSingleStockStrategy(
       thesis:
         canonical.reason,
       positives:
-        candidate.narrative
-          ?.positives ||
-        [],
+        horizon === 'short_term'
+          ? priceAction?.positives ||
+            []
+          : candidate.narrative
+              ?.positives ||
+            [],
       risks:
-        candidate.narrative
-          ?.risks ||
-        []
+        horizon === 'short_term'
+          ? priceAction?.risks ||
+            []
+          : candidate.narrative
+              ?.risks ||
+            []
     },
     diagnostics: {
       overallScore,
@@ -25495,10 +26347,15 @@ async function runDecisionLab(
         row => ({
           row,
           screeningScore:
-            decisionScreeningScore(
-              row,
-              eligibleRows
-            )
+            horizon === 'short_term'
+              ? decisionTraderScreeningScore(
+                  row,
+                  eligibleRows
+                )
+              : decisionScreeningScore(
+                  row,
+                  eligibleRows
+                )
         })
       )
       .sort(
@@ -25683,14 +26540,25 @@ async function runDecisionLab(
             riskScore,
           deepProxyScore:
             decisionRound(
-              item.screeningScore *
-                0.30 +
-              valuation.score *
-                0.20 +
-              entry.score *
-                0.30 +
-              riskScore.score *
-                0.20,
+              horizon === 'short_term'
+                ? (
+                    item.screeningScore * 0.20 +
+                    (
+                      safeNumber(
+                        historicalContext
+                          ?.priceAction
+                          ?.timingScore
+                      ) ||
+                      entry.score
+                    ) * 0.50 +
+                    riskScore.score * 0.30
+                  )
+                : (
+                    item.screeningScore * 0.30 +
+                    valuation.score * 0.20 +
+                    entry.score * 0.30 +
+                    riskScore.score * 0.20
+                  ),
               2
             )
         };
@@ -25765,58 +26633,117 @@ async function runDecisionLab(
         batch,
         4,
         async item => {
-          const fundamentalEvidence =
-            await decisionLoadFundamentals(
-              item.row,
-              memoryMap
-            );
+          let fundamentalEvidence;
+          let fundamentals;
+          let fundamental;
 
-          const fundamentals =
-            fundamentalEvidence
-              .fundamentals;
+          if (horizon === 'short_term') {
+            fundamentalEvidence = {
+              evidenceState: 'SECONDARY_NOT_REQUIRED',
+              cachedAt: null,
+              error: null,
+              diagnostics: null,
+              fundamentals: null
+            };
+            fundamentals = null;
+            fundamental = {
+              available: false,
+              score: 50,
+              coverage: 0,
+              metrics: {},
+              reasons: [
+                'Short-term market action is not gated by financial-statement completeness.'
+              ],
+              risks: [],
+              evidenceState: 'SECONDARY_NOT_REQUIRED',
+              cachedAt: null
+            };
+          } else {
+            fundamentalEvidence =
+              await decisionLoadFundamentals(
+                item.row,
+                memoryMap
+              );
 
-          const fundamental =
-            scoreDecisionFundamentals(
-              fundamentals
-            );
+            fundamentals =
+              fundamentalEvidence
+                .fundamentals;
 
-          fundamental.evidenceState =
-            fundamentalEvidence
-              .evidenceState;
+            fundamental =
+              scoreDecisionFundamentals(
+                fundamentals
+              );
 
-          fundamental.cachedAt =
-            fundamentalEvidence
-              .cachedAt;
+            fundamental.evidenceState =
+              fundamentalEvidence
+                .evidenceState;
 
-          if (
-            fundamentalEvidence.error
-          ) {
-            fundamental.risks =
-              uniqueTextValues([
-                ...(
-                  fundamental.risks ||
-                  []
-                ),
-                fundamentalEvidence.error
-              ]);
+            fundamental.cachedAt =
+              fundamentalEvidence
+                .cachedAt;
+
+            if (
+              fundamentalEvidence.error
+            ) {
+              fundamental.risks =
+                uniqueTextValues([
+                  ...(
+                    fundamental.risks ||
+                    []
+                  ),
+                  fundamentalEvidence.error
+                ]);
+            }
           }
 
+          const traderEvidence =
+            horizon === 'short_term'
+              ? decisionTraderEvidenceProfile({
+                  horizon,
+                  historicalContext:
+                    item.historicalContext
+                })
+              : null;
+
           const dataQuality =
-            scoreDecisionDataQuality(
-              item.row,
-              item.historicalContext,
-              fundamental
-            );
+            horizon === 'short_term'
+              ? {
+                  score:
+                    traderEvidence.score,
+                  missing:
+                    traderEvidence.missing
+                }
+              : scoreDecisionDataQuality(
+                  item.row,
+                  item.historicalContext,
+                  fundamental
+                );
 
           const overallScore =
-            decisionOverallScore(
-              model,
-              fundamental,
-              item.valuation,
-              item.entry,
-              item.risk,
-              dataQuality
-            );
+            horizon === 'short_term'
+              ? decisionRound(
+                  decisionClamp(
+                    (
+                      safeNumber(
+                        item.historicalContext
+                          ?.priceAction
+                          ?.timingScore
+                      ) ||
+                      item.entry.score
+                    ) * 0.55 +
+                    item.risk.score * 0.25 +
+                    dataQuality.score * 0.20
+                  ),
+                  2
+                )
+              : decisionOverallScore(
+                  model,
+                  fundamental,
+                  item.valuation,
+                  item.entry,
+                  item.risk,
+                  dataQuality
+                );
 
           const candidate = {
             horizon,
@@ -25872,11 +26799,17 @@ async function runDecisionLab(
           };
 
           const action =
-            decisionCandidateAction(
-              candidate,
-              model,
-              riskPolicy
-            );
+            horizon === 'short_term'
+              ? {
+                  action: 'WAIT',
+                  reason:
+                    'Legacy weighted action is bypassed in short-term mode; the dedicated Trader brain is authoritative.'
+                }
+              : decisionCandidateAction(
+                  candidate,
+                  model,
+                  riskPolicy
+                );
 
           candidate.action =
             action.action;
@@ -25893,6 +26826,15 @@ async function runDecisionLab(
             decisionCanonicalCompanyState(
               candidate
             );
+
+          if (horizon === 'short_term') {
+            candidate.action =
+              candidate.canonicalState
+                .marketAction;
+            candidate.actionReason =
+              candidate.canonicalState
+                .reason;
+          }
 
           candidate.profileSuitability =
             decisionProfileSuitability(
@@ -26030,11 +26972,21 @@ async function runDecisionLab(
         ? 'INVEST'
         : 'PARTIAL_INVEST';
     headline =
-      priorityOneCount === 1
-        ? 'One Priority 1 opportunity currently passes the shadow allocation gates.'
-        : 'Priority 1 opportunities currently pass the shadow allocation gates.';
+      horizon === 'short_term'
+        ? (
+            priorityOneCount === 1
+              ? 'One active short-term trade setup currently passes the Trader brain gates.'
+              : 'Active short-term trade setups currently pass the Trader brain gates.'
+          )
+        : (
+            priorityOneCount === 1
+              ? 'One Priority 1 opportunity currently passes the shadow allocation gates.'
+              : 'Priority 1 opportunities currently pass the shadow allocation gates.'
+          );
     reason =
-      'The capital allocator builds a portfolio-aware target from the strongest opportunities that passed the current shadow allocation gates. Position sizes are conviction-weighted, profile-gated and constrained by stock/sector limits; existing holdings are applied to the combined post-investment portfolio before whole shares are calculated.';
+      horizon === 'short_term'
+        ? 'The Trader brain requires a defined setup, technical evidence, profile suitability, entry, invalidation, target and minimum reward-to-risk before capital is permitted. Position size is also capped by the selected profile\'s per-trade risk budget.'
+        : 'The capital allocator builds a portfolio-aware target from the strongest opportunities that passed the current shadow allocation gates. Position sizes are conviction-weighted, profile-gated and constrained by stock/sector limits; existing holdings are applied to the combined post-investment portfolio before whole shares are calculated.';
   } else if (
     priorityOneCount > 0
   ) {
@@ -26048,18 +27000,26 @@ async function runDecisionLab(
   ) {
     action = 'WATCH';
     headline =
-      'No Priority 1 idea passes the full standard; the best current ideas remain Priority 2.';
+      horizon === 'short_term'
+        ? 'No active short-term setup passes the full trade gate; the best current setups remain on watch.'
+        : 'No Priority 1 idea passes the full standard; the best current ideas remain Priority 2.';
     reason =
-      'These companies remain worth monitoring, but one or more thesis, evidence, valuation or entry conditions do not pass the current shadow allocation gate.';
+      horizon === 'short_term'
+        ? 'These stocks have technical context worth monitoring, but setup confirmation, timing, reward-to-risk or trade-plan completeness is not yet strong enough for entry.'
+        : 'These companies remain worth monitoring, but one or more thesis, evidence, valuation or entry conditions do not pass the current shadow allocation gate.';
   } else if (
     researchRequiredCount > 0
   ) {
     action =
       'EVIDENCE_RESEARCH';
     headline =
-      'Interesting candidates exist and NOMAD is automatically researching the missing evidence.';
+      horizon === 'short_term'
+        ? 'Potential setups exist and NOMAD is refreshing the missing technical evidence.'
+        : 'Interesting candidates exist and NOMAD is automatically researching the missing evidence.';
     reason =
-      'Missing evidence is a research trigger, not a final verdict. NOMAD keeps these names visible, backfills additional candidates, and blocks allocation until the evidence state becomes actionable.';
+      horizon === 'short_term'
+        ? 'Missing OHLC, momentum, volume, level or trade-plan evidence is a research trigger, not a trade signal. Allocation remains blocked until a complete setup is available.'
+        : 'Missing evidence is a research trigger, not a final verdict. NOMAD keeps these names visible, backfills additional candidates, and blocks allocation until the evidence state becomes actionable.';
   }
 
   if (
@@ -26138,6 +27098,26 @@ async function runDecisionLab(
             ?.evidence
             ?.extendedCoveragePct
       ),
+    technicalCoveragePct:
+      horizon === 'short_term'
+        ? averageMetric(
+            evidenceSample,
+            item =>
+              item.canonicalState
+                ?.evidence
+                ?.technicalCoveragePct
+          )
+        : null,
+    tradePlanCoveragePct:
+      horizon === 'short_term'
+        ? averageMetric(
+            evidenceSample,
+            item =>
+              item.canonicalState
+                ?.evidence
+                ?.tradePlanCoveragePct
+          )
+        : null,
     dataQualityPct:
       averageMetric(
         evidenceSample,
@@ -26147,6 +27127,15 @@ async function runDecisionLab(
             ?.dataQualityPct
       )
   };
+
+  if (horizon === 'short_term') {
+    evidenceProfile.setupCompleteness =
+      evidenceProfile.tradePlanCoveragePct >= 99
+        ? 'COMPLETE'
+        : evidenceProfile.tradePlanCoveragePct > 0
+          ? 'PARTIAL'
+          : 'INCOMPLETE';
+  }
 
   evidenceProfile.confidence =
     evidenceProfile.confidenceScore >= 82
@@ -27429,6 +28418,30 @@ function runDecisionEngineSelfTests() {
     'professional price-action engine must return a timing state'
   );
 
+  const historicalContextWithTraderData =
+    buildHistoricalContext(
+      'SYNTH',
+      syntheticPriceRows,
+      syntheticPriceRows[
+        syntheticPriceRows.length - 1
+      ].close
+    );
+
+  assert.equal(
+    historicalContextWithTraderData
+      .contextSchemaVersion,
+    DECISION_HISTORICAL_CONTEXT_SCHEMA_VERSION,
+    'historical context must carry the Trader-brain schema version so stale pre-0.9.3 caches are refreshed'
+  );
+
+  assert.equal(
+    historicalContextWithTraderData
+      .priceAction
+      ?.available,
+    true,
+    'historical context must return the already-computed professional price-action object to the Trader brain'
+  );
+
   const longTermProfessionalCandidate = {
     ...validatedDecisionCandidate,
     horizon: 'long_term',
@@ -27468,14 +28481,17 @@ function runDecisionEngineSelfTests() {
   const poorTimingLongTerm =
     decisionCanonicalCompanyState({
       ...longTermProfessionalCandidate,
+      entry: {
+        score: 35
+      },
       historicalContext: {
         available: true,
         priceAction: {
           available: true,
-          timingScore: 35,
-          timingState: 'RISKY',
-          setup: 'NO_CLEAR_SETUP',
-          rewardRisk: 0.7
+          timingScore: 90,
+          timingState: 'GOOD',
+          setup: 'CONFIRMED_BREAKOUT',
+          rewardRisk: 3
         }
       }
     });
@@ -27492,12 +28508,43 @@ function runDecisionEngineSelfTests() {
       horizon: 'short_term',
       historicalContext: {
         available: true,
+        contextSchemaVersion:
+          DECISION_HISTORICAL_CONTEXT_SCHEMA_VERSION,
+        asOf:
+          new Date()
+            .toISOString()
+            .slice(0, 10),
+        validSessions: 120,
+        technical: {
+          rsi14: 58,
+          macdHistogram: 0.8,
+          volumeRatio20d: 1.4,
+          annualizedVolatility20dPct: 32
+        },
         priceAction: {
           available: true,
           timingScore: 82,
           timingState: 'GOOD',
           setup: 'CONFIRMED_BREAKOUT',
-          rewardRisk: 2.2
+          atr14: 3.2,
+          support: 95,
+          resistance: 112,
+          structure: {
+            bias: 'BULLISH'
+          },
+          tradePlan: {
+            complete: true,
+            state: 'DEFINED',
+            entryLow: 100,
+            entryHigh: 101,
+            entryReference: 100.5,
+            stop: 96,
+            target1: 111,
+            target2: 114,
+            riskPerShare: 4.5,
+            riskPct: 4.48,
+            rewardRisk: 2.33
+          }
         }
       }
     });
@@ -27512,6 +28559,128 @@ function runDecisionEngineSelfTests() {
     shortTermProfessionalState.marketAction,
     'BUY',
     'confirmed short-term setup with acceptable reward-to-risk must be actionable'
+  );
+
+  const shortTermAllocationCandidate = {
+    ...longTermProfessionalCandidate,
+    symbol: 'TRADER1',
+    horizon: 'short_term',
+    price: 100,
+    averageVolume30d: 500000,
+    entry: { score: 82 },
+    risk: { score: 72, liquidityScore: 85 },
+    dataQuality: { score: 90 },
+    historicalContext: {
+      available: true,
+      contextSchemaVersion:
+        DECISION_HISTORICAL_CONTEXT_SCHEMA_VERSION,
+      asOf:
+        new Date()
+          .toISOString()
+          .slice(0, 10),
+      validSessions: 120,
+      technical: {
+        rsi14: 58,
+        macdHistogram: 0.8,
+        volumeRatio20d: 1.4,
+        annualizedVolatility20dPct: 32
+      },
+      priceAction: {
+        available: true,
+        timingScore: 82,
+        timingState: 'GOOD',
+        setup: 'CONFIRMED_BREAKOUT',
+        atr14: 3.2,
+        support: 95,
+        resistance: 112,
+        structure: { bias: 'BULLISH' },
+        tradePlan: {
+          complete: true,
+          state: 'DEFINED',
+          entryLow: 100,
+          entryHigh: 101,
+          entryReference: 100.5,
+          stop: 90.5,
+          target1: 120.5,
+          riskPerShare: 10,
+          riskPct: 9.95,
+          rewardRisk: 2
+        }
+      }
+    }
+  };
+
+  shortTermAllocationCandidate.canonicalState =
+    decisionCanonicalCompanyState(
+      shortTermAllocationCandidate
+    );
+  shortTermAllocationCandidate.profileSuitability =
+    decisionProfileSuitability(
+      shortTermAllocationCandidate,
+      riskBalanced
+    );
+
+  const shortTermBoard =
+    buildDecisionOpportunityBoard([
+      shortTermAllocationCandidate
+    ]);
+
+  const shortTermRiskSized =
+    allocateDecisionCenterOpportunities(
+      shortTermBoard,
+      100000,
+      riskBalanced
+    );
+
+  assert.ok(
+    !shortTermRiskSized.allocations.length ||
+    shortTermRiskSized.allocations[0].principalPkr <= 10000.01,
+    'Balanced short-term sizing must respect the 1% capital-at-risk budget when stop risk is PKR 10 per share at a PKR 100 price'
+  );
+
+  const shortTermMissingPlan =
+    decisionCanonicalCompanyState({
+      ...longTermProfessionalCandidate,
+      horizon: 'short_term',
+      historicalContext: {
+        ...shortTermProfessionalState.professional
+          ?.technicalEvidence,
+        available: true,
+        asOf:
+          new Date()
+            .toISOString()
+            .slice(0, 10),
+        validSessions: 120,
+        technical: {
+          rsi14: 58,
+          macdHistogram: 0.8,
+          volumeRatio20d: 1.4,
+          annualizedVolatility20dPct: 32
+        },
+        priceAction: {
+          available: true,
+          timingScore: 82,
+          timingState: 'GOOD',
+          setup: 'CONFIRMED_BREAKOUT',
+          atr14: 3.2,
+          support: 95,
+          resistance: 112,
+          structure: {
+            bias: 'BULLISH'
+          },
+          tradePlan: {
+            complete: false,
+            state: 'TARGET_UNRESOLVED',
+            rewardRisk: null
+          }
+        }
+      }
+    });
+
+  assert.notEqual(
+    shortTermMissingPlan.marketAction,
+    'BUY',
+    'short-term mode must never BUY when entry/stop/target reward-to-risk is unresolved'
   );
 
   console.log(
@@ -44285,6 +45454,70 @@ function renderOpportunityList(
           item.professional ||
           {};
 
+        const isShortTerm =
+          professional.framework ===
+            'SHORT_TERM_TRADER';
+
+        const canonicalEvidence =
+          item.canonicalState
+            ?.evidence ||
+          {};
+
+        const evidenceMeta =
+          isShortTerm
+            ? (
+                ' · Technical evidence ' +
+                escapeHtml(
+                  canonicalEvidence.confidence ||
+                  'UNRESOLVED'
+                ) +
+                ' · Coverage ' +
+                formatNumber(
+                  canonicalEvidence.technicalCoveragePct ||
+                  canonicalEvidence.score ||
+                  0,
+                  0
+                ) +
+                '%' +
+                ' · Plan ' +
+                escapeHtml(
+                  canonicalEvidence.setupCompleteness ||
+                  'INCOMPLETE'
+                )
+              )
+            : (
+                ' · Headline financials ' +
+                escapeHtml(
+                  analyst.financialView ||
+                  'UNAVAILABLE'
+                ) +
+                ' · Evidence ' +
+                escapeHtml(
+                  analyst.evidenceConfidence ||
+                  'UNRESOLVED'
+                ) +
+                ' · Summary ' +
+                (
+                  analyst.coveragePct !== null &&
+                  analyst.coveragePct !== undefined
+                    ? formatNumber(
+                        analyst.coveragePct,
+                        0
+                      ) + '%'
+                    : 'N/A'
+                ) +
+                (
+                  analyst.extendedCoveragePct !== null &&
+                  analyst.extendedCoveragePct !== undefined
+                    ? ' · Extended ' +
+                      formatNumber(
+                        analyst.extendedCoveragePct,
+                        0
+                      ) + '%'
+                    : ''
+                )
+              );
+
         return (
           '<div class="opportunityRow">' +
           '<div class="opportunityRank">#' +
@@ -44317,43 +45550,14 @@ function renderOpportunityList(
             item.sector ||
             'Unknown sector'
           ) +
-          ' · Headline financials ' +
-          escapeHtml(
-            analyst.financialView ||
-            'UNAVAILABLE'
-          ) +
-          ' · Evidence ' +
-          escapeHtml(
-            analyst.evidenceConfidence ||
-            'UNRESOLVED'
-          ) +
-          ' · Summary ' +
-          (
-            analyst.coveragePct !==
-              null &&
-            analyst.coveragePct !==
-              undefined
-              ? formatNumber(
-                  analyst.coveragePct,
-                  0
-                ) + '%'
-              : 'N/A'
-          ) +
-          (
-            analyst.extendedCoveragePct !==
-              null &&
-            analyst.extendedCoveragePct !==
-              undefined
-              ? ' · Extended ' +
-                formatNumber(
-                  analyst.extendedCoveragePct,
-                  0
-                ) + '%'
-              : ''
-          ) +
+          evidenceMeta +
           (
             professional.thesisStatus
-              ? ' · Thesis ' +
+              ? (
+                  isShortTerm
+                    ? ' · State '
+                    : ' · Thesis '
+                ) +
                 escapeHtml(
                   professional.thesisStatus
                 )
@@ -44537,40 +45741,26 @@ function renderStockStrategy(
   }
 
   const professional =
-    result?.professional ||
-    {};
-
+    result?.professional || {};
   const personal =
-    result?.personal ||
-    {};
-
+    result?.personal || {};
   const technical =
-    result?.technical ||
-    {};
-
+    result?.technical || {};
   const performance =
-    result?.performance ||
-    {};
-
+    result?.performance || {};
   const financial =
-    result?.financial ||
-    {};
-
+    result?.financial || {};
   const valuation =
-    result?.valuation ||
-    {};
-
+    result?.valuation || {};
   const risk =
-    result?.risk ||
-    {};
-
+    result?.risk || {};
   const evidence =
-    result?.evidence ||
-    {};
-
+    result?.evidence || {};
   const suitability =
-    result?.riskSuitability ||
-    {};
+    result?.riskSuitability || {};
+  const isShortTerm =
+    result?.input?.horizon ===
+      'short_term';
 
   const actionable =
     professional.marketAction === 'BUY' ||
@@ -44584,19 +45774,11 @@ function renderStockStrategy(
         : 'warn';
 
   const personalClass =
-    String(
-      personal.action ||
-      ''
-    ).includes('AVOID') ||
-    String(
-      personal.action ||
-      ''
-    ).includes('REDUCE')
+    String(personal.action || '').includes('AVOID') ||
+    String(personal.action || '').includes('REDUCE') ||
+    String(personal.action || '').includes('DO_NOT')
       ? 'bad'
-      : String(
-          personal.action ||
-          ''
-        ).includes('ADD') ||
+      : String(personal.action || '').includes('ADD') ||
         personal.action === 'BUY' ||
         personal.action === 'ACCUMULATE'
           ? 'good'
@@ -44607,48 +45789,29 @@ function renderStockStrategy(
       ? 'good'
       : 'bad';
 
-  const price =
-    result?.market?.price;
-
-  const dayChange =
-    result?.market?.dayChangePct;
+  const price = result?.market?.price;
+  const dayChange = result?.market?.dayChangePct;
 
   let html =
     '<div class="stockStrategyHeadline">' +
     '<div class="stockStrategyIdentity"><strong>' +
-    escapeHtml(
-      result?.identity?.symbol ||
-      ''
-    ) +
+    escapeHtml(result?.identity?.symbol || '') +
     ' · ' +
-    escapeHtml(
-      result?.identity?.companyName ||
-      ''
-    ) +
+    escapeHtml(result?.identity?.companyName || '') +
     '</strong><span>' +
-    escapeHtml(
-      result?.identity?.sector ||
-      ''
-    ) +
+    escapeHtml(result?.identity?.sector || '') +
     ' · PKR ' +
-    formatNumber(
-      price,
-      2
-    ) +
+    formatNumber(price, 2) +
     (
       dayChange !== null &&
       dayChange !== undefined
         ? ' · Today ' +
-          formatPercent(
-            dayChange
-          )
+          formatPercent(dayChange)
         : ''
     ) +
     '</span></div>' +
     '<div class="stockStrategyBadges">' +
-    '<span class="strategyBadge ' +
-    actionClass +
-    '">Market: ' +
+    '<span class="strategyBadge ' + actionClass + '">Market: ' +
     escapeHtml(
       decisionActionLabel(
         professional.marketAction ||
@@ -44656,9 +45819,7 @@ function renderStockStrategy(
       )
     ) +
     '</span>' +
-    '<span class="strategyBadge ' +
-    personalClass +
-    '">You: ' +
+    '<span class="strategyBadge ' + personalClass + '">You: ' +
     escapeHtml(
       decisionActionLabel(
         personal.action ||
@@ -44666,229 +45827,394 @@ function renderStockStrategy(
       )
     ) +
     '</span>' +
-    '<span class="strategyBadge ' +
-    suitabilityClass +
-    '">' +
+    '<span class="strategyBadge ' + suitabilityClass + '">' +
     escapeHtml(
       suitability.state ||
       'UNRESOLVED'
     ) +
     ' for ' +
-    escapeHtml(
-      result?.input?.risk ||
-      ''
-    ) +
+    escapeHtml(result?.input?.risk || '') +
     '</span>' +
     '</div></div>';
 
-  html +=
-    '<div class="strategyMetricGrid">' +
-    strategyMetricCard(
-      'Thesis',
-      strategyValue(
-        professional.thesisStatus
-      )
-    ) +
-    strategyMetricCard(
-      'Valuation',
-      strategyValue(
-        valuation.state
-      )
-    ) +
-    strategyMetricCard(
-      'Company risk',
-      strategyValue(
-        risk.state
-      )
-    ) +
-    strategyMetricCard(
-      'Your risk fit',
-      strategyValue(
-        suitability.state
-      )
-    ) +
-    strategyMetricCard(
-      'Timing',
-      strategyValue(
-        technical.timingState
-      )
-    ) +
-    strategyMetricCard(
-      'Evidence',
-      strategyValue(
-        evidence.confidence
-      )
-    ) +
-    strategyMetricCard(
-      'Current holding',
-      personal.hasPosition
-        ? formatNumber(
-            personal.currentPortfolioWeightPct,
-            1
-          ) + '%'
-        : 'None'
-    ) +
-    '</div>';
+  if (isShortTerm) {
+    html +=
+      '<div class="strategyMetricGrid">' +
+      strategyMetricCard(
+        'Setup',
+        strategyValue(technical.setup)
+      ) +
+      strategyMetricCard(
+        'Trend structure',
+        strategyValue(
+          technical.structureBias ||
+          technical.trend
+        )
+      ) +
+      strategyMetricCard(
+        'Trader risk',
+        strategyValue(risk.state)
+      ) +
+      strategyMetricCard(
+        'Your risk fit',
+        strategyValue(suitability.state)
+      ) +
+      strategyMetricCard(
+        'Timing',
+        strategyValue(technical.timingState)
+      ) +
+      strategyMetricCard(
+        'Technical evidence',
+        strategyValue(evidence.confidence)
+      ) +
+      strategyMetricCard(
+        'Reward / risk',
+        technical.rewardRisk !== null &&
+        technical.rewardRisk !== undefined
+          ? formatNumber(technical.rewardRisk, 2) + 'x'
+          : '—'
+      ) +
+      '</div>';
+  } else {
+    html +=
+      '<div class="strategyMetricGrid">' +
+      strategyMetricCard(
+        'Thesis',
+        strategyValue(professional.thesisStatus)
+      ) +
+      strategyMetricCard(
+        'Valuation',
+        strategyValue(valuation.state)
+      ) +
+      strategyMetricCard(
+        'Company risk',
+        strategyValue(risk.state)
+      ) +
+      strategyMetricCard(
+        'Your risk fit',
+        strategyValue(suitability.state)
+      ) +
+      strategyMetricCard(
+        'Timing',
+        strategyValue(technical.timingState)
+      ) +
+      strategyMetricCard(
+        'Evidence',
+        strategyValue(evidence.confidence)
+      ) +
+      strategyMetricCard(
+        'Current holding',
+        personal.hasPosition
+          ? formatNumber(
+              personal.currentPortfolioWeightPct,
+              1
+            ) + '%'
+          : 'None'
+      ) +
+      '</div>';
+  }
 
   html +=
     '<p class="strategyReason"><strong>NOMAD view:</strong> ' +
-    escapeHtml(
-      professional.reason ||
-      ''
-    ) +
+    escapeHtml(professional.reason || '') +
     '</p>' +
     '<p class="strategyReason"><strong>Your action:</strong> ' +
-    escapeHtml(
-      personal.reason ||
-      ''
-    ) +
+    escapeHtml(personal.reason || '') +
     '</p>';
 
-  html +=
-    '<div class="strategySections">' +
-    '<div class="strategySection"><h3>Performance & price action</h3>' +
-    '<div class="strategyLine"><span>5 sessions</span><strong>' +
-    formatPercent(
-      performance.d5Pct
-    ) +
-    '</strong></div>' +
-    '<div class="strategyLine"><span>1 month</span><strong>' +
-    formatPercent(
-      performance.m1Pct
-    ) +
-    '</strong></div>' +
-    '<div class="strategyLine"><span>3 months</span><strong>' +
-    formatPercent(
-      performance.m3Pct
-    ) +
-    '</strong></div>' +
-    '<div class="strategyLine"><span>1 year</span><strong>' +
-    formatPercent(
-      performance.y1Pct
-    ) +
-    '</strong></div>' +
-    '<div class="strategyLine"><span>Trend</span><strong>' +
-    strategyValue(
-      technical.trend
-    ) +
-    '</strong></div>' +
-    '<div class="strategyLine"><span>Setup</span><strong>' +
-    strategyValue(
-      technical.setup
-    ) +
-    '</strong></div>' +
-    '<div class="strategyLine"><span>Candle</span><strong>' +
-    strategyValue(
-      technical.candlePattern
-    ) +
-    '</strong></div>' +
-    '<div class="strategyLine"><span>Support</span><strong>' +
-    (
-      technical.support !== null &&
-      technical.support !== undefined
+  if (isShortTerm) {
+    const entryText =
+      technical.entryLow !== null &&
+      technical.entryLow !== undefined &&
+      technical.entryHigh !== null &&
+      technical.entryHigh !== undefined
         ? 'PKR ' +
-          formatNumber(
-            technical.support,
-            2
-          )
-        : '—'
-    ) +
-    '</strong></div>' +
-    '<div class="strategyLine"><span>Resistance</span><strong>' +
-    (
-      technical.resistance !== null &&
-      technical.resistance !== undefined
-        ? 'PKR ' +
-          formatNumber(
-            technical.resistance,
-            2
-          )
-        : '—'
-    ) +
-    '</strong></div>' +
-    '<div class="strategyLine"><span>Reward / risk</span><strong>' +
-    (
-      technical.rewardRisk !== null &&
-      technical.rewardRisk !== undefined
-        ? formatNumber(
-            technical.rewardRisk,
-            2
-          ) + 'x'
-        : '—'
-    ) +
-    '</strong></div>' +
-    '</div>' +
-    '<div class="strategySection"><h3>Professional evidence</h3>' +
-    '<div class="strategyLine"><span>Headline financials</span><strong>' +
-    strategyValue(
-      financial.headlineView ||
-      financial.overall
-    ) +
-    '</strong></div>' +
-    '<div class="strategyLine"><span>Deep financial validation</span><strong>' +
-    strategyValue(
-      financial.deepValidation
-    ) +
-    '</strong></div>' +
-    '<div class="strategyLine"><span>Earnings quality</span><strong>' +
-    strategyValue(
-      financial.earningsQuality
-    ) +
-    '</strong></div>' +
-    '<div class="strategyLine"><span>Cash flow</span><strong>' +
-    strategyValue(
-      financial.cashFlowQuality
-    ) +
-    '</strong></div>' +
-    '<div class="strategyLine"><span>Balance sheet</span><strong>' +
-    strategyValue(
-      financial.balanceSheet
-    ) +
-    '</strong></div>' +
-    '<div class="strategyLine"><span>P/E</span><strong>' +
-    (
-      valuation.peRatio !== null &&
-      valuation.peRatio !== undefined
-        ? formatNumber(
-            valuation.peRatio,
-            2
-          ) + 'x'
-        : '—'
-    ) +
-    '</strong></div>' +
-    '<div class="strategyLine"><span>Dividend yield</span><strong>' +
-    formatPercent(
-      valuation.dividendYield
-    ) +
-    '</strong></div>' +
-    '<div class="strategyLine"><span>20D volatility</span><strong>' +
-    formatPercent(
-      risk.annualizedVolatility20dPct
-    ) +
-    '</strong></div>' +
-    '<div class="strategyLine"><span>52W max drawdown</span><strong>' +
-    formatPercent(
-      risk.maxDrawdown52wPct
-    ) +
-    '</strong></div>' +
-    '<div class="strategyLine"><span>Summary evidence</span><strong>' +
-    formatNumber(
-      evidence.summaryCoveragePct ||
-      0,
-      0
-    ) + '%</strong></div>' +
-    '<div class="strategyLine"><span>Extended evidence</span><strong>' +
-    formatNumber(
-      evidence.extendedCoveragePct ||
-      0,
-      0
-    ) + '%</strong></div>' +
-    '</div></div>';
+          formatNumber(technical.entryLow, 2) +
+          ' – ' +
+          formatNumber(technical.entryHigh, 2)
+        : '—';
+
+    html +=
+      '<div class="strategySections">' +
+      '<div class="strategySection"><h3>Trade setup & execution</h3>' +
+      '<div class="strategyLine"><span>5 sessions</span><strong>' +
+      formatPercent(performance.d5Pct) +
+      '</strong></div>' +
+      '<div class="strategyLine"><span>1 month</span><strong>' +
+      formatPercent(performance.m1Pct) +
+      '</strong></div>' +
+      '<div class="strategyLine"><span>Structure</span><strong>' +
+      strategyValue(
+        technical.structureBias ||
+        technical.trend
+      ) +
+      '</strong></div>' +
+      '<div class="strategyLine"><span>Setup</span><strong>' +
+      strategyValue(technical.setup) +
+      '</strong></div>' +
+      '<div class="strategyLine"><span>Candle</span><strong>' +
+      strategyValue(technical.candlePattern) +
+      '</strong></div>' +
+      '<div class="strategyLine"><span>Entry zone</span><strong>' +
+      entryText +
+      '</strong></div>' +
+      '<div class="strategyLine"><span>Stop / invalidation</span><strong>' +
+      (
+        technical.stop !== null &&
+        technical.stop !== undefined
+          ? 'PKR ' +
+            formatNumber(technical.stop, 2)
+          : '—'
+      ) +
+      '</strong></div>' +
+      '<div class="strategyLine"><span>Target 1</span><strong>' +
+      (
+        technical.target1 !== null &&
+        technical.target1 !== undefined
+          ? 'PKR ' +
+            formatNumber(technical.target1, 2)
+          : '—'
+      ) +
+      '</strong></div>' +
+      '<div class="strategyLine"><span>Target 2</span><strong>' +
+      (
+        technical.target2 !== null &&
+        technical.target2 !== undefined
+          ? 'PKR ' +
+            formatNumber(technical.target2, 2)
+          : '—'
+      ) +
+      '</strong></div>' +
+      '<div class="strategyLine"><span>Reward / risk</span><strong>' +
+      (
+        technical.rewardRisk !== null &&
+        technical.rewardRisk !== undefined
+          ? formatNumber(technical.rewardRisk, 2) + 'x'
+          : '—'
+      ) +
+      '</strong></div>' +
+      '<div class="strategyLine"><span>Risk / share</span><strong>' +
+      (
+        technical.riskPerShare !== null &&
+        technical.riskPerShare !== undefined
+          ? 'PKR ' +
+            formatNumber(technical.riskPerShare, 2)
+          : '—'
+      ) +
+      '</strong></div>' +
+      '</div>' +
+      '<div class="strategySection"><h3>Trader evidence & risk</h3>' +
+      '<div class="strategyLine"><span>Technical evidence</span><strong>' +
+      strategyValue(evidence.confidence) +
+      '</strong></div>' +
+      '<div class="strategyLine"><span>Technical coverage</span><strong>' +
+      formatNumber(
+        evidence.technicalCoveragePct ||
+        evidence.score ||
+        0,
+        0
+      ) + '%</strong></div>' +
+      '<div class="strategyLine"><span>Setup plan</span><strong>' +
+      strategyValue(
+        evidence.setupCompleteness ||
+        technical.tradePlanState
+      ) +
+      '</strong></div>' +
+      '<div class="strategyLine"><span>History sessions</span><strong>' +
+      strategyValue(evidence.validSessions) +
+      '</strong></div>' +
+      '<div class="strategyLine"><span>RSI 14</span><strong>' +
+      strategyValue(
+        technical.rsi14 !== null &&
+        technical.rsi14 !== undefined
+          ? formatNumber(technical.rsi14, 2)
+          : null
+      ) +
+      '</strong></div>' +
+      '<div class="strategyLine"><span>MACD histogram</span><strong>' +
+      strategyValue(
+        technical.macdHistogram !== null &&
+        technical.macdHistogram !== undefined
+          ? formatNumber(
+              technical.macdHistogram,
+              4
+            )
+          : null
+      ) +
+      '</strong></div>' +
+      '<div class="strategyLine"><span>Volume vs 20D avg</span><strong>' +
+      (
+        technical.volumeRatio20d !== null &&
+        technical.volumeRatio20d !== undefined
+          ? formatNumber(
+              technical.volumeRatio20d,
+              2
+            ) + 'x'
+          : '—'
+      ) +
+      '</strong></div>' +
+      '<div class="strategyLine"><span>ATR 14</span><strong>' +
+      (
+        technical.atr14 !== null &&
+        technical.atr14 !== undefined
+          ? 'PKR ' +
+            formatNumber(technical.atr14, 2) +
+            (
+              technical.atrPct !== null &&
+              technical.atrPct !== undefined
+                ? ' (' +
+                  formatPercent(
+                    technical.atrPct
+                  ) +
+                  ')'
+                : ''
+            )
+          : '—'
+      ) +
+      '</strong></div>' +
+      '<div class="strategyLine"><span>20D annualized volatility</span><strong>' +
+      formatPercent(
+        risk.annualizedVolatility20dPct
+      ) +
+      '</strong></div>' +
+      '<div class="strategyLine"><span>30D average volume</span><strong>' +
+      formatNumber(
+        risk.averageVolume30d ||
+        0,
+        0
+      ) +
+      '</strong></div>' +
+      '<div class="strategyLine"><span>Financial context</span><strong>' +
+      strategyValue(
+        financial.headlineView ||
+        'SECONDARY'
+      ) +
+      '</strong></div>' +
+      '</div></div>';
+
+    if (technical.invalidation) {
+      html +=
+        '<p class="strategyReason"><strong>Invalidation:</strong> ' +
+        escapeHtml(technical.invalidation) +
+        '</p>';
+    }
+  } else {
+    html +=
+      '<div class="strategySections">' +
+      '<div class="strategySection"><h3>Performance & price action</h3>' +
+      '<div class="strategyLine"><span>5 sessions</span><strong>' +
+      formatPercent(performance.d5Pct) +
+      '</strong></div>' +
+      '<div class="strategyLine"><span>1 month</span><strong>' +
+      formatPercent(performance.m1Pct) +
+      '</strong></div>' +
+      '<div class="strategyLine"><span>3 months</span><strong>' +
+      formatPercent(performance.m3Pct) +
+      '</strong></div>' +
+      '<div class="strategyLine"><span>1 year</span><strong>' +
+      formatPercent(performance.y1Pct) +
+      '</strong></div>' +
+      '<div class="strategyLine"><span>Trend</span><strong>' +
+      strategyValue(technical.trend) +
+      '</strong></div>' +
+      '<div class="strategyLine"><span>Setup</span><strong>' +
+      strategyValue(technical.setup) +
+      '</strong></div>' +
+      '<div class="strategyLine"><span>Candle</span><strong>' +
+      strategyValue(technical.candlePattern) +
+      '</strong></div>' +
+      '<div class="strategyLine"><span>Support</span><strong>' +
+      (
+        technical.support !== null &&
+        technical.support !== undefined
+          ? 'PKR ' +
+            formatNumber(
+              technical.support,
+              2
+            )
+          : '—'
+      ) +
+      '</strong></div>' +
+      '<div class="strategyLine"><span>Resistance</span><strong>' +
+      (
+        technical.resistance !== null &&
+        technical.resistance !== undefined
+          ? 'PKR ' +
+            formatNumber(
+              technical.resistance,
+              2
+            )
+          : '—'
+      ) +
+      '</strong></div>' +
+      '<div class="strategyLine"><span>Reward / risk</span><strong>' +
+      (
+        technical.rewardRisk !== null &&
+        technical.rewardRisk !== undefined
+          ? formatNumber(
+              technical.rewardRisk,
+              2
+            ) + 'x'
+          : '—'
+      ) +
+      '</strong></div>' +
+      '</div>' +
+      '<div class="strategySection"><h3>Professional evidence</h3>' +
+      '<div class="strategyLine"><span>Headline financials</span><strong>' +
+      strategyValue(
+        financial.headlineView ||
+        financial.overall
+      ) +
+      '</strong></div>' +
+      '<div class="strategyLine"><span>Deep financial validation</span><strong>' +
+      strategyValue(financial.deepValidation) +
+      '</strong></div>' +
+      '<div class="strategyLine"><span>Earnings quality</span><strong>' +
+      strategyValue(financial.earningsQuality) +
+      '</strong></div>' +
+      '<div class="strategyLine"><span>Cash flow</span><strong>' +
+      strategyValue(financial.cashFlowQuality) +
+      '</strong></div>' +
+      '<div class="strategyLine"><span>Balance sheet</span><strong>' +
+      strategyValue(financial.balanceSheet) +
+      '</strong></div>' +
+      '<div class="strategyLine"><span>P/E</span><strong>' +
+      (
+        valuation.peRatio !== null &&
+        valuation.peRatio !== undefined
+          ? formatNumber(
+              valuation.peRatio,
+              2
+            ) + 'x'
+          : '—'
+      ) +
+      '</strong></div>' +
+      '<div class="strategyLine"><span>Dividend yield</span><strong>' +
+      formatPercent(valuation.dividendYield) +
+      '</strong></div>' +
+      '<div class="strategyLine"><span>20D volatility</span><strong>' +
+      formatPercent(risk.annualizedVolatility20dPct) +
+      '</strong></div>' +
+      '<div class="strategyLine"><span>52W max drawdown</span><strong>' +
+      formatPercent(risk.maxDrawdown52wPct) +
+      '</strong></div>' +
+      '<div class="strategyLine"><span>Summary evidence</span><strong>' +
+      formatNumber(
+        evidence.summaryCoveragePct ||
+        0,
+        0
+      ) + '%</strong></div>' +
+      '<div class="strategyLine"><span>Extended evidence</span><strong>' +
+      formatNumber(
+        evidence.extendedCoveragePct ||
+        0,
+        0
+      ) + '%</strong></div>' +
+      '</div></div>';
+  }
 
   const issues =
-    Array.isArray(
-      suitability.issues
-    )
+    Array.isArray(suitability.issues)
       ? suitability.issues
       : [];
 
@@ -44911,8 +46237,7 @@ function renderStockStrategy(
       '</ul></div>';
   }
 
-  target.innerHTML =
-    html;
+  target.innerHTML = html;
 }
 
 async function loadStockStrategy(
@@ -45307,27 +46632,53 @@ function renderShadowDecision(
       ''
     ) +
     '</div></div>' +
-    '<span>Evidence confidence ' +
-    escapeHtml(
-      decision.evidence
-        ?.confidence ||
-      'UNRESOLVED'
+    '<span>' +
+    (
+      result?.input?.horizon === 'short_term'
+        ? 'Technical evidence ' +
+          escapeHtml(
+            decision.evidence
+              ?.confidence ||
+            'UNRESOLVED'
+          ) +
+          ' · Coverage ' +
+          formatNumber(
+            decision.evidence
+              ?.technicalCoveragePct ||
+            decision.evidence
+              ?.score ||
+            0,
+            0
+          ) +
+          '% · Trade plan ' +
+          escapeHtml(
+            decision.evidence
+              ?.setupCompleteness ||
+            'INCOMPLETE'
+          )
+        : 'Evidence confidence ' +
+          escapeHtml(
+            decision.evidence
+              ?.confidence ||
+            'UNRESOLVED'
+          ) +
+          ' · Summary ' +
+          formatNumber(
+            decision.evidence
+              ?.summaryCoveragePct ||
+            0,
+            0
+          ) +
+          '% · Extended ' +
+          formatNumber(
+            decision.evidence
+              ?.extendedCoveragePct ||
+            0,
+            0
+          ) +
+          '%'
     ) +
-    ' · Summary ' +
-    formatNumber(
-      decision.evidence
-        ?.summaryCoveragePct ||
-      0,
-      0
-    ) +
-    '% · Extended ' +
-    formatNumber(
-      decision.evidence
-        ?.extendedCoveragePct ||
-      0,
-      0
-    ) +
-    '%</span>' +
+    '</span>' +
     '</div>' +
     '<div class="decisionMoneyLine">' +
     '<div><span>Requested</span><strong>PKR ' +
@@ -45575,6 +46926,55 @@ function renderShadowDecision(
                 '%'
               : ''
           ) +
+          (
+            item.traderPlan
+              ? ' · setup ' +
+                escapeHtml(
+                  item.traderPlan.setup ||
+                  'DEFINED'
+                ) +
+                (
+                  item.traderPlan.stop !== null &&
+                  item.traderPlan.stop !== undefined
+                    ? ' · stop PKR ' +
+                      formatNumber(
+                        item.traderPlan.stop,
+                        2
+                      )
+                    : ''
+                ) +
+                (
+                  item.traderPlan.target1 !== null &&
+                  item.traderPlan.target1 !== undefined
+                    ? ' · target PKR ' +
+                      formatNumber(
+                        item.traderPlan.target1,
+                        2
+                      )
+                    : ''
+                ) +
+                (
+                  item.traderPlan.rewardRisk !== null &&
+                  item.traderPlan.rewardRisk !== undefined
+                    ? ' · R/R ' +
+                      formatNumber(
+                        item.traderPlan.rewardRisk,
+                        2
+                      ) + 'x'
+                    : ''
+                ) +
+                (
+                  item.traderPlan.riskBudgetPct !== null &&
+                  item.traderPlan.riskBudgetPct !== undefined
+                    ? ' · risk budget ' +
+                      formatNumber(
+                        item.traderPlan.riskBudgetPct,
+                        2
+                      ) + '%'
+                    : ''
+                )
+              : ''
+          ) +
           '</div></div>' +
           '<div class="decisionActionTag ' +
           escapeHtml(
@@ -45786,6 +47186,41 @@ if ($('decisionRisk') && $('strategyRisk')) {
       }
     );
 }
+
+['strategyHorizon', 'strategyRisk']
+  .forEach(
+    id => {
+      if (!$(id)) {
+        return;
+      }
+
+      $(id).addEventListener(
+        'change',
+        () => {
+          const symbol =
+            String(
+              $('strategySymbol')
+                ?.value ||
+              ''
+            )
+              .trim()
+              .toUpperCase();
+
+          if (!symbol) {
+            return;
+          }
+
+          $('stockStrategyResult')
+            .innerHTML =
+              '<div class="terminalEmpty small">Strategy settings changed. NOMAD is re-running this stock under the selected horizon and risk profile...</div>';
+
+          loadStockStrategy(
+            symbol
+          );
+        }
+      );
+    }
+  );
 
 if ($('findBestOption')) {
   $('findBestOption')
