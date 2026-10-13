@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.3.2.2';
+const VERSION = '0.9.3.2.3';
 
 
 const SUPABASE_URL =
@@ -45446,6 +45446,26 @@ $('loadQuote')
             error.message;
       }
     };
+
+/* =========================================================
+   RESEARCH SYMBOL ENTER KEY
+========================================================= */
+
+$('stockSymbol')
+  .addEventListener(
+    'keydown',
+    event => {
+      if (
+        event.key === 'Enter' &&
+        !event.isComposing
+      ) {
+        event.preventDefault();
+
+        $('loadQuote')
+          .click();
+      }
+    }
+  );
 
 /* =========================================================
    LIVE CHART BUTTON
