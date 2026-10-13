@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.3.1';
+const VERSION = '0.9.3.2';
 
 
 const SUPABASE_URL =
@@ -20062,6 +20062,12 @@ const DECISION_TRADER_RISK_BUDGET_PCT = {
   aggressive: 0.015
 };
 
+// Execution practicality. PSX regular-market equities use a one-share
+// marketable lot, but NOMAD still avoids economically trivial positions.
+const DECISION_MIN_MEANINGFUL_POSITION_PKR = 1000;
+const DECISION_MAX_MEANINGFUL_POSITION_FLOOR_PKR = 50000;
+const DECISION_MEANINGFUL_POSITION_BUDGET_PCT = 0.05;
+
 function decisionClamp(
   value,
   minimum = 0,
@@ -21890,6 +21896,214 @@ function professionalRiskState(score) {
   return 'HIGH';
 }
 
+function professionalLongTermEntryExtension(
+  candidate
+) {
+  const context =
+    candidate?.historicalContext ||
+    {};
+  const returns =
+    context.returns ||
+    {};
+  const movingAverages =
+    context.movingAverages ||
+    {};
+  const technical =
+    context.technical ||
+    {};
+
+  const price =
+    safeNumber(
+      context.price
+    ) ??
+    safeNumber(
+      candidate?.price
+    );
+  const m1 =
+    safeNumber(
+      returns.m1
+    );
+  const m3 =
+    safeNumber(
+      returns.m3
+    );
+  const m6 =
+    safeNumber(
+      returns.m6
+    );
+  const sma20 =
+    safeNumber(
+      movingAverages.sma20
+    );
+  const sma50 =
+    safeNumber(
+      movingAverages.sma50
+    );
+  const rsi14 =
+    safeNumber(
+      technical.rsi14
+    );
+
+  const distance20Pct =
+    price !== null &&
+    sma20 !== null &&
+    sma20 > 0
+      ? (
+          price - sma20
+        ) /
+        sma20 *
+        100
+      : null;
+
+  const distance50Pct =
+    price !== null &&
+    sma50 !== null &&
+    sma50 > 0
+      ? (
+          price - sma50
+        ) /
+        sma50 *
+        100
+      : null;
+
+  const sector =
+    String(
+      candidate?.sector ||
+      ''
+    ).toLowerCase();
+
+  const cyclicalSector = [
+    'refin',
+    'cement',
+    'steel',
+    'engineering',
+    'oil & gas',
+    'oil and gas',
+    'textile',
+    'paper',
+    'sugar',
+    'automobile',
+    'power generation'
+  ].some(
+    keyword =>
+      sector.includes(
+        keyword
+      )
+  );
+
+  let score = 0;
+  const reasons = [];
+
+  if (m1 !== null && m1 >= 20) {
+    score += m1 >= 35 ? 2 : 1;
+    reasons.push(
+      'The stock has already rerated sharply over the last month.'
+    );
+  }
+
+  if (m3 !== null && m3 >= 50) {
+    score +=
+      m3 >= 120
+        ? 3
+        : m3 >= 80
+          ? 2
+          : 1;
+    reasons.push(
+      'The three-month price advance is large enough to increase chase risk.'
+    );
+  }
+
+  if (m6 !== null && m6 >= 100) {
+    score += 1;
+    reasons.push(
+      'The six-month rerating has been unusually strong.'
+    );
+  }
+
+  if (
+    distance20Pct !== null &&
+    distance20Pct >= 10
+  ) {
+    score +=
+      distance20Pct >= 18
+        ? 2
+        : 1;
+    reasons.push(
+      'Price is extended above its 20-session moving average.'
+    );
+  }
+
+  if (
+    distance50Pct !== null &&
+    distance50Pct >= 18
+  ) {
+    score +=
+      distance50Pct >= 30
+        ? 2
+        : 1;
+    reasons.push(
+      'Price is extended above its 50-session moving average.'
+    );
+  }
+
+  if (rsi14 !== null && rsi14 >= 70) {
+    score += 1;
+    reasons.push(
+      'RSI is elevated, which reduces the margin for an aggressive entry.'
+    );
+  }
+
+  if (
+    cyclicalSector &&
+    m3 !== null &&
+    m3 >= 50
+  ) {
+    score += 1;
+    reasons.push(
+      'This is a cyclical sector, so a strong rerating also raises peak-earnings and normalization risk.'
+    );
+  }
+
+  const state =
+    score >= 6
+      ? 'EXTREME'
+      : score >= 4
+        ? 'HIGH'
+        : score >= 2
+          ? 'MODERATE'
+          : 'LOW';
+
+  const timingPenalty =
+    state === 'EXTREME'
+      ? 20
+      : state === 'HIGH'
+        ? 12
+        : state === 'MODERATE'
+          ? 6
+          : 0;
+
+  return {
+    state,
+    score,
+    timingPenalty,
+    distance20Pct:
+      decisionRound(
+        distance20Pct,
+        2
+      ),
+    distance50Pct:
+      decisionRound(
+        distance50Pct,
+        2
+      ),
+    cyclicalSector,
+    reasons:
+      uniqueTextValues(
+        reasons
+      )
+  };
+}
+
 function professionalLongTermView(
   candidate,
   analystGate,
@@ -21902,13 +22116,21 @@ function professionalLongTermView(
     safeNumber(candidate?.valuation?.score) || 0;
   const riskScore =
     safeNumber(candidate?.risk?.score) || 0;
-  // Long-term 0.9.2.6 behavior is intentionally frozen. The shared
-  // historical context now exposes richer priceAction for the Trader brain,
-  // but the Investor brain continues to use its pre-existing entry score so
-  // short-term plumbing cannot silently change long-term rankings/actions.
-  const timingScore =
+  // Long-term remains thesis-led, but a professional investor must not
+  // confuse a strong business with a good entry after an extreme rerating.
+  // This guard only affects entry timing/sizing; it does not rewrite the thesis.
+  const baseTimingScore =
     safeNumber(candidate?.entry?.score) ??
     50;
+  const entryExtension =
+    professionalLongTermEntryExtension(
+      candidate
+    );
+  const timingScore =
+    decisionClamp(
+      baseTimingScore -
+      entryExtension.timingPenalty
+    );
   const timingState =
     timingScore >= 72
       ? 'GOOD'
@@ -21961,8 +22183,15 @@ function professionalLongTermView(
       valuationState: professionalValuationState(valuationScore),
       riskScore,
       riskState: professionalRiskState(riskScore),
+      baseTimingScore,
       timingScore,
       timingState,
+      entryExtensionRisk:
+        entryExtension.state,
+      entryExtensionScore:
+        entryExtension.score,
+      entryExtensionReasons:
+        entryExtension.reasons,
       rankingScore,
       marketAction: 'RESEARCHING',
       opportunityTier: 'EVIDENCE_RESEARCH',
@@ -21983,8 +22212,15 @@ function professionalLongTermView(
       valuationState: professionalValuationState(valuationScore),
       riskScore,
       riskState: professionalRiskState(riskScore),
+      baseTimingScore,
       timingScore,
       timingState,
+      entryExtensionRisk:
+        entryExtension.state,
+      entryExtensionScore:
+        entryExtension.score,
+      entryExtensionReasons:
+        entryExtension.reasons,
       rankingScore,
       marketAction: 'AVOID',
       opportunityTier: 'LOW_PRIORITY',
@@ -22009,6 +22245,10 @@ function professionalLongTermView(
     valuationScore >= 62 &&
     evidence.confidence !== 'UNRESOLVED';
 
+  const highChaseRisk =
+    entryExtension.state === 'HIGH' ||
+    entryExtension.state === 'EXTREME';
+
   const thesisDescription =
     thesisStatus === 'STRONG'
       ? 'strong'
@@ -22022,18 +22262,25 @@ function professionalLongTermView(
     if (timingState === 'GOOD') {
       marketAction =
         analystGate.state === 'VALIDATED' &&
-        highConviction
+        highConviction &&
+        !highChaseRisk
           ? 'BUY'
           : 'ACCUMULATE';
       opportunityTier = 'PRIORITY_1';
       reason =
-        marketAction === 'BUY'
-          ? 'The long-term thesis, valuation, risk and current technical timing all support a new position.'
-          : 'The long-term thesis is ' + thesisDescription + ', but NOMAD prefers staged exposure because conviction or evidence is not yet complete.';
+        highChaseRisk
+          ? 'The long-term thesis remains ' + thesisDescription + ', but the stock has rerated sharply and chase risk is elevated. NOMAD prefers staged accumulation rather than treating a strong recent run as a fresh full-size entry.'
+          : marketAction === 'BUY'
+            ? 'The long-term thesis, valuation, risk and current technical timing all support a new position.'
+            : 'The long-term thesis is ' + thesisDescription + ', but NOMAD prefers staged exposure because conviction or evidence is not yet complete.';
     } else if (timingState === 'FAIR') {
       marketAction = 'ACCUMULATE';
       opportunityTier = 'PRIORITY_1';
-      reason = 'The long-term thesis is ' + thesisDescription + '. Entry timing is acceptable but not strong enough to justify aggressive deployment.';
+      reason =
+        entryExtension.state === 'HIGH' ||
+        entryExtension.state === 'EXTREME'
+          ? 'The long-term thesis is ' + thesisDescription + ', but recent price extension and rerating reduce the margin of safety. NOMAD prefers staged accumulation or a better entry rather than chasing the move.'
+          : 'The long-term thesis is ' + thesisDescription + '. Entry timing is acceptable but not strong enough to justify aggressive deployment.';
     } else {
       marketAction = 'WATCH';
       opportunityTier = 'PRIORITY_2';
@@ -22056,8 +22303,15 @@ function professionalLongTermView(
     valuationState: professionalValuationState(valuationScore),
     riskScore,
     riskState: professionalRiskState(riskScore),
+    baseTimingScore,
     timingScore,
     timingState,
+    entryExtensionRisk:
+      entryExtension.state,
+    entryExtensionScore:
+      entryExtension.score,
+    entryExtensionReasons:
+      entryExtension.reasons,
     rankingScore,
     marketAction,
     opportunityTier,
@@ -23211,6 +23465,37 @@ function decisionProfileSuitability(
   };
 }
 
+function decisionMinimumMeaningfulPositionPkr(
+  newMoneyAmountPkr
+) {
+  const amount =
+    Math.max(
+      0,
+      safeNumber(
+        newMoneyAmountPkr
+      ) || 0
+    );
+
+  if (amount <= 0) {
+    return 0;
+  }
+
+  return decisionRound(
+    Math.min(
+      amount,
+      Math.max(
+        DECISION_MIN_MEANINGFUL_POSITION_PKR,
+        Math.min(
+          DECISION_MAX_MEANINGFUL_POSITION_FLOOR_PKR,
+          amount *
+            DECISION_MEANINGFUL_POSITION_BUDGET_PCT
+        )
+      )
+    ),
+    2
+  );
+}
+
 function decisionCenterTargetPositionCount(
   totalCapitalPkr,
   riskPolicy
@@ -23899,8 +24184,15 @@ function allocateDecisionCenterOpportunities(
   opportunityBoard,
   amount,
   riskPolicy,
-  portfolioContext = null
+  portfolioContext = null,
+  options = {}
 ) {
+  const sectorConstraint =
+    String(
+      options?.sectorConstraint ||
+      ''
+    ).trim() ||
+    null;
   const budgetPaisa =
     Math.max(
       0,
@@ -23967,6 +24259,21 @@ function allocateDecisionCenterOpportunities(
     decisionCenterDynamicCaps(
       sizingPositionCount,
       riskPolicy
+    );
+
+  const effectiveSectorCapPct =
+    sectorConstraint
+      ? 1
+      : dynamicCaps.sectorCapPct;
+
+  const minimumMeaningfulPositionPkr =
+    decisionMinimumMeaningfulPositionPkr(
+      amount
+    );
+  const minimumMeaningfulPositionPaisa =
+    Math.round(
+      minimumMeaningfulPositionPkr *
+      100
     );
 
   const deploymentPlan =
@@ -24036,10 +24343,18 @@ function allocateDecisionCenterOpportunities(
         ),
       dynamicMaxSectorPct:
         decisionRound(
-          dynamicCaps.sectorCapPct *
+          effectiveSectorCapPct *
           100,
           2
         ),
+      sectorConstraint,
+      concentrationWarning:
+        sectorConstraint
+          ? 'This plan is intentionally restricted to ' + sectorConstraint + '. Cross-sector diversification is disabled by user choice; stock-level evidence, risk and sizing gates remain active.'
+          : null,
+      minimumMeaningfulPositionPkr,
+      marketableLotPolicy:
+        'PSX_REGULAR_ONE_SHARE',
       unfundedPriorityOne: [],
       personalActions: []
     };
@@ -24176,7 +24491,7 @@ function allocateDecisionCenterOpportunities(
     const sectorTotalCap =
       Math.floor(
         postFundingCapitalBasePaisa *
-        dynamicCaps.sectorCapPct
+        effectiveSectorCapPct
       );
 
     const sectorGap =
@@ -24247,6 +24562,50 @@ function allocateDecisionCenterOpportunities(
           traderRiskValueCap
         )
       );
+
+    if (
+      allowed > 0 &&
+      allowed <
+        minimumMeaningfulPositionPaisa &&
+      budgetPaisa >=
+        minimumMeaningfulPositionPaisa
+    ) {
+      personalActions.push({
+        symbol:
+          candidate.symbol,
+        marketView:
+          candidate.canonicalState
+            ?.marketAction ||
+          candidate.decisionCenterView,
+        portfolioAction:
+          'NO_ADD',
+        allocationTier:
+          candidate.allocationTier,
+        existingWeightPct:
+          decisionRound(
+            existingStockWeightPct,
+            2
+          ),
+        targetWeightPct:
+          decisionRound(
+            stockTotalCap /
+            Math.max(
+              1,
+              postFundingCapitalBasePaisa
+            ) *
+            100,
+            2
+          ),
+        reason:
+          "The feasible new-money position would be below NOMAD\'s minimum meaningful position of PKR " +
+          decisionRound(
+            minimumMeaningfulPositionPkr,
+            0
+          ) +
+          ', so the engine does not create an economically trivial holding.'
+      });
+      continue;
+    }
 
     const shares =
       Math.floor(
@@ -24868,10 +25227,18 @@ function allocateDecisionCenterOpportunities(
       ),
     dynamicMaxSectorPct:
       decisionRound(
-        dynamicCaps.sectorCapPct *
+        effectiveSectorCapPct *
         100,
         2
       ),
+    sectorConstraint,
+    concentrationWarning:
+      sectorConstraint
+        ? 'This plan is intentionally restricted to ' + sectorConstraint + '. Cross-sector diversification is disabled by user choice; stock-level evidence, risk and sizing gates remain active.'
+        : null,
+    minimumMeaningfulPositionPkr,
+    marketableLotPolicy:
+      'PSX_REGULAR_ONE_SHARE',
     unfundedPriorityOne,
     personalActions
   };
@@ -26703,6 +27070,12 @@ async function runDecisionLab(
       'balanced'
     );
 
+  const requestedSector =
+    String(
+      input?.sector ||
+      ''
+    ).trim();
+
   if (
     amount === null ||
     amount <= 0 ||
@@ -26758,6 +27131,56 @@ async function runDecisionLab(
       market
     );
 
+  const availableSectors =
+    [
+      ...new Set(
+        (market.stocks || [])
+          .map(
+            row =>
+              String(
+                row.sector ||
+                ''
+              ).trim()
+          )
+          .filter(
+            sector =>
+              sector &&
+              sector.toUpperCase() !==
+                'UNKNOWN'
+          )
+      )
+    ].sort();
+
+  const selectedSector =
+    requestedSector
+      ? availableSectors.find(
+          sector =>
+            sector.toLowerCase() ===
+            requestedSector.toLowerCase()
+        ) || null
+      : null;
+
+  if (
+    requestedSector &&
+    !selectedSector
+  ) {
+    bad(
+      'Select a valid PSX industry/sector.'
+    );
+  }
+
+  const scopedMarketRows =
+    selectedSector
+      ? (market.stocks || []).filter(
+          row =>
+            String(
+              row.sector ||
+              ''
+            ).trim() ===
+            selectedSector
+        )
+      : market.stocks;
+
   const researchCapitalBasePkr =
     amount +
     (
@@ -26780,7 +27203,7 @@ async function runDecisionLab(
     );
 
   const eligibleRows =
-    market.stocks
+    scopedMarketRows
       .filter(
         row =>
           row.recommendationEligible ===
@@ -26870,6 +27293,7 @@ async function runDecisionLab(
       0;
 
     if (
+      !selectedSector &&
       count >=
         DECISION_CENTER_MAX_SHORTLIST_PER_SECTOR
     ) {
@@ -26919,7 +27343,9 @@ async function runDecisionLab(
             2
           ),
         horizon,
-        risk
+        risk,
+        sector:
+          selectedSector
       },
       market: {
         asOf:
@@ -27395,7 +27821,11 @@ async function runDecisionLab(
       opportunityBoard,
       amount,
       riskPolicy,
-      portfolioContext
+      portfolioContext,
+      {
+        sectorConstraint:
+          selectedSector
+      }
     );
 
   let action = 'WATCH';
@@ -27743,7 +28173,13 @@ async function runDecisionLab(
       dataBlocked:
         dataBlockedCount,
       rankingBudgetIndependent:
-        true
+        true,
+      sectorConstraint:
+        selectedSector,
+      availableSectorCount:
+        availableSectors.length,
+      scopedUniverseCount:
+        scopedMarketRows.length
     },
     decision: {
       action,
@@ -27830,6 +28266,18 @@ async function runDecisionLab(
       dynamicMaxSectorPct:
         allocation.dynamicMaxSectorPct ||
         0,
+      sectorConstraint:
+        allocation.sectorConstraint ||
+        null,
+      concentrationWarning:
+        allocation.concentrationWarning ||
+        null,
+      minimumMeaningfulPositionPkr:
+        allocation.minimumMeaningfulPositionPkr ||
+        0,
+      marketableLotPolicy:
+        allocation.marketableLotPolicy ||
+        'PSX_REGULAR_ONE_SHARE',
       personalActions:
         allocation.personalActions ||
         [],
@@ -27862,6 +28310,14 @@ async function runDecisionLab(
       'No order-execution capability exists. The user remains the final decision maker.',
       'Current scoring rules remain supporting evidence only; Priority 1 now also requires the Financial Analyst evidence gate.',
       'Opportunity ranking is independent of the entered budget. Portfolio construction targets at least three funded stocks and scales up to eight, but never forces a weak, unresolved, profile-unsuitable, unaffordable, or portfolio-incompatible name merely to hit the count.',
+      'PSX regular-market equities use a one-share marketable lot; NOMAD therefore uses a minimum meaningful PKR position instead of outdated 20/50/100/500-share board-lot rules.',
+      ...(
+        selectedSector
+          ? [
+              'Industry constraint active: ranking, research and allocation are restricted to ' + selectedSector + '. Cross-sector diversification is intentionally disabled by user choice.'
+            ]
+          : []
+      ),
       ...(
         candidates.some(
           candidate =>
@@ -29210,6 +29666,137 @@ function runDecisionEngineSelfTests() {
       DECISION_TRADER_MIN_REWARD_RISK &&
     conditionalTraderPlan.entryHigh < 110,
     'Trader brain must be able to convert a poor current R/R into a conditional pullback entry without lowering the minimum R/R gate'
+  );
+
+  const extensionSynthetic =
+    professionalLongTermEntryExtension({
+      symbol: 'EXTENDED',
+      sector: 'REFINERY',
+      price: 100,
+      historicalContext: {
+        price: 100,
+        returns: {
+          m1: 18,
+          m3: 125,
+          m6: 150
+        },
+        movingAverages: {
+          sma20: 89,
+          sma50: 74
+        },
+        technical: {
+          rsi14: 72
+        }
+      }
+    });
+
+  assert.ok(
+    ['HIGH', 'EXTREME'].includes(
+      extensionSynthetic.state
+    ),
+    'a sharp multi-month rerating with moving-average extension must trigger the long-term chase-risk guard'
+  );
+
+  const extendedLongTermState =
+    decisionCanonicalCompanyState({
+      ...longTermProfessionalCandidate,
+      sector: 'REFINERY',
+      entry: { score: 82 },
+      historicalContext: {
+        available: true,
+        price: 100,
+        returns: {
+          m1: 18,
+          m3: 125,
+          m6: 150
+        },
+        movingAverages: {
+          sma20: 89,
+          sma50: 74
+        },
+        technical: {
+          rsi14: 72,
+          annualizedVolatility20dPct: 40
+        },
+        priceAction: {
+          available: true,
+          timingScore: 88,
+          timingState: 'GOOD',
+          setup: 'UPTREND_CONTINUATION',
+          rewardRisk: 2
+        }
+      }
+    });
+
+  assert.notEqual(
+    extendedLongTermState.marketAction,
+    'BUY',
+    'an extreme recent rerating must prevent the Investor brain from treating the stock as a fresh full-size BUY even when the thesis remains strong'
+  );
+
+  assert.equal(
+    decisionMinimumMeaningfulPositionPkr(5000),
+    1000,
+    'a PKR 5k account must avoid new positions smaller than the PKR 1k execution-practicality floor'
+  );
+
+  assert.equal(
+    decisionMinimumMeaningfulPositionPkr(500000),
+    25000,
+    'a PKR 500k account must use a scaled meaningful-position floor rather than creating token holdings'
+  );
+
+  assert.equal(
+    decisionMinimumMeaningfulPositionPkr(2000000),
+    50000,
+    'the meaningful-position floor must remain capped so larger portfolios can still diversify normally'
+  );
+
+  const sameSectorBoard =
+    buildDecisionOpportunityBoard(
+      breadthCandidates.map(
+        item => ({
+          ...item,
+          sector: 'REFINERY'
+        })
+      )
+    );
+
+  const sameSectorConstrainedAllocation =
+    allocateDecisionCenterOpportunities(
+      sameSectorBoard,
+      500000,
+      riskBalanced,
+      null,
+      {
+        sectorConstraint: 'REFINERY'
+      }
+    );
+
+  assert.ok(
+    sameSectorConstrainedAllocation.allocations.length >= 3,
+    'an explicit industry constraint must not let the normal cross-sector cap silently block the entire plan'
+  );
+
+  assert.equal(
+    sameSectorConstrainedAllocation.dynamicMaxSectorPct,
+    100,
+    'an explicit industry constraint must replace the normal sector cap with a concentration warning while keeping stock-level gates active'
+  );
+
+  assert.equal(
+    sameSectorConstrainedAllocation.sectorConstraint,
+    'REFINERY',
+    'industry-constrained allocation must preserve the selected sector in diagnostics'
+  );
+
+  assert.ok(
+    sameSectorConstrainedAllocation.allocations.every(
+      item =>
+        item.principalPkr >=
+        sameSectorConstrainedAllocation.minimumMeaningfulPositionPkr
+    ),
+    'funded positions must respect the minimum meaningful PKR position floor'
   );
 
   const shortTermHighVolCandidate = {
@@ -34665,8 +35252,11 @@ Checking connection...
 <div><label>Horizon</label><select id="decisionHorizon"><option value="long_term">Long-term</option><option value="short_term">Short-term</option></select></div>
 <div><label>Risk</label><select id="decisionRisk"><option value="balanced">Balanced</option><option value="conservative">Conservative</option><option value="aggressive">Aggressive</option></select></div>
 </div>
+<div class="contextRow">
+<div style="grid-column:1/-1"><label>Industry / Sector</label><select id="decisionSector"><option value="">All industries</option></select></div>
+</div>
 <button id="findBestOption" class="primaryWide">Analyze PSX & build plan</button>
-<div class="decisionPrinciple">Priority ranking does not change because of your budget. If a better stock cannot fit one whole share, NOMAD keeps it ranked and leaves cash rather than substituting a weaker idea.</div>
+<div class="decisionPrinciple">Priority ranking does not change because of your budget. Choose an industry only when you intentionally want a sector-constrained plan; NOMAD will not weaken evidence or risk gates to fill it.</div>
 </div>
 
 <div class="terminalCard decisionVerdictCard">
@@ -40432,6 +41022,67 @@ function populateSectors() {
         .join('');
 }
 
+function populateDecisionSectors() {
+  const target =
+    $('decisionSector');
+
+  if (!target) {
+    return;
+  }
+
+  const sectors =
+    [
+      ...new Set(
+        marketRows
+          .map(
+            row =>
+              row.sector
+          )
+          .filter(
+            value =>
+              value &&
+              value !== 'Unknown'
+          )
+      )
+    ].sort();
+
+  target.innerHTML =
+    '<option value="">All industries</option>' +
+    sectors.map(
+      sector =>
+        '<option value="' +
+        escapeHtml(sector) +
+        '">' +
+        escapeHtml(sector) +
+        '</option>'
+    ).join('');
+
+  try {
+    const storedContext =
+      JSON.parse(
+        localStorage.getItem(
+          'nomadDecisionContext'
+        ) ||
+        'null'
+      );
+
+    const preferredSector =
+      storedContext?.sector ||
+      target.dataset.pendingValue ||
+      '';
+
+    if (
+      preferredSector &&
+      sectors.includes(
+        preferredSector
+      )
+    ) {
+      target.value =
+        preferredSector;
+    }
+  } catch {}
+}
+
 /* =========================================================
    METADATA / SECURITY UNIVERSE AUDIT UI
 ========================================================= */
@@ -44138,6 +44789,7 @@ async function loadExploreMarket(
               );
 
     populateSectors();
+    populateDecisionSectors();
 
     renderStocks();
 
@@ -46502,6 +47154,13 @@ function renderStockStrategy(
         strategyValue(technical.timingState)
       ) +
       strategyMetricCard(
+        'Chase risk',
+        strategyValue(
+          professional.entryExtensionRisk ||
+          'LOW'
+        )
+      ) +
+      strategyMetricCard(
         'Evidence',
         strategyValue(evidence.confidence)
       ) +
@@ -46758,6 +47417,12 @@ function renderStockStrategy(
       '</strong></div>' +
       '<div class="strategyLine"><span>3 months</span><strong>' +
       formatPercent(performance.m3Pct) +
+      '</strong></div>' +
+      '<div class="strategyLine"><span>Entry extension</span><strong>' +
+      strategyValue(
+        professional.entryExtensionRisk ||
+        'LOW'
+      ) +
       '</strong></div>' +
       '<div class="strategyLine"><span>1 year</span><strong>' +
       formatPercent(performance.y1Pct) +
@@ -47363,6 +48028,17 @@ function renderShadowDecision(
     '</div>';
 
   if (
+    result?.input?.sector
+  ) {
+    html +=
+      '<div class="decisionMetaLine"><strong>Industry-constrained plan:</strong> ' +
+      escapeHtml(
+        result.input.sector
+      ) +
+      ' only. NOMAD ranks, researches and allocates within this industry; normal cross-sector diversification is intentionally disabled, while stock-level evidence, profile suitability and sizing gates remain active.</div>';
+  }
+
+  if (
     result?.allocationDiagnostics
       ?.portfolioAware
   ) {
@@ -47438,7 +48114,14 @@ function renderShadowDecision(
         0,
         1
       ) +
-      '% per sector.</div>';
+      '% per sector. Minimum meaningful new-money position: PKR ' +
+      formatNumber(
+        result.allocationDiagnostics
+          .minimumMeaningfulPositionPkr ||
+        0,
+        0
+      ) +
+      '.</div>';
 
     if (
       result?.allocationDiagnostics
@@ -47517,7 +48200,7 @@ function renderShadowDecision(
 
   if (allocations.length) {
     html +=
-      '<div class="decisionMetaLine">Whole-share implementation</div>';
+      '<div class="decisionMetaLine">Whole-share implementation · PSX regular-market equities use a one-share marketable lot; NOMAD additionally avoids economically trivial positions.</div>';
 
     html +=
       allocations.map(
@@ -47904,7 +48587,11 @@ if ($('findBestOption')) {
               .value,
           risk:
             $('decisionRisk')
-              .value
+              .value,
+          sector:
+            $('decisionSector')
+              ?.value ||
+            ''
         };
 
         localStorage.setItem(
@@ -48003,7 +48690,11 @@ if ($('saveDecisionContext')) {
               .value,
           risk:
             $('decisionRisk')
-              .value
+              .value,
+          sector:
+            $('decisionSector')
+              ?.value ||
+            ''
         };
 
         localStorage.setItem(
@@ -48059,6 +48750,15 @@ try {
       $('decisionRisk')
         .value =
           storedContext.risk;
+    }
+
+    if (
+      storedContext.sector &&
+      $('decisionSector')
+    ) {
+      $('decisionSector')
+        .dataset.pendingValue =
+          storedContext.sector;
     }
   }
 } catch {}
