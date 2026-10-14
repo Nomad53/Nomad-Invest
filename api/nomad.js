@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.3.8';
+const VERSION = '0.9.3.9';
 
 
 const SUPABASE_URL =
@@ -37235,6 +37235,58 @@ pre {
   }
 }
 
+
+/* Build 0.9.3.9 - information hierarchy cleanup */
+.appMain { padding-top: 18px; }
+.decisionTitleRow { margin-bottom: 12px; }
+.decisionTitleRow .muted { max-width: 620px; }
+.decisionModeBadge { opacity: .72; font-size: 9px; padding: 5px 8px; }
+.setupHelp { margin-top: 9px; font-size: 10px; color: #7890aa; }
+.setupHelp summary, .decisionMethodDetails summary { cursor: pointer; color: #8fb7da; font-weight: 700; }
+.setupHelp > div { margin-top: 6px; line-height: 1.45; }
+.decisionQuickWhy { margin: 10px 0; padding: 10px 12px; border: 1px solid #1d425d; border-radius: 8px; background: #0b1a28; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+.decisionQuickWhy strong { color:#f5f9ff; }
+.decisionQuickWhy span { color:#8fb7da; }
+.decisionMethodDetails { margin: 6px 0 10px; }
+.decisionMethodBody { margin-top:8px; padding:10px; border:1px solid #1a3145; border-radius:8px; background:#091521; }
+.decisionMethodBody .decisionMetaLine { margin: 5px 0; font-size: 10px; line-height:1.42; color:#8095aa; }
+.decisionMethodBody .decisionLeadReason { margin:0 0 7px; font-size:10px; color:#a9bdd0; }
+.allocationNote { font-size:9px !important; color:#6e8295 !important; }
+.closestTriggerCard { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:7px; margin:10px 0 4px; padding:9px; border:1px solid #24445e; border-radius:8px; background:#0b1927; }
+.closestTriggerCard > div { padding:7px 8px; border:1px solid #183247; border-radius:6px; }
+.closestTriggerCard span { display:block; color:#67839d; font-size:8px; text-transform:uppercase; letter-spacing:.07em; }
+.closestTriggerCard strong { display:block; margin-top:3px; color:#f5f9ff; font-size:11px; }
+.decisionBoardHeader { margin-top: 14px; margin-bottom: 8px; }
+.decisionBoardHeader h2 { margin-top:2px; }
+.decisionBoardNote { max-width:360px; font-size:9px; line-height:1.35; }
+.opportunityBoardGrid { align-items:start; }
+.opportunityCard { min-height:0 !important; height:auto !important; }
+.opportunityCard.isEmpty { padding-bottom:10px; }
+.opportunityCard.isEmpty .panelHeader { margin-bottom:4px; }
+.opportunityCard.isEmpty .opportunityList { min-height:0 !important; }
+.opportunityCard.isEmpty .terminalEmpty { min-height:0; padding:10px; }
+.opportunityReason.compact { margin-top:5px; line-height:1.35; color:#a9bdd0; }
+.stockStrategyCard { margin-top:14px; }
+.stockStrategyCard .panelHeader .muted { margin-top:4px; }
+.decisionAuditCard { margin-top:14px; padding:0; overflow:hidden; }
+.auditSummary { list-style:none; cursor:pointer; display:flex; justify-content:space-between; align-items:center; gap:10px; padding:12px 14px; }
+.auditSummary::-webkit-details-marker { display:none; }
+.auditSummary span:first-child { display:flex; flex-direction:column; gap:2px; }
+.auditSummary strong { color:#f3f8ff; font-size:13px; }
+.auditChevron { color:#6f8ba5; }
+.decisionAuditCard[open] .decisionAudit { padding:0 14px 14px; }
+@media (max-width: 760px) {
+  .closestTriggerCard { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .decisionBoardNote { display:none; }
+}
+
+
+/* Build 0.9.3.9b - compact decision surface */
+.decisionShadowBanner { display:inline-flex; width:auto; padding:4px 7px; margin-bottom:7px; font-size:8px; letter-spacing:.08em; }
+.decisionOutcome > span { max-width:240px; font-size:9px; color:#6f89a1; }
+.decisionAllocationRow .decisionMinor { line-height:1.3; }
+#portfolioPage .muted, #exploreSection .muted { max-width:720px; }
+
 </style>
 
 </head>
@@ -37284,10 +37336,6 @@ pre {
 </aside>
 
 <main class="appMain">
-
-<div class="topBar topBarActionsOnly">
-<button id="askNomadButton" class="askNomadButton">Ask NOMAD</button>
-</div>
 
 <header class="legacyHeader">
 
@@ -37422,9 +37470,9 @@ Checking connection...
 <div>
 <div class="eyebrow">CORE AI INTELLIGENCE</div>
 <h1>Decision Center</h1>
-<p class="muted">NOMAD first ranks the best PSX opportunities independently of your budget. Only after the thesis and evidence pass does the allocator convert your amount into whole shares.</p>
+<p class="muted">Rank opportunities, check suitability, then allocate capital.</p>
 </div>
-<div class="decisionModeBadge">SHADOW · STRICT EVIDENCE GATES</div>
+<div class="decisionModeBadge">SHADOW</div>
 </div>
 
 <div class="decisionWorkspaceGrid">
@@ -37440,7 +37488,7 @@ Checking connection...
 <div style="grid-column:1/-1"><label>Industry / Sector</label><select id="decisionSector"><option value="">All industries</option></select></div>
 </div>
 <button id="findBestOption" class="primaryWide">Analyze PSX & build plan</button>
-<div class="decisionPrinciple">Priority ranking does not change because of your budget. Choose an industry only when you intentionally want a sector-constrained plan; NOMAD will not weaken evidence or risk gates to fill it.</div>
+<details class="setupHelp"><summary>How plan settings work</summary><div>Budget changes sizing, not opportunity ranking. Industry filters only constrain the search universe; evidence and risk gates remain unchanged.</div></details>
 </div>
 
 <div class="terminalCard decisionVerdictCard">
@@ -37449,26 +37497,9 @@ Checking connection...
 </div>
 </div>
 
-<div class="terminalCard stockStrategyCard">
-<div class="panelHeader">
-<div>
-<div class="eyebrow">STOCK STRATEGY</div>
-<h2>Analyze one company before you act</h2>
-<p class="muted">Use the same professional brain on a single PSX stock. NOMAD separates the objective market view from what you personally should do based on horizon, risk profile and existing holdings.</p>
-</div>
-</div>
-<div class="stockStrategyControls">
-<div><label>Stock</label><input id="strategySymbol" type="text" placeholder="Example: OGDC" list="strategySymbolOptions" autocomplete="off" autocapitalize="characters" spellcheck="false"><datalist id="strategySymbolOptions"></datalist></div>
-<div><label>Horizon</label><select id="strategyHorizon"><option value="long_term">Long-term</option><option value="short_term">Short-term</option></select></div>
-<div><label>Risk</label><select id="strategyRisk"><option value="balanced">Balanced</option><option value="conservative">Conservative</option><option value="aggressive">Aggressive</option></select></div>
-<button id="analyzeStockStrategy" class="primaryWide">Analyze stock</button>
-</div>
-<div id="stockStrategyResult" class="stockStrategyResult"><div class="terminalEmpty small">Enter a symbol to see thesis, performance, valuation, risk, technical timing and your personal action.</div></div>
-</div>
-
 <div class="decisionBoardHeader">
-<div><div class="eyebrow">OPPORTUNITY BOARD</div><h2>Ranked before allocation</h2></div>
-<div class="decisionBoardNote">NOMAD separates market quality, personal suitability and capital action. Open “Why / details” only when you want the full evidence trail.</div>
+<div><div class="eyebrow">OPPORTUNITIES</div><h2>Best options right now</h2></div>
+<div class="decisionBoardNote">Market view and your suitability are shown separately.</div>
 </div>
 
 <div class="opportunityBoardGrid">
@@ -37493,15 +37524,34 @@ Checking connection...
 </div>
 </div>
 
-<div class="terminalCard decisionAuditCard">
-<div class="panelHeader"><div><div class="eyebrow">AUDIT</div><h2>What NOMAD actually analyzed</h2></div></div>
-<div id="decisionAudit" class="decisionAudit"><div class="terminalEmpty small">No analysis run yet.</div></div>
+<div class="terminalCard stockStrategyCard">
+<div class="panelHeader">
+<div>
+<div class="eyebrow">STOCK STRATEGY</div>
+<h2>Analyze one company before you act</h2>
+<p class="muted">Check one stock under the selected horizon and risk profile.</p>
 </div>
+</div>
+<div class="stockStrategyControls">
+<div><label>Stock</label><input id="strategySymbol" type="text" placeholder="Example: OGDC" list="strategySymbolOptions" autocomplete="off" autocapitalize="characters" spellcheck="false"><datalist id="strategySymbolOptions"></datalist></div>
+<div><label>Horizon</label><select id="strategyHorizon"><option value="long_term">Long-term</option><option value="short_term">Short-term</option></select></div>
+<div><label>Risk</label><select id="strategyRisk"><option value="balanced">Balanced</option><option value="conservative">Conservative</option><option value="aggressive">Aggressive</option></select></div>
+<button id="analyzeStockStrategy" class="primaryWide">Analyze stock</button>
+</div>
+<div id="stockStrategyResult" class="stockStrategyResult"><div class="terminalEmpty small">Enter a symbol to analyze this stock.</div></div>
+</div>
+
+
+
+<details class="terminalCard decisionAuditCard">
+<summary class="auditSummary"><span><span class="eyebrow">AUDIT</span><strong id="decisionAuditSummary">Analysis audit</strong></span><span class="auditChevron">⌄</span></summary>
+<div id="decisionAudit" class="decisionAudit"><div class="terminalEmpty small">No analysis run yet.</div></div>
+</details>
 </section>
 
 <section class="appPage" id="portfolioPage" data-page="portfolio">
 <div class="pageTitleRow">
-<div><div class="eyebrow">LIVE PORTFOLIO INTELLIGENCE</div><h1>Your portfolio mirror</h1><p class="muted">Record the trades you execute with your broker. NOMAD mirrors the positions against current PSX prices, tracks P&amp;L, concentration and the latest NOMAD view, and uses existing holdings when allocating new money.</p></div>
+<div><div class="eyebrow">LIVE PORTFOLIO INTELLIGENCE</div><h1>Your portfolio mirror</h1><p class="muted">Live value, P&amp;L, concentration and portfolio-aware decisions.</p></div>
 <div class="panelActions"><button id="portfolioRecordTrade" class="miniButton">+ Record trade</button><button id="portfolioImportCsv" class="miniButton secondary">Import CSV</button><button id="portfolioAddHolding" class="miniButton secondary">Opening holding</button></div>
 </div>
 <div id="portfolioFull"><div class="terminalCard"><div class="terminalEmpty">Loading live portfolio...</div></div></div>
@@ -37582,7 +37632,7 @@ More
 <div>
 <div class="eyebrow">LIVE MARKET</div>
 <h2>Explore PSX</h2>
-<p class="muted">Current PSX market feed with live price tracking. Prices refresh automatically while this page is open.</p>
+<p class="muted">Live PSX market feed with automatic refresh.</p>
 </div>
 <button id="loadMarket" class="miniButton secondary">Refresh now</button>
 </div>
@@ -49241,7 +49291,13 @@ function renderOpportunityList(
       ? items
       : [];
 
+  const card =
+    target.closest('.opportunityCard');
+
   if (!list.length) {
+    if (card) {
+      card.classList.add('isEmpty');
+    }
     target.innerHTML =
       '<div class="terminalEmpty small">' +
       escapeHtml(
@@ -49249,6 +49305,10 @@ function renderOpportunityList(
       ) +
       '</div>';
     return;
+  }
+
+  if (card) {
+    card.classList.remove('isEmpty');
   }
 
   target.innerHTML =
@@ -49320,7 +49380,9 @@ function renderOpportunityList(
 
         const compactReason =
           String(item.reason || '')
-            .split(/(?<=[.!?])\s+/)[0] ||
+            .split(/(?<=[.!?])\s+/)[0]
+            .replace(/^The\s+/i, '')
+            .slice(0, 150) ||
           '';
 
         const detailMeta =
@@ -50251,7 +50313,7 @@ function renderOpportunityBoard(
     'priorityOneList',
     priority1,
     isShortTerm
-      ? 'No trade is valid right now. Ready trigger setups are shown in the next panel.'
+      ? 'No entry is valid right now.'
       : 'No company currently earns Priority 1 under the tiered analyst-evidence gate.'
   );
 
@@ -50259,7 +50321,7 @@ function renderOpportunityBoard(
     'priorityTwoList',
     priority2,
     isShortTerm
-      ? 'No complete trigger-ready setup currently stands out.'
+      ? 'No ready setup right now.'
       : 'No Priority 2 opportunity currently stands out.'
   );
 
@@ -50267,7 +50329,7 @@ function renderOpportunityBoard(
     'researchRequiredList',
     research,
     isShortTerm
-      ? 'No developing setup currently needs additional evidence.'
+      ? 'No developing setup right now.'
       : 'No shortlisted company is currently in automatic evidence research.'
   );
 
@@ -50275,7 +50337,7 @@ function renderOpportunityBoard(
     'avoidList',
     avoid,
     isShortTerm
-      ? 'No invalid or avoid setup in the current deep shortlist.'
+      ? 'No avoid setup right now.'
       : 'No evidence-backed avoid candidate in the current deep shortlist.'
   );
 
@@ -50367,6 +50429,12 @@ function renderDecisionAudit(
       screening.dataBlocked
     ]
   ];
+
+  if ($('decisionAuditSummary')) {
+    $('decisionAuditSummary').textContent =
+      formatNumber(screening.eligibleUniverse || 0, 0) +
+      ' stocks scanned';
+  }
 
   target.innerHTML =
     metrics.map(
@@ -50665,7 +50733,7 @@ function renderShadowDecision(
     result?.input?.horizon === 'short_term';
 
   let html =
-    '<div class="decisionShadowBanner">SHADOW MODEL · NOT REAL-MONEY ELIGIBLE</div>' +
+    '<div class="decisionShadowBanner">SHADOW</div>' +
     '<div class="decisionOutcome">' +
     '<div><strong>' +
     escapeHtml(
@@ -50682,48 +50750,12 @@ function renderShadowDecision(
     '<span>' +
     (
       result?.input?.horizon === 'short_term'
-        ? 'Technical evidence ' +
-          escapeHtml(
-            decision.evidence
-              ?.confidence ||
-            'UNRESOLVED'
-          ) +
-          ' · Coverage ' +
-          formatNumber(
-            decision.evidence
-              ?.technicalCoveragePct ||
-            decision.evidence
-              ?.score ||
-            0,
-            0
-          ) +
-          '% · Trade plan ' +
-          escapeHtml(
-            decision.evidence
-              ?.setupCompleteness ||
-            'INCOMPLETE'
-          )
-        : 'Evidence confidence ' +
-          escapeHtml(
-            decision.evidence
-              ?.confidence ||
-            'UNRESOLVED'
-          ) +
-          ' · Summary ' +
-          formatNumber(
-            decision.evidence
-              ?.summaryCoveragePct ||
-            0,
-            0
-          ) +
-          '% · Extended ' +
-          formatNumber(
-            decision.evidence
-              ?.extendedCoveragePct ||
-            0,
-            0
-          ) +
-          '%'
+        ? 'Evidence ' +
+          escapeHtml(decision.evidence?.confidence || 'UNRESOLVED') +
+          ' · Plan ' +
+          escapeHtml(decision.evidence?.setupCompleteness || 'INCOMPLETE')
+        : 'Evidence ' +
+          escapeHtml(decision.evidence?.confidence || 'UNRESOLVED')
     ) +
     '</span>' +
     '</div>' +
@@ -50767,11 +50799,19 @@ function renderShadowDecision(
         ) +
         '</strong></div>') +
     '</div>' +
-    '<div class="decisionLeadReason">' +
+    '<div class="decisionQuickWhy">' +
+    '<strong>Why this plan</strong>' +
+    '<span>' +
     escapeHtml(
-      decision.reason ||
-      ''
+      isShortTermDecision
+        ? ((triggerPlan?.count || 0) + ' ready setup' + ((triggerPlan?.count || 0) === 1 ? '' : 's') + ' · ' + (decision.amountInvestedPkr > 0 ? 'entry valid now' : 'no buy-now entry'))
+        : ((allocations.length || 0) + ' funded position' + (allocations.length === 1 ? '' : 's') + ' · ' + formatNumber(decision.cashRemainingPkr || 0, 0) + ' PKR retained')
     ) +
+    '</span>' +
+    '</div>' +
+    '<details class="decisionMethodDetails"><summary>Why / methodology</summary><div class="decisionMethodBody">' +
+    '<div class="decisionLeadReason">' +
+    escapeHtml(decision.reason || '') +
     '</div>';
 
   if (
@@ -50945,9 +50985,12 @@ function renderShadowDecision(
     }
   }
 
+  html +=
+    '</div></details>';
+
   if (allocations.length) {
     html +=
-      '<div class="decisionMetaLine">Whole-share implementation · PSX regular-market equities use a one-share marketable lot; NOMAD additionally avoids economically trivial positions.</div>';
+      '<div class="decisionMetaLine allocationNote">Whole-share implementation · PSX regular-market equities use a one-share marketable lot; NOMAD additionally avoids economically trivial positions.</div>';
 
     html +=
       allocations.map(
@@ -50981,20 +51024,6 @@ function renderShadowDecision(
             item.companyName ||
             ''
           ) +
-          ' · ' +
-          escapeHtml(
-            item.allocationTier ===
-              'PRIORITY_2'
-              ? 'Priority 2'
-              : 'Priority 1'
-          ) +
-          ' · new money ' +
-          formatNumber(
-            item.newMoneyWeightPct ??
-            item.actualWeightPct,
-            1
-          ) +
-          '%' +
           (
             item.postPortfolioWeightPct !==
               undefined &&
@@ -51076,112 +51105,30 @@ function renderShadowDecision(
       ).join('');
   } else {
     html +=
-      '<div class="decisionMetaLine">No capital is allocated unless a canonical BUY or ACCUMULATE state has allocation permission and at least one whole share fits the portfolio/risk limits.</div>';
+      '<div class="decisionMetaLine allocationNote">No capital is allocated unless a canonical BUY or ACCUMULATE state has allocation permission and at least one whole share fits the portfolio/risk limits.</div>';
   }
 
   if (
     result?.input?.horizon === 'short_term' &&
     triggerPlan?.plans?.length
   ) {
-    html +=
-      '<div class="decisionMetaLine"><strong>Next-trigger capital plan:</strong> PKR ' +
-      formatNumber(
-        triggerPlan.plannedCapitalPkr ||
-        0,
-        0
-      ) +
-      ' is reserved across ' +
-      formatNumber(
-        triggerPlan.count ||
-        0,
-        0
-      ) +
-      ' setup' +
-      (
-        Number(triggerPlan.count) === 1
-          ? ''
-          : 's'
-      ) +
-      '. This is not a buy-now instruction; each position activates only if its entry trigger remains valid.</div>';
+    const closest =
+      triggerPlan.plans[0];
 
     html +=
-      '<div class="triggerPlanGrid">' +
-      triggerPlan.plans.map(
-        item => {
-          const statusClass =
-            String(
-              item.triggerStatus ||
-              item.state ||
-              'WAITING'
-            ).toLowerCase();
-          const distanceText =
-            item.distancePct === null ||
-            item.distancePct === undefined
-              ? ''
-              : item.triggerDirection === 'below'
-                ? formatNumber(item.distancePct, 2) + '% below trigger'
-                : item.triggerDirection === 'above'
-                  ? formatNumber(item.distancePct, 2) + '% above entry zone'
-                  : 'Entry zone reached';
-
-          return (
-            '<div class="triggerPlanCard ' +
-            escapeHtml(statusClass) +
-            '" data-trigger-symbol="' +
-            escapeHtml(item.symbol) +
-            '" data-trigger-low="' +
-            escapeHtml(item.entryLow) +
-            '" data-trigger-high="' +
-            escapeHtml(item.entryHigh) +
-            '" data-trigger-stop="' +
-            escapeHtml(item.stop) +
-            '">' +
-            '<div class="triggerPlanTop"><div><strong class="triggerSymbol">' +
-            escapeHtml(item.symbol) +
-            '</strong><span>' +
-            escapeHtml(item.companyName || '') +
-            '</span></div><div class="triggerStatus ' +
-            escapeHtml(statusClass) +
-            '" data-trigger-status>' +
-            escapeHtml(item.triggerLabel || 'Waiting') +
-            '</div></div>' +
-            '<div class="triggerPriceRow"><div><span>Current</span><strong data-trigger-current>PKR ' +
-            formatNumber(item.currentPrice, 2) +
-            '</strong></div><div class="highlightTrigger"><span>Trigger zone</span><strong>PKR ' +
-            formatNumber(item.entryLow, 2) +
-            '–' +
-            formatNumber(item.entryHigh, 2) +
-            '</strong></div><div class="highlightStop"><span>Stop</span><strong>PKR ' +
-            formatNumber(item.stop, 2) +
-            '</strong></div>' +
-            (
-              item.target1 !== null &&
-              item.target1 !== undefined
-                ? '<div class="highlightTarget"><span>Target</span><strong>PKR ' +
-                  formatNumber(item.target1, 2) +
-                  '</strong></div>'
-                : ''
-            ) +
-            '</div>' +
-            '<div class="triggerDistance" data-trigger-distance>' +
-            escapeHtml(distanceText) +
-            '</div>' +
-            '<div class="triggerCondition"><strong>What triggers it:</strong> ' +
-            escapeHtml(item.triggerCondition || '') +
-            '</div>' +
-            '<div class="triggerPlanFoot"><strong>' +
-            formatNumber(item.shares, 0) +
-            ' shares · ~PKR ' +
-            formatNumber(item.plannedPrincipalPkr, 0) +
-            '</strong><span>R:R ' +
-            formatNumber(item.rewardRisk, 2) +
-            'x · risk budget ' +
-            formatNumber(item.riskBudgetPct, 2) +
-            '%</span></div>' +
-            '</div>'
-          );
-        }
-      ).join('') +
+      '<div class="closestTriggerCard">' +
+      '<div><span>Closest setup</span><strong>' +
+      escapeHtml(closest.symbol || '') +
+      '</strong></div>' +
+      '<div><span>Current</span><strong>PKR ' +
+      formatNumber(closest.currentPrice, 2) +
+      '</strong></div>' +
+      '<div class="highlightTrigger"><span>Entry</span><strong>PKR ' +
+      formatNumber(closest.entryLow, 2) + '–' + formatNumber(closest.entryHigh, 2) +
+      '</strong></div>' +
+      '<div><span>Status</span><strong>' +
+      escapeHtml(closest.triggerLabel || 'Waiting') +
+      '</strong></div>' +
       '</div>';
   }
 
@@ -51472,6 +51419,13 @@ if ($('findBestOption')) {
             ''
         };
 
+        if ($('strategyHorizon')) {
+          $('strategyHorizon').value = context.horizon;
+        }
+        if ($('strategyRisk')) {
+          $('strategyRisk').value = context.risk;
+        }
+
         localStorage.setItem(
           'nomadDecisionContext',
           JSON.stringify(
@@ -51490,9 +51444,9 @@ if ($('findBestOption')) {
 
         $('decisionResult')
           .innerHTML =
-            '<div class="decisionShadowBanner">SHADOW MODEL</div>' +
-            '<strong>NOMAD is ranking the eligible universe.</strong><br>' +
-            'Opportunity ranking is independent of your budget. NOMAD is checking liquidity, history, fundamentals, Financial Analyst evidence, valuation, entry and risk before the separate whole-share allocator runs.';
+            '<div class="decisionShadowBanner">SHADOW</div>' +
+            '<strong>Analyzing PSX opportunities...</strong><br>' +
+            '<span class="decisionMinor">Checking evidence, suitability and allocation.</span>';
 
         try {
           const result =
@@ -51640,6 +51594,13 @@ try {
     }
   }
 } catch {}
+
+if ($('decisionHorizon') && $('strategyHorizon')) {
+  $('strategyHorizon').value = $('decisionHorizon').value;
+}
+if ($('decisionRisk') && $('strategyRisk')) {
+  $('strategyRisk').value = $('decisionRisk').value;
+}
 
 try {
   const storedDecisionSummary =
