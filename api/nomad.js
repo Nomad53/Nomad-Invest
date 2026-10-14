@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.3.7';
+const VERSION = '0.9.3.8';
 
 
 const SUPABASE_URL =
@@ -24657,6 +24657,76 @@ function shortTermProfileExecutionDecision(
   };
 }
 
+function shortTermTriggerConditionText(setup) {
+  const normalized = String(setup || '').toUpperCase();
+
+  if (normalized.includes('BREAKOUT')) {
+    return 'Price must enter or clear the entry zone and hold the breakout while the setup remains valid.';
+  }
+
+  if (normalized.includes('PULLBACK')) {
+    return 'Price must pull back into the entry zone while the broader short-term trend remains intact.';
+  }
+
+  if (normalized.includes('CONTINUATION')) {
+    return 'Price must reclaim or hold the entry zone with the continuation structure still intact.';
+  }
+
+  return 'Price must enter the defined entry zone while the setup, stop and reward-to-risk remain valid.';
+}
+
+function shortTermTriggerSnapshot(currentPrice, entryLow, entryHigh, stop) {
+  const current = safeNumber(currentPrice);
+  const low = safeNumber(entryLow);
+  const high = safeNumber(entryHigh);
+  const invalidation = safeNumber(stop);
+
+  if (current === null || low === null || high === null) {
+    return {
+      status: 'WAITING',
+      label: 'Waiting for live price',
+      distancePct: null,
+      direction: 'unknown'
+    };
+  }
+
+  if (invalidation !== null && current <= invalidation) {
+    return {
+      status: 'INVALIDATED',
+      label: 'Invalidated',
+      distancePct: 0,
+      direction: 'invalid'
+    };
+  }
+
+  if (current >= low && current <= high) {
+    return {
+      status: 'TRIGGERED',
+      label: 'Entry zone active',
+      distancePct: 0,
+      direction: 'inside'
+    };
+  }
+
+  if (current < low) {
+    const distancePct = ((low - current) / Math.max(current, 0.0001)) * 100;
+    return {
+      status: distancePct <= 1.5 ? 'NEAR_TRIGGER' : 'WAITING',
+      label: distancePct <= 1.5 ? 'Near trigger' : 'Waiting below trigger',
+      distancePct: decisionRound(distancePct, 2),
+      direction: 'below'
+    };
+  }
+
+  const abovePct = ((current - high) / Math.max(high, 0.0001)) * 100;
+  return {
+    status: abovePct <= 1.0 ? 'TRIGGERED' : 'ABOVE_ENTRY_ZONE',
+    label: abovePct <= 1.0 ? 'Entry still valid' : 'Above entry zone — do not chase',
+    distancePct: decisionRound(abovePct, 2),
+    direction: 'above'
+  };
+}
+
 function buildShortTermTriggerPlan(
   opportunityBoard,
   amount,
@@ -24709,6 +24779,8 @@ function buildShortTermTriggerPlan(
       safeNumber(plan.entryHigh);
     const stop =
       safeNumber(plan.stop);
+    const currentPrice =
+      safeNumber(item.price);
 
     if (
       entryLow === null ||
@@ -24774,13 +24846,38 @@ function buildShortTermTriggerPlan(
     const principal =
       shares * entry;
 
+    const triggerSnapshot =
+      shortTermTriggerSnapshot(
+        currentPrice,
+        entryLow,
+        entryHigh,
+        stop
+      );
+
     reserved += principal;
 
     plans.push({
       symbol: item.symbol,
       companyName:
         item.companyName,
-      state: 'WAIT_FOR_TRIGGER',
+      state:
+        triggerSnapshot.status,
+      triggerStatus:
+        triggerSnapshot.status,
+      triggerLabel:
+        triggerSnapshot.label,
+      triggerDirection:
+        triggerSnapshot.direction,
+      distancePct:
+        triggerSnapshot.distancePct,
+      triggerCondition:
+        shortTermTriggerConditionText(
+          item.professional.setup
+        ),
+      currentPrice:
+        currentPrice !== null
+          ? decisionRound(currentPrice, 2)
+          : null,
       setup:
         item.professional.setup ||
         null,
@@ -35875,6 +35972,231 @@ pre {
 }
 
 
+
+/* =========================================================
+   CLARITY + SEMANTIC HIGHLIGHTS - BUILD 0.9.3.8
+========================================================= */
+:root {
+  --nomad-info: #49b9ff;
+  --nomad-good: #42d99b;
+  --nomad-warn: #f0c75e;
+  --nomad-bad: #ff7480;
+  --nomad-research: #9d8cff;
+  --nomad-panel-hi: #132239;
+}
+
+.decisionLeadReason {
+  margin: 10px 0 12px;
+  padding: 10px 12px;
+  border-left: 3px solid var(--nomad-info);
+  background: rgba(73,185,255,.06);
+  color: #c9d7e8;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.decisionMoneyLine.shortTermMoneyLine {
+  grid-template-columns: repeat(4,minmax(0,1fr));
+}
+
+.decisionMoneyLine > div {
+  position: relative;
+}
+
+.decisionMoneyLine .moneyAction strong { color: var(--nomad-good); }
+.decisionMoneyLine .moneyTrigger strong { color: var(--nomad-warn); }
+.decisionMoneyLine .moneyCash strong { color: #d9e7f7; }
+
+.tradeQuickLine {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 0 7px;
+}
+
+.tradeMetric {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 82px;
+  padding: 6px 8px;
+  border: 1px solid #2a3e57;
+  border-radius: 7px;
+  background: #0d1827;
+}
+.tradeMetric small {
+  color: #70879f;
+  font-size: 8px;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+}
+.tradeMetric strong { font-size: 11px; }
+.tradeMetric.trigger { border-color: rgba(240,199,94,.45); }
+.tradeMetric.trigger strong { color: var(--nomad-warn); }
+.tradeMetric.stop { border-color: rgba(255,116,128,.38); }
+.tradeMetric.stop strong { color: var(--nomad-bad); }
+.tradeMetric.target { border-color: rgba(66,217,155,.38); }
+.tradeMetric.target strong { color: var(--nomad-good); }
+
+.opportunityPrimaryMeta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: baseline;
+  margin: 2px 0 4px;
+}
+.opportunityPrimaryMeta strong { color: #f3f8ff; font-size: 12px; }
+.opportunityPrimaryMeta span { color: #7890aa; font-size: 10px; }
+.opportunityReason.compact { color: #b8c7d8; }
+
+.opportunityDetails {
+  margin-top: 7px;
+  color: #8197af;
+  font-size: 10px;
+}
+.opportunityDetails summary {
+  cursor: pointer;
+  color: var(--nomad-info);
+  user-select: none;
+}
+.opportunityDetailBody {
+  display: grid;
+  gap: 5px;
+  margin-top: 7px;
+  padding: 8px 9px;
+  border: 1px solid #253950;
+  border-radius: 7px;
+  background: #0b1522;
+  line-height: 1.45;
+}
+
+.opportunityProfileAction.buy,
+.opportunityProfileAction.buy_small,
+.opportunityProfileAction.eligible {
+  color: var(--nomad-good);
+  border-color: rgba(66,217,155,.35);
+  background: rgba(66,217,155,.06);
+}
+.opportunityProfileAction.plan,
+.opportunityProfileAction.wait {
+  color: var(--nomad-warn);
+  border-color: rgba(240,199,94,.35);
+  background: rgba(240,199,94,.06);
+}
+.opportunityProfileAction.pass {
+  color: #9db1c8;
+}
+
+.triggerPlanGrid {
+  display: grid;
+  gap: 10px;
+  margin-top: 10px;
+}
+.triggerPlanCard {
+  border: 1px solid #2b405a;
+  border-left: 3px solid var(--nomad-warn);
+  border-radius: 8px;
+  background: #0d1827;
+  padding: 11px 12px;
+}
+.triggerPlanCard.near_trigger { border-left-color: var(--nomad-info); }
+.triggerPlanCard.triggered { border-left-color: var(--nomad-good); background: rgba(66,217,155,.045); }
+.triggerPlanCard.invalidated { border-left-color: var(--nomad-bad); opacity: .82; }
+.triggerPlanCard.above_entry_zone { border-left-color: var(--nomad-warn); }
+
+.triggerPlanTop,
+.triggerPlanFoot {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: center;
+}
+.triggerPlanTop > div:first-child {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+}
+.triggerPlanTop span,
+.triggerPlanFoot span { color: #7890aa; font-size: 10px; }
+.triggerSymbol { font-size: 15px; }
+.triggerStatus {
+  border: 1px solid #4f472e;
+  border-radius: 999px;
+  padding: 4px 8px;
+  color: var(--nomad-warn);
+  background: rgba(240,199,94,.07);
+  font-size: 9px;
+  font-weight: 900;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.triggerStatus.near_trigger { color: var(--nomad-info); border-color: rgba(73,185,255,.4); background: rgba(73,185,255,.07); }
+.triggerStatus.triggered { color: var(--nomad-good); border-color: rgba(66,217,155,.4); background: rgba(66,217,155,.07); }
+.triggerStatus.invalidated { color: var(--nomad-bad); border-color: rgba(255,116,128,.4); background: rgba(255,116,128,.07); }
+.triggerStatus.above_entry_zone { color: var(--nomad-warn); }
+
+.triggerPriceRow {
+  display: grid;
+  grid-template-columns: repeat(4,minmax(0,1fr));
+  gap: 7px;
+  margin: 10px 0 7px;
+}
+.triggerPriceRow > div {
+  padding: 7px 8px;
+  border: 1px solid #263950;
+  border-radius: 6px;
+  background: #0a1420;
+}
+.triggerPriceRow span {
+  display: block;
+  color: #70879f;
+  font-size: 8px;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+}
+.triggerPriceRow strong { display: block; margin-top: 3px; font-size: 11px; }
+.highlightTrigger strong { color: var(--nomad-warn); }
+.highlightStop strong { color: var(--nomad-bad); }
+.highlightTarget strong { color: var(--nomad-good); }
+.triggerDistance { color: var(--nomad-info); font-size: 10px; font-weight: 700; }
+.triggerCondition {
+  margin: 7px 0 9px;
+  padding: 7px 9px;
+  border-radius: 6px;
+  background: rgba(73,185,255,.05);
+  color: #aebfd2;
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.decisionMetaLine {
+  color: #7f93aa;
+  font-size: 10px;
+  line-height: 1.45;
+}
+.decisionMetaLine strong { color: #aebfd2; }
+
+@media (max-width: 760px) {
+  .decisionMoneyLine.shortTermMoneyLine,
+  .triggerPriceRow {
+    grid-template-columns: 1fr 1fr;
+  }
+  .triggerPlanTop,
+  .triggerPlanFoot {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  .opportunityRow {
+    grid-template-columns: 28px minmax(0,1fr);
+  }
+  .opportunityActionStack {
+    grid-column: 2;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: flex-start;
+  }
+}
+
 /* =========================================================
    DECISION CENTER - BUILD 0.8.4B.1
 ========================================================= */
@@ -37146,27 +37468,27 @@ Checking connection...
 
 <div class="decisionBoardHeader">
 <div><div class="eyebrow">OPPORTUNITY BOARD</div><h2>Ranked before allocation</h2></div>
-<div class="decisionBoardNote">Each company now has one canonical state. Missing evidence triggers automatic Evidence Research and backfill; WATCH, active research and Avoid are never allowed to receive capital. Priority controls ranking, while the canonical market action controls whether allocation is permitted.</div>
+<div class="decisionBoardNote">NOMAD separates market quality, personal suitability and capital action. Open “Why / details” only when you want the full evidence trail.</div>
 </div>
 
 <div class="opportunityBoardGrid">
 <div class="terminalCard opportunityCard priorityOneCard">
-<div class="panelHeader"><div><div class="eyebrow">PRIORITY 1</div><h2>Best current opportunities</h2></div><span class="boardCount" id="priorityOneCount">0</span></div>
+<div class="panelHeader"><div><div class="eyebrow" id="priorityOneEyebrow">PRIORITY 1</div><h2 id="priorityOneTitle">Best current opportunities</h2></div><span class="boardCount" id="priorityOneCount">0</span></div>
 <div id="priorityOneList" class="opportunityList"><div class="terminalEmpty small">Run analysis to rank opportunities.</div></div>
 </div>
 
 <div class="terminalCard opportunityCard priorityTwoCard">
-<div class="panelHeader"><div><div class="eyebrow">PRIORITY 2</div><h2>Next best opportunities</h2></div><span class="boardCount" id="priorityTwoCount">0</span></div>
+<div class="panelHeader"><div><div class="eyebrow" id="priorityTwoEyebrow">PRIORITY 2</div><h2 id="priorityTwoTitle">Next best opportunities</h2></div><span class="boardCount" id="priorityTwoCount">0</span></div>
 <div id="priorityTwoList" class="opportunityList"><div class="terminalEmpty small">Run analysis to rank opportunities.</div></div>
 </div>
 
 <div class="terminalCard opportunityCard researchCard">
-<div class="panelHeader"><div><div class="eyebrow">EVIDENCE RESEARCH</div><h2>NOMAD is investigating missing evidence</h2></div><span class="boardCount" id="researchRequiredCount">0</span></div>
+<div class="panelHeader"><div><div class="eyebrow" id="researchEyebrow">EVIDENCE RESEARCH</div><h2 id="researchTitle">NOMAD is investigating missing evidence</h2></div><span class="boardCount" id="researchRequiredCount">0</span></div>
 <div id="researchRequiredList" class="opportunityList"><div class="terminalEmpty small">Missing evidence triggers automatic research and does not consume the whole comparable set.</div></div>
 </div>
 
 <div class="terminalCard opportunityCard avoidCard">
-<div class="panelHeader"><div><div class="eyebrow">LOW PRIORITY / AVOID</div><h2>Not attractive enough now</h2></div><span class="boardCount" id="avoidCount">0</span></div>
+<div class="panelHeader"><div><div class="eyebrow" id="avoidEyebrow">LOW PRIORITY / AVOID</div><h2 id="avoidTitle">Not attractive enough now</h2></div><span class="boardCount" id="avoidCount">0</span></div>
 <div id="avoidList" class="opportunityList"><div class="terminalEmpty small">Evidence-backed rejects will appear here.</div></div>
 </div>
 </div>
@@ -37871,6 +38193,7 @@ let liveRefreshTimer = null;
 let portfolioRefreshTimer = null;
 let exploreRefreshTimer = null;
 let homeRefreshTimer = null;
+let decisionTriggerRefreshTimer = null;
 let exploreRefreshInFlight = false;
 let explorePreviousPrices = new Map();
 
@@ -38683,6 +39006,7 @@ function openAppPage(
   if (page === 'decision') {
     populateDecisionSectors();
     populateStrategySymbolOptions();
+    startDecisionTriggerMonitor();
   }
 
   if (page === 'explore') {
@@ -48933,48 +49257,100 @@ function renderOpportunityList(
         const firstRisk =
           item.risks?.[0] ||
           '';
-
         const analyst =
           item.analyst ||
           {};
-
         const professional =
           item.professional ||
           {};
-
         const isShortTerm =
           professional.framework ===
             'SHORT_TERM_TRADER';
+        const plan =
+          professional.conditionalTradePlan ||
+          null;
+        const execution =
+          item.shortTermExecution ||
+          null;
 
-        const canonicalEvidence =
-          item.canonicalState
-            ?.evidence ||
-          {};
+        const marketAction =
+          decisionActionLabel(
+            item.decisionCenterView
+          );
+        const profileAction =
+          isShortTerm && execution
+            ? decisionActionLabel(
+                execution.action
+              )
+            : item.profileSuitability?.state === 'SUITABLE'
+              ? 'ELIGIBLE'
+              : 'PASS';
 
-        const evidenceMeta =
+        const quickTradeLine =
+          isShortTerm && plan?.complete
+            ? (
+                '<div class="tradeQuickLine">' +
+                '<span class="tradeMetric trigger"><small>Trigger</small><strong>PKR ' +
+                formatNumber(plan.entryLow, 2) +
+                '–' +
+                formatNumber(plan.entryHigh, 2) +
+                '</strong></span>' +
+                '<span class="tradeMetric stop"><small>Stop</small><strong>PKR ' +
+                formatNumber(plan.stop, 2) +
+                '</strong></span>' +
+                (
+                  plan.target1 !== null &&
+                  plan.target1 !== undefined
+                    ? '<span class="tradeMetric target"><small>Target</small><strong>PKR ' +
+                      formatNumber(plan.target1, 2) +
+                      '</strong></span>'
+                    : ''
+                ) +
+                (
+                  plan.rewardRisk !== null &&
+                  plan.rewardRisk !== undefined
+                    ? '<span class="tradeMetric"><small>R:R</small><strong>' +
+                      formatNumber(plan.rewardRisk, 2) +
+                      'x</strong></span>'
+                    : ''
+                ) +
+                '</div>'
+              )
+            : '';
+
+        const compactReason =
+          String(item.reason || '')
+            .split(/(?<=[.!?])\s+/)[0] ||
+          '';
+
+        const detailMeta =
           isShortTerm
             ? (
-                ' · Technical evidence ' +
+                'Technical evidence ' +
                 escapeHtml(
-                  canonicalEvidence.confidence ||
+                  item.canonicalState?.evidence?.confidence ||
                   'UNRESOLVED'
                 ) +
                 ' · Coverage ' +
                 formatNumber(
-                  canonicalEvidence.technicalCoveragePct ||
-                  canonicalEvidence.score ||
+                  item.canonicalState?.evidence?.technicalCoveragePct ||
+                  item.canonicalState?.evidence?.score ||
                   0,
                   0
                 ) +
-                '%' +
-                ' · Plan ' +
+                '% · Setup ' +
                 escapeHtml(
-                  canonicalEvidence.setupCompleteness ||
-                  'INCOMPLETE'
+                  professional.setup ||
+                  'UNRESOLVED'
+                ) +
+                ' · Timing ' +
+                escapeHtml(
+                  professional.timingState ||
+                  'UNRESOLVED'
                 )
               )
             : (
-                ' · Headline financials ' +
+                'Headline financials ' +
                 escapeHtml(
                   analyst.financialView ||
                   'UNAVAILABLE'
@@ -48985,136 +49361,60 @@ function renderOpportunityList(
                   'UNRESOLVED'
                 ) +
                 ' · Summary ' +
-                (
-                  analyst.coveragePct !== null &&
-                  analyst.coveragePct !== undefined
-                    ? formatNumber(
-                        analyst.coveragePct,
-                        0
-                      ) + '%'
-                    : 'N/A'
+                formatNumber(
+                  analyst.coveragePct ||
+                  0,
+                  0
                 ) +
-                (
-                  analyst.extendedCoveragePct !== null &&
-                  analyst.extendedCoveragePct !== undefined
-                    ? ' · Extended ' +
-                      formatNumber(
-                        analyst.extendedCoveragePct,
-                        0
-                      ) + '%'
-                    : ''
-                )
+                '%'
               );
 
         return (
-          '<div class="opportunityRow">' +
+          '<div class="opportunityRow ' +
+          (isShortTerm ? 'shortTermOpportunity' : '') +
+          '">' +
           '<div class="opportunityRank">#' +
-          escapeHtml(
-            item.rank
-          ) +
+          escapeHtml(item.rank) +
           '</div>' +
-          '<div>' +
+          '<div class="opportunityMain">' +
           '<div class="opportunityIdentity"><strong>' +
-          escapeHtml(
-            item.symbol
-          ) +
+          escapeHtml(item.symbol) +
           '</strong><span>' +
-          escapeHtml(
-            item.companyName ||
-            ''
-          ) +
+          escapeHtml(item.companyName || '') +
           '</span><button type="button" class="opportunityAnalyzeButton" data-strategy-symbol="' +
-          escapeHtml(
-            item.symbol
-          ) +
+          escapeHtml(item.symbol) +
           '">Analyze</button></div>' +
-          '<div class="opportunityMeta">PKR ' +
-          formatNumber(
-            item.price,
-            2
-          ) +
-          ' · ' +
-          escapeHtml(
-            item.sector ||
-            'Unknown sector'
-          ) +
-          evidenceMeta +
+          '<div class="opportunityPrimaryMeta"><strong>PKR ' +
+          formatNumber(item.price, 2) +
+          '</strong><span>' +
+          escapeHtml(item.sector || 'Unknown sector') +
+          '</span></div>' +
+          quickTradeLine +
           (
-            professional.thesisStatus
-              ? (
-                  isShortTerm
-                    ? ' · State '
-                    : ' · Thesis '
-                ) +
-                escapeHtml(
-                  professional.thesisStatus
-                )
-              : ''
-          ) +
-          (
-            professional.timingState
-              ? ' · Timing ' +
-                escapeHtml(
-                  professional.timingState
-                )
-              : ''
-          ) +
-          (
-            item.profileSuitability?.state
-              ? ' · Profile ' +
-                escapeHtml(
-                  item.profileSuitability.state === 'SUITABLE'
-                    ? 'SUITABLE'
-                    : 'NOT SUITABLE'
-                )
-              : ''
-          ) +
-          (
-            professional.setup &&
-            professional.framework === 'SHORT_TERM_TRADER'
-              ? ' · Setup ' +
-                escapeHtml(
-                  professional.setup
-                )
-              : ''
-          ) +
-          (
-            professional.framework === 'SHORT_TERM_TRADER' &&
-            professional.conditionalTradePlan
-              ?.complete
-              ? ' · Conditional entry PKR ' +
-                formatNumber(
-                  professional.conditionalTradePlan.entryLow,
-                  2
-                ) +
-                '–' +
-                formatNumber(
-                  professional.conditionalTradePlan.entryHigh,
-                  2
-                ) +
-                ' · R/R ' +
-                formatNumber(
-                  professional.conditionalTradePlan.rewardRisk,
-                  2
-                ) + 'x'
-              : ''
-          ) +
-          '</div>' +
-          '<div class="opportunityReason">' +
-          escapeHtml(
-            item.reason ||
-            ''
-          ) +
-          '</div>' +
-          (
-            firstRisk
-              ? '<div class="opportunityConcern">Risk: ' +
-                escapeHtml(
-                  firstRisk
-                ) +
+            compactReason
+              ? '<div class="opportunityReason compact">' +
+                escapeHtml(compactReason) +
                 '</div>'
               : ''
           ) +
+          '<details class="opportunityDetails"><summary>Why / details</summary>' +
+          '<div class="opportunityDetailBody">' +
+          detailMeta +
+          (
+            item.reason
+              ? '<div><strong>View:</strong> ' +
+                escapeHtml(item.reason) +
+                '</div>'
+              : ''
+          ) +
+          (
+            firstRisk
+              ? '<div class="opportunityConcern"><strong>Risk:</strong> ' +
+                escapeHtml(firstRisk) +
+                '</div>'
+              : ''
+          ) +
+          '</div></details>' +
           '</div>' +
           '<div class="opportunityActionStack">' +
           '<div class="opportunityAction ' +
@@ -49124,29 +49424,21 @@ function renderOpportunityList(
               ''
             ).toLowerCase()
           ) +
-          '">' +
-          escapeHtml(
-            'Market: ' +
-            decisionActionLabel(
-              item.decisionCenterView
-            )
-          ) +
+          '">Market: ' +
+          escapeHtml(marketAction) +
           '</div>' +
-          '<div class="opportunityProfileAction">' +
+          '<div class="opportunityProfileAction ' +
           escapeHtml(
-            isShortTerm &&
-            item.shortTermExecution
-              ? 'For you: ' +
-                decisionActionLabel(
-                  item.shortTermExecution.action
-                )
-              : 'For profile: ' +
-                (
-                  item.profileSuitability?.state === 'SUITABLE'
-                    ? 'ELIGIBLE'
-                    : 'PASS'
-                )
+            String(
+              isShortTerm && execution
+                ? execution.action || ''
+                : item.profileSuitability?.state === 'SUITABLE'
+                  ? 'eligible'
+                  : 'pass'
+            ).toLowerCase()
           ) +
+          '">For you: ' +
+          escapeHtml(profileAction) +
           '</div>' +
           '</div>' +
           '</div>'
@@ -49904,70 +50196,104 @@ function renderOpportunityBoard(
   const board =
     result?.opportunityBoard ||
     {};
+  const isShortTerm =
+    result?.input?.horizon ===
+      'short_term';
 
   const priority1 =
     board.priority1 ||
     [];
-
   const priority2 =
     board.priority2 ||
     [];
-
   const research =
     board.evidenceResearch ||
     board.researchRequired ||
     [];
-
   const avoid =
     board.avoid ||
     [];
 
+  if ($('priorityOneEyebrow')) {
+    $('priorityOneEyebrow').textContent =
+      isShortTerm ? 'ACTION NOW' : 'PRIORITY 1';
+  }
+  if ($('priorityOneTitle')) {
+    $('priorityOneTitle').textContent =
+      isShortTerm ? 'Trades valid right now' : 'Best current opportunities';
+  }
+  if ($('priorityTwoEyebrow')) {
+    $('priorityTwoEyebrow').textContent =
+      isShortTerm ? 'READY SETUPS' : 'PRIORITY 2';
+  }
+  if ($('priorityTwoTitle')) {
+    $('priorityTwoTitle').textContent =
+      isShortTerm ? 'Complete plans waiting for trigger' : 'Next best opportunities';
+  }
+  if ($('researchEyebrow')) {
+    $('researchEyebrow').textContent =
+      isShortTerm ? 'DEVELOPING / RESEARCH' : 'EVIDENCE RESEARCH';
+  }
+  if ($('researchTitle')) {
+    $('researchTitle').textContent =
+      isShortTerm ? 'Interesting, but setup not complete' : 'NOMAD is investigating missing evidence';
+  }
+  if ($('avoidEyebrow')) {
+    $('avoidEyebrow').textContent =
+      isShortTerm ? 'AVOID / INVALID' : 'LOW PRIORITY / AVOID';
+  }
+  if ($('avoidTitle')) {
+    $('avoidTitle').textContent =
+      isShortTerm ? 'Do not trade these setups now' : 'Not attractive enough now';
+  }
+
   renderOpportunityList(
     'priorityOneList',
     priority1,
-    'No company currently earns Priority 1 under the tiered analyst-evidence gate.'
+    isShortTerm
+      ? 'No trade is valid right now. Ready trigger setups are shown in the next panel.'
+      : 'No company currently earns Priority 1 under the tiered analyst-evidence gate.'
   );
 
   renderOpportunityList(
     'priorityTwoList',
     priority2,
-    'No Priority 2 opportunity currently stands out.'
+    isShortTerm
+      ? 'No complete trigger-ready setup currently stands out.'
+      : 'No Priority 2 opportunity currently stands out.'
   );
 
   renderOpportunityList(
     'researchRequiredList',
     research,
-    'No shortlisted company is currently in automatic evidence research.'
+    isShortTerm
+      ? 'No developing setup currently needs additional evidence.'
+      : 'No shortlisted company is currently in automatic evidence research.'
   );
 
   renderOpportunityList(
     'avoidList',
     avoid,
-    'No evidence-backed avoid candidate in the current deep shortlist.'
+    isShortTerm
+      ? 'No invalid or avoid setup in the current deep shortlist.'
+      : 'No evidence-backed avoid candidate in the current deep shortlist.'
   );
 
   if ($('priorityOneCount')) {
-    $('priorityOneCount')
-      .textContent =
-        priority1.length;
+    $('priorityOneCount').textContent =
+      priority1.length;
   }
-
   if ($('priorityTwoCount')) {
-    $('priorityTwoCount')
-      .textContent =
-        priority2.length;
+    $('priorityTwoCount').textContent =
+      priority2.length;
   }
-
   if ($('researchRequiredCount')) {
-    $('researchRequiredCount')
-      .textContent =
-        research.length;
+    $('researchRequiredCount').textContent =
+      research.length;
   }
-
   if ($('avoidCount')) {
-    $('avoidCount')
-      .textContent =
-        avoid.length;
+    $('avoidCount').textContent =
+      avoid.length;
   }
 }
 
@@ -50176,6 +50502,135 @@ function renderHomeDecisionSummary(
     );
 }
 
+function classifyClientTriggerPrice(current, low, high, stop) {
+  const price = Number(current);
+  const entryLow = Number(low);
+  const entryHigh = Number(high);
+  const invalidation = Number(stop);
+
+  if (!Number.isFinite(price) || !Number.isFinite(entryLow) || !Number.isFinite(entryHigh)) {
+    return { status: 'waiting', label: 'Waiting for live price', distance: '' };
+  }
+  if (Number.isFinite(invalidation) && price <= invalidation) {
+    return { status: 'invalidated', label: 'Invalidated', distance: 'Price is at or below the stop level' };
+  }
+  if (price >= entryLow && price <= entryHigh) {
+    return { status: 'triggered', label: 'Entry zone active', distance: 'Entry zone reached' };
+  }
+  if (price < entryLow) {
+    const pct = ((entryLow - price) / Math.max(price, 0.0001)) * 100;
+    return {
+      status: pct <= 1.5 ? 'near_trigger' : 'waiting',
+      label: pct <= 1.5 ? 'Near trigger' : 'Waiting below trigger',
+      distance: formatNumber(pct, 2) + '% below trigger'
+    };
+  }
+  const pct = ((price - entryHigh) / Math.max(entryHigh, 0.0001)) * 100;
+  return {
+    status: pct <= 1 ? 'triggered' : 'above_entry_zone',
+    label: pct <= 1 ? 'Entry still valid' : 'Above entry zone — do not chase',
+    distance: formatNumber(pct, 2) + '% above entry zone'
+  };
+}
+
+async function refreshDecisionTriggerStates() {
+  const cards =
+    [...document.querySelectorAll('[data-trigger-symbol]')];
+
+  if (!cards.length || document.visibilityState !== 'visible') {
+    return;
+  }
+
+  try {
+    const market =
+      await api('market');
+    const rows =
+      Array.isArray(market?.liveMarketRows)
+        ? market.liveMarketRows
+        : [];
+    const bySymbol =
+      new Map(
+        rows.map(
+          row => [
+            String(row.canonicalSymbol || row.symbol || '').toUpperCase(),
+            Number(row.price)
+          ]
+        )
+      );
+
+    cards.forEach(
+      card => {
+        const symbol =
+          String(card.dataset.triggerSymbol || '').toUpperCase();
+        const current =
+          bySymbol.get(symbol);
+
+        if (!Number.isFinite(current)) {
+          return;
+        }
+
+        const state =
+          classifyClientTriggerPrice(
+            current,
+            card.dataset.triggerLow,
+            card.dataset.triggerHigh,
+            card.dataset.triggerStop
+          );
+
+        card.classList.remove(
+          'waiting',
+          'near_trigger',
+          'triggered',
+          'invalidated',
+          'above_entry_zone'
+        );
+        card.classList.add(state.status);
+
+        const status =
+          card.querySelector('[data-trigger-status]');
+        if (status) {
+          status.className =
+            'triggerStatus ' + state.status;
+          status.textContent =
+            state.label;
+        }
+
+        const currentTarget =
+          card.querySelector('[data-trigger-current]');
+        if (currentTarget) {
+          currentTarget.textContent =
+            'PKR ' + formatNumber(current, 2);
+        }
+
+        const distanceTarget =
+          card.querySelector('[data-trigger-distance]');
+        if (distanceTarget) {
+          distanceTarget.textContent =
+            state.distance;
+        }
+      }
+    );
+  } catch {}
+}
+
+function startDecisionTriggerMonitor() {
+  if (decisionTriggerRefreshTimer) {
+    clearInterval(decisionTriggerRefreshTimer);
+    decisionTriggerRefreshTimer = null;
+  }
+
+  if (!document.querySelector('[data-trigger-symbol]')) {
+    return;
+  }
+
+  refreshDecisionTriggerStates();
+  decisionTriggerRefreshTimer =
+    setInterval(
+      refreshDecisionTriggerStates,
+      30000
+    );
+}
+
 function renderShadowDecision(
   result
 ) {
@@ -50201,6 +50656,13 @@ function renderShadowDecision(
     )
       ? result.allocations
       : [];
+
+  const triggerPlan =
+    result?.shortTermTriggerPlan ||
+    null;
+
+  const isShortTermDecision =
+    result?.input?.horizon === 'short_term';
 
   let html =
     '<div class="decisionShadowBanner">SHADOW MODEL · NOT REAL-MONEY ELIGIBLE</div>' +
@@ -50265,7 +50727,9 @@ function renderShadowDecision(
     ) +
     '</span>' +
     '</div>' +
-    '<div class="decisionMoneyLine">' +
+    '<div class="decisionMoneyLine ' +
+    (isShortTermDecision ? 'shortTermMoneyLine' : '') +
+    '">' +
     '<div><span>Requested</span><strong>PKR ' +
     formatNumber(
       result.input?.amount ||
@@ -50273,22 +50737,37 @@ function renderShadowDecision(
       0
     ) +
     '</strong></div>' +
-    '<div><span>Buy now</span><strong>PKR ' +
+    '<div class="moneyAction"><span>Buy now</span><strong>PKR ' +
     formatNumber(
       decision.amountInvestedPkr ||
       0,
       0
     ) +
     '</strong></div>' +
-    '<div><span>Cash retained</span><strong>PKR ' +
-    formatNumber(
-      decision.cashRemainingPkr ||
-      0,
-      0
-    ) +
-    '</strong></div>' +
+    (isShortTermDecision
+      ? '<div class="moneyTrigger"><span>Reserved for triggers</span><strong>PKR ' +
+        formatNumber(
+          triggerPlan?.plannedCapitalPkr ||
+          0,
+          0
+        ) +
+        '</strong></div><div class="moneyCash"><span>Free cash</span><strong>PKR ' +
+        formatNumber(
+          triggerPlan?.uncommittedCapitalPkr ??
+          decision.cashRemainingPkr ??
+          0,
+          0
+        ) +
+        '</strong></div>'
+      : '<div class="moneyCash"><span>Cash retained</span><strong>PKR ' +
+        formatNumber(
+          decision.cashRemainingPkr ||
+          0,
+          0
+        ) +
+        '</strong></div>') +
     '</div>' +
-    '<div class="decisionMetaLine">' +
+    '<div class="decisionLeadReason">' +
     escapeHtml(
       decision.reason ||
       ''
@@ -50600,10 +51079,6 @@ function renderShadowDecision(
       '<div class="decisionMetaLine">No capital is allocated unless a canonical BUY or ACCUMULATE state has allocation permission and at least one whole share fits the portfolio/risk limits.</div>';
   }
 
-  const triggerPlan =
-    result?.shortTermTriggerPlan ||
-    null;
-
   if (
     result?.input?.horizon === 'short_term' &&
     triggerPlan?.plans?.length
@@ -50630,43 +51105,84 @@ function renderShadowDecision(
       '. This is not a buy-now instruction; each position activates only if its entry trigger remains valid.</div>';
 
     html +=
+      '<div class="triggerPlanGrid">' +
       triggerPlan.plans.map(
-        item =>
-          '<div class="decisionAllocationRow triggerPlanRow">' +
-          '<div class="decisionSymbol">' +
-          escapeHtml(item.symbol) +
-          '</div>' +
-          '<div><strong>' +
-          formatNumber(item.shares, 0) +
-          ' shares if triggered · ~PKR ' +
-          formatNumber(item.plannedPrincipalPkr, 0) +
-          '</strong><div class="decisionMinor">Entry PKR ' +
-          formatNumber(item.entryLow, 2) +
-          '–' +
-          formatNumber(item.entryHigh, 2) +
-          ' · stop PKR ' +
-          formatNumber(item.stop, 2) +
-          (
-            item.target1 !== null &&
-            item.target1 !== undefined
-              ? ' · target PKR ' +
-                formatNumber(item.target1, 2)
-              : ''
-          ) +
-          (
-            item.rewardRisk !== null &&
-            item.rewardRisk !== undefined
-              ? ' · R/R ' +
-                formatNumber(item.rewardRisk, 2) +
-                'x'
-              : ''
-          ) +
-          ' · risk budget ' +
-          formatNumber(item.riskBudgetPct, 2) +
-          '%</div></div>' +
-          '<div class="decisionActionTag watch">WAIT FOR TRIGGER</div>' +
-          '</div>'
-      ).join('');
+        item => {
+          const statusClass =
+            String(
+              item.triggerStatus ||
+              item.state ||
+              'WAITING'
+            ).toLowerCase();
+          const distanceText =
+            item.distancePct === null ||
+            item.distancePct === undefined
+              ? ''
+              : item.triggerDirection === 'below'
+                ? formatNumber(item.distancePct, 2) + '% below trigger'
+                : item.triggerDirection === 'above'
+                  ? formatNumber(item.distancePct, 2) + '% above entry zone'
+                  : 'Entry zone reached';
+
+          return (
+            '<div class="triggerPlanCard ' +
+            escapeHtml(statusClass) +
+            '" data-trigger-symbol="' +
+            escapeHtml(item.symbol) +
+            '" data-trigger-low="' +
+            escapeHtml(item.entryLow) +
+            '" data-trigger-high="' +
+            escapeHtml(item.entryHigh) +
+            '" data-trigger-stop="' +
+            escapeHtml(item.stop) +
+            '">' +
+            '<div class="triggerPlanTop"><div><strong class="triggerSymbol">' +
+            escapeHtml(item.symbol) +
+            '</strong><span>' +
+            escapeHtml(item.companyName || '') +
+            '</span></div><div class="triggerStatus ' +
+            escapeHtml(statusClass) +
+            '" data-trigger-status>' +
+            escapeHtml(item.triggerLabel || 'Waiting') +
+            '</div></div>' +
+            '<div class="triggerPriceRow"><div><span>Current</span><strong data-trigger-current>PKR ' +
+            formatNumber(item.currentPrice, 2) +
+            '</strong></div><div class="highlightTrigger"><span>Trigger zone</span><strong>PKR ' +
+            formatNumber(item.entryLow, 2) +
+            '–' +
+            formatNumber(item.entryHigh, 2) +
+            '</strong></div><div class="highlightStop"><span>Stop</span><strong>PKR ' +
+            formatNumber(item.stop, 2) +
+            '</strong></div>' +
+            (
+              item.target1 !== null &&
+              item.target1 !== undefined
+                ? '<div class="highlightTarget"><span>Target</span><strong>PKR ' +
+                  formatNumber(item.target1, 2) +
+                  '</strong></div>'
+                : ''
+            ) +
+            '</div>' +
+            '<div class="triggerDistance" data-trigger-distance>' +
+            escapeHtml(distanceText) +
+            '</div>' +
+            '<div class="triggerCondition"><strong>What triggers it:</strong> ' +
+            escapeHtml(item.triggerCondition || '') +
+            '</div>' +
+            '<div class="triggerPlanFoot"><strong>' +
+            formatNumber(item.shares, 0) +
+            ' shares · ~PKR ' +
+            formatNumber(item.plannedPrincipalPkr, 0) +
+            '</strong><span>R:R ' +
+            formatNumber(item.rewardRisk, 2) +
+            'x · risk budget ' +
+            formatNumber(item.riskBudgetPct, 2) +
+            '%</span></div>' +
+            '</div>'
+          );
+        }
+      ).join('') +
+      '</div>';
   }
 
   const unfunded =
@@ -50747,6 +51263,8 @@ function renderShadowDecision(
 
   target.innerHTML =
     html;
+
+  startDecisionTriggerMonitor();
 
   renderOpportunityBoard(
     result
