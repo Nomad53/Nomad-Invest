@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.5.0';
+const VERSION = '0.9.5.1';
 
 
 const SUPABASE_URL =
@@ -25045,7 +25045,8 @@ function shortTermTriggerSnapshot(
 function buildShortTermTriggerPlan(
   opportunityBoard,
   amount,
-  riskPolicy
+  riskPolicy,
+  alreadyInvestedPkr = 0
 ) {
   const policy =
     decisionTraderProfilePolicy(
@@ -25082,6 +25083,27 @@ function buildShortTermTriggerPlan(
 
   const plans = [];
   let reserved = 0;
+
+  const totalCapital =
+    Math.max(
+      0,
+      Number(amount) || 0
+    );
+
+  const investedNow =
+    Math.max(
+      0,
+      Math.min(
+        totalCapital,
+        Number(alreadyInvestedPkr) || 0
+      )
+    );
+
+  const availableForTriggers =
+    Math.max(
+      0,
+      totalCapital - investedNow
+    );
 
   for (const item of candidates) {
     const plan =
@@ -25121,7 +25143,7 @@ function buildShortTermTriggerPlan(
     }
 
     const maxRiskPkr =
-      Number(amount) *
+      totalCapital *
       riskBudgetPct;
     const sharesByRisk =
       Math.floor(
@@ -25130,7 +25152,7 @@ function buildShortTermTriggerPlan(
       );
 
     const maxPrincipalBySlot =
-      Number(amount) /
+      availableForTriggers /
       Math.max(
         1,
         Math.min(
@@ -25158,8 +25180,33 @@ function buildShortTermTriggerPlan(
       continue;
     }
 
+    const remainingTriggerCapital =
+      Math.max(
+        0,
+        availableForTriggers - reserved
+      );
+
+    const affordableShares =
+      Math.floor(
+        remainingTriggerCapital /
+        entry
+      );
+
+    const fundedShares =
+      Math.max(
+        0,
+        Math.min(
+          shares,
+          affordableShares
+        )
+      );
+
+    if (fundedShares < 1) {
+      continue;
+    }
+
     const principal =
-      shares * entry;
+      fundedShares * entry;
 
     const triggerSnapshot =
       shortTermTriggerSnapshot(
@@ -25198,7 +25245,7 @@ function buildShortTermTriggerPlan(
       setup:
         item.professional.setup ||
         null,
-      shares,
+      shares: fundedShares,
       entryLow:
         decisionRound(entryLow, 2),
       entryHigh:
@@ -25240,7 +25287,7 @@ function buildShortTermTriggerPlan(
     plannedCapitalPkr:
       decisionRound(
         Math.min(
-          Number(amount) || 0,
+          availableForTriggers,
           reserved
         ),
         2
@@ -25249,9 +25296,20 @@ function buildShortTermTriggerPlan(
       decisionRound(
         Math.max(
           0,
-          (Number(amount) || 0) -
+          totalCapital -
+          investedNow -
           reserved
         ),
+        2
+      ),
+    buyNowCapitalPkr:
+      decisionRound(
+        investedNow,
+        2
+      ),
+    availableForTriggersPkr:
+      decisionRound(
+        availableForTriggers,
         2
       ),
     plans
@@ -29562,7 +29620,8 @@ async function runDecisionLab(
       ? buildShortTermTriggerPlan(
           opportunityBoard,
           amount,
-          riskPolicy
+          riskPolicy,
+          allocation.amountInvestedPkr || 0
         )
       : null;
 
@@ -38256,6 +38315,96 @@ button:not(.secondary):not(.miniButton):not(.chartModeButton):not(.navButton):no
   }
 }
 
+
+
+/* =========================================================
+   TRADER CONSISTENCY + OPPORTUNITY LEGIBILITY - BUILD 0.9.5.1
+========================================================= */
+.opportunityCard:not(.isEmptyOpportunity) {
+  padding: 14px 16px 16px;
+}
+.opportunityCard:not(.isEmptyOpportunity) .panelHeader {
+  margin-bottom: 10px;
+}
+.opportunityCard:not(.isEmptyOpportunity) .opportunityList {
+  gap: 12px 14px !important;
+  padding: 2px 2px 4px;
+}
+.opportunityCard:not(.isEmptyOpportunity) .opportunityRow {
+  margin: 0 !important;
+  padding: 12px 12px 11px !important;
+  border: 1px solid #22384e !important;
+  border-radius: 8px;
+  background: rgba(10, 24, 38, .62);
+  min-width: 0;
+  box-sizing: border-box;
+}
+.opportunityCard:not(.isEmptyOpportunity) .opportunityRow:first-child {
+  border-top: 1px solid #22384e !important;
+}
+.opportunityCard:not(.isEmptyOpportunity) .opportunityRow:hover {
+  border-color: rgba(244, 197, 66, .36) !important;
+  background: rgba(16, 32, 48, .78);
+}
+.opportunityIdentity {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px 7px;
+}
+.opportunityIdentity .opportunityAnalyzeButton {
+  margin-left: 2px !important;
+  flex: 0 0 auto;
+}
+.opportunityMain {
+  min-width: 0;
+  padding-right: 8px;
+}
+.opportunityActionStack {
+  min-width: 104px;
+  gap: 6px;
+  padding-left: 8px;
+}
+.opportunityAction,
+.opportunityProfileAction {
+  white-space: nowrap;
+}
+.tradeQuickLine {
+  gap: 7px !important;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(58, 82, 105, .42);
+}
+.opportunityReason.compact {
+  margin-top: 8px;
+}
+.opportunityDetails {
+  margin-top: 7px;
+}
+
+@media (min-width: 1101px) {
+  .opportunityCard:not(.isEmptyOpportunity) .opportunityList {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@media (max-width: 1100px) {
+  .opportunityCard:not(.isEmptyOpportunity) {
+    padding: 12px;
+  }
+  .opportunityCard:not(.isEmptyOpportunity) .opportunityList {
+    grid-template-columns: 1fr !important;
+    gap: 10px !important;
+  }
+}
+@media (max-width: 620px) {
+  .opportunityCard:not(.isEmptyOpportunity) .opportunityRow {
+    padding: 11px 10px !important;
+  }
+  .opportunityActionStack {
+    min-width: 0;
+    padding-left: 0;
+  }
+}
 </style>
 
 </head>
@@ -50571,13 +50720,17 @@ function renderOpportunityList(
             item.decisionCenterView
           );
         const profileAction =
-          isShortTerm && execution
+          item.displayProfileAction
             ? decisionActionLabel(
-                execution.action
+                item.displayProfileAction
               )
-            : item.profileSuitability?.state === 'SUITABLE'
-              ? 'ELIGIBLE'
-              : 'PASS';
+            : isShortTerm && execution
+              ? decisionActionLabel(
+                  execution.action
+                )
+              : item.profileSuitability?.state === 'SUITABLE'
+                ? 'ELIGIBLE'
+                : 'PASS';
 
         const quickTradeLine =
           isShortTerm && plan?.complete
@@ -50725,11 +50878,13 @@ function renderOpportunityList(
           '<div class="opportunityProfileAction ' +
           escapeHtml(
             String(
-              isShortTerm && execution
-                ? execution.action || ''
-                : item.profileSuitability?.state === 'SUITABLE'
-                  ? 'eligible'
-                  : 'pass'
+              item.displayProfileAction
+                ? item.displayProfileAction
+                : isShortTerm && execution
+                  ? execution.action || ''
+                  : item.profileSuitability?.state === 'SUITABLE'
+                    ? 'eligible'
+                    : 'pass'
             ).toLowerCase()
           ) +
           '">For you: ' +
@@ -51509,6 +51664,62 @@ function renderOpportunityBoard(
     board.avoid ||
     [];
 
+  const allocationSymbols =
+    new Set(
+      (result?.allocations || [])
+        .map(item => item?.symbol)
+        .filter(Boolean)
+    );
+
+  const personalActionBySymbol =
+    new Map(
+      (result?.allocationDiagnostics?.personalActions || [])
+        .filter(item => item?.symbol)
+        .map(item => [item.symbol, item])
+    );
+
+  const decoratePersonalAction =
+    item => {
+      if (!isShortTerm || !item?.symbol) {
+        return item;
+      }
+
+      const personal =
+        personalActionBySymbol.get(
+          item.symbol
+        );
+
+      let displayProfileAction =
+        null;
+
+      if (allocationSymbols.has(item.symbol)) {
+        displayProfileAction =
+          item?.shortTermExecution?.action === 'BUY_SMALL'
+            ? 'BUY_SMALL'
+            : 'BUY';
+      } else if (personal?.portfolioAction) {
+        displayProfileAction =
+          personal.portfolioAction;
+      } else if (item?.shortTermExecution?.action) {
+        displayProfileAction =
+          item.shortTermExecution.action;
+      }
+
+      return {
+        ...item,
+        displayProfileAction
+      };
+    };
+
+  const priority1Display =
+    priority1.map(decoratePersonalAction);
+  const priority2Display =
+    priority2.map(decoratePersonalAction);
+  const researchDisplay =
+    research.map(decoratePersonalAction);
+  const avoidDisplay =
+    avoid.map(decoratePersonalAction);
+
   if ($('priorityOneEyebrow')) {
     $('priorityOneEyebrow').textContent =
       isShortTerm ? 'ACTION NOW' : 'PRIORITY 1';
@@ -51544,7 +51755,7 @@ function renderOpportunityBoard(
 
   renderOpportunityList(
     'priorityOneList',
-    priority1,
+    priority1Display,
     isShortTerm
       ? 'No entry is valid right now.'
       : 'No company currently earns Priority 1 under the tiered analyst-evidence gate.'
@@ -51552,7 +51763,7 @@ function renderOpportunityBoard(
 
   renderOpportunityList(
     'priorityTwoList',
-    priority2,
+    priority2Display,
     isShortTerm
       ? 'No ready setup right now.'
       : 'No Priority 2 opportunity currently stands out.'
@@ -51560,7 +51771,7 @@ function renderOpportunityBoard(
 
   renderOpportunityList(
     'researchRequiredList',
-    research,
+    researchDisplay,
     isShortTerm
       ? 'No developing setup right now.'
       : 'No shortlisted company is currently in automatic evidence research.'
@@ -51568,7 +51779,7 @@ function renderOpportunityBoard(
 
   renderOpportunityList(
     'avoidList',
-    avoid,
+    avoidDisplay,
     isShortTerm
       ? 'No avoid setup right now.'
       : 'No evidence-backed avoid candidate in the current deep shortlist.'
@@ -52059,7 +52270,7 @@ function renderShadowDecision(
     '<span>' +
     escapeHtml(
       isShortTermDecision
-        ? ((triggerPlan?.count || 0) + ' ready setup' + ((triggerPlan?.count || 0) === 1 ? '' : 's') + ' · ' + (decision.amountInvestedPkr > 0 ? 'entry valid now' : 'no buy-now entry'))
+        ? ((triggerPlan?.count || 0) + ' funded trigger plan' + ((triggerPlan?.count || 0) === 1 ? '' : 's') + ' · ' + (decision.amountInvestedPkr > 0 ? 'entry valid now' : 'no buy-now entry'))
         : ((allocations.length || 0) + ' funded position' + (allocations.length === 1 ? '' : 's') + ' · ' + formatNumber(decision.cashRemainingPkr || 0, 0) + ' PKR retained')
     ) +
     '</span>' +
