@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.4.4';
+const VERSION = '0.9.4.5';
 
 
 const SUPABASE_URL =
@@ -37783,6 +37783,101 @@ button:not(.secondary):not(.miniButton):not(.chartModeButton):not(.navButton):no
 }
 
 
+
+/* BUILD 0.9.4.5 - Portfolio chart and dense-row legibility fixes. */
+.portfolioChartToolbarLeft {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.portfolioCostBadge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 0 10px;
+  border: 1px solid #3a4d63;
+  border-radius: 7px;
+  background: #101b2a;
+  color: #a9b7c7;
+  font-size: 9px;
+  font-weight: 750;
+  white-space: nowrap;
+}
+.portfolioChartFoot {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 4px 0 0;
+  color: #708399;
+  font-size: 9px;
+}
+.portfolioChartAxisText {
+  font-size: 10px !important;
+  letter-spacing: 0 !important;
+}
+.portfolioNomadCell {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  line-height: 1.15;
+}
+.portfolioNomadCell .portfolioViewTag {
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
+  white-space: nowrap;
+}
+.portfolioNomadCell .decisionMinor {
+  margin: 0 !important;
+  max-width: 100%;
+  color: #7f93aa;
+  font-size: 9px;
+  line-height: 1.2;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.transactionRow {
+  grid-template-columns: 100px 70px 80px minmax(190px, 1fr) 100px 70px;
+  gap: 14px;
+}
+.transactionRow > div {
+  min-width: 0;
+}
+.transactionRow > div:nth-child(4) {
+  white-space: nowrap;
+}
+.transactionRow .transactionSideTag {
+  min-width: 58px;
+  box-sizing: border-box;
+}
+@media (min-width: 901px) {
+  .portfolioPositionHeader,
+  .portfolioPositionRow {
+    grid-template-columns: 70px minmax(165px,1.45fr) 72px 86px 86px 104px 108px 76px 126px !important;
+    column-gap: 12px;
+  }
+}
+@media (max-width: 900px) {
+  .portfolioPositionHeader,
+  .portfolioPositionRow {
+    min-width: 1080px;
+    grid-template-columns: 70px 190px 72px 88px 88px 105px 112px 78px 135px;
+    column-gap: 10px;
+  }
+  .transactionRow {
+    grid-template-columns: 88px 62px 72px minmax(170px,1fr) 80px 62px;
+    min-width: 650px;
+    gap: 10px;
+  }
+  .transactionList {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+}
+
 /* BUILD 0.9.4.4 - Research tabs stay in normal document flow. */
 #researchSection > .actions {
   position: static !important;
@@ -40052,7 +40147,7 @@ function portfolioLiveValueChart(series, summary) {
     '<polygon points="'+area+'" class="portfolioChartArea" />' +
     '<polyline points="'+poly+'" class="portfolioChartLine" />' +
     '</svg>' +
-    '<div class="portfolioChartFoot"><span>'+escapeHtml(startLabel)+'</span><span>Cost basis '+portfolioMoney(cost)+'</span><span>'+escapeHtml(endLabel)+'</span></div>' +
+    '<div class="portfolioChartFoot"><span>'+escapeHtml(startLabel)+'</span><span>'+escapeHtml(endLabel)+'</span></div>' +
     '<div class="portfolioChartNote">Session tracking uses NOMAD\\'s verified portfolio snapshots. It builds as live prices refresh and is separate from broker account equity.</div>' +
     '</div>';
 }
@@ -40075,23 +40170,31 @@ function portfolioIntradayChartMarkup(result) {
   const pad = Math.max((max-min)*.10, Math.max(max,1)*.0008);
   min -= pad; max += pad;
 
-  const W=1000,H=250,L=70,R=18,T=18,B=30;
+  const W=1000,H=250,L=96,R=18,T=18,B=30;
   const uw=W-L-R, uh=H-T-B;
   const x=i => L + (i/(rows.length-1))*uw;
   const y=v => T + (1-((v-min)/(max-min)))*uh;
   const poly = rows.map((row,i)=>x(i).toFixed(1)+','+y(Number(row.value)).toFixed(1)).join(' ');
   const area = L+','+(T+uh)+' '+poly+' '+(W-R)+','+(T+uh);
   const ticks=[max,(max+min)/2,min];
+  const axisMoney = value => {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return '';
+    const a = Math.abs(n);
+    if (a >= 1e6) return 'PKR ' + formatNumber(n / 1e6, 2) + 'M';
+    if (a >= 1e3) return 'PKR ' + formatNumber(n / 1e3, 1) + 'K';
+    return 'PKR ' + formatNumber(n, 0);
+  };
   const startLabel = new Date(rows[0].timestamp).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
   const endLabel = new Date(rows[rows.length-1].timestamp).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
 
   return '<div class="portfolioLiveChart portfolioBrokerChart">' +
     '<div class="portfolioChartHead"><div><div class="eyebrow">PORTFOLIO PERFORMANCE</div><h2>Intraday value</h2><div class="portfolioChartAsOf">'+escapeHtml(result?.marketStatus?.isOpen ? 'Live session' : 'Latest completed session')+' · '+escapeHtml(relativeTime(result.asOf))+'</div></div>' +
     '<div class="portfolioChartValue"><strong>'+portfolioMoney(current)+'</strong><span class="'+percentClass(changePct)+'">'+(changeValue>0?'+':'')+portfolioMoney(changeValue)+' · '+(changePct>0?'+':'')+formatNumber(changePct,2)+'%</span></div></div>' +
-    '<div class="portfolioChartToolbar"><span class="portfolioChartRange active">1D</span><span class="portfolioChartSource">'+escapeHtml(result.holdingsCovered)+'/'+escapeHtml(result.holdingsTotal)+' holdings · pyPSX intraday</span></div>' +
+    '<div class="portfolioChartToolbar"><div class="portfolioChartToolbarLeft"><span class="portfolioChartRange active">1D</span><span class="portfolioCostBadge">Cost basis '+portfolioMoney(cost)+'</span></div><span class="portfolioChartSource">'+escapeHtml(result.holdingsCovered)+'/'+escapeHtml(result.holdingsTotal)+' holdings · pyPSX intraday</span></div>' +
     '<svg viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none" class="portfolioValueSvg portfolioBrokerSvg" aria-label="Intraday portfolio value chart">' +
     ticks.map(v=>'<line x1="'+L+'" x2="'+(W-R)+'" y1="'+y(v).toFixed(1)+'" y2="'+y(v).toFixed(1)+'" class="portfolioChartGrid" />').join('') +
-    ticks.map(v=>'<text x="4" y="'+(y(v)+4).toFixed(1)+'" class="portfolioChartAxisText">'+escapeHtml('PKR '+formatCompactPKR(v))+'</text>').join('') +
+    ticks.map(v=>'<text x="'+(L-12)+'" y="'+(y(v)+4).toFixed(1)+'" text-anchor="end" class="portfolioChartAxisText">'+escapeHtml(axisMoney(v))+'</text>').join('') +
     '<polygon points="'+area+'" class="portfolioChartArea" />' +
     '<polyline points="'+poly+'" class="portfolioChartLine" />' +
     '</svg>' +
@@ -40423,7 +40526,7 @@ function renderPortfolioFull(
             1
           ) +
           '%</div>' +
-          '<div><span class="portfolioViewTag ' +
+          '<div class="portfolioNomadCell"><span class="portfolioViewTag ' +
           portfolioViewClass(
             item.nomadView
           ) +
