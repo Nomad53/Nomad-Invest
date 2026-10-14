@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.3.6';
+const VERSION = '0.9.3.7';
 
 
 const SUPABASE_URL =
@@ -20251,7 +20251,7 @@ const DECISION_MODELS = {
     }
   },
   short_term: {
-    id: 'NOMAD-ST-PRO-0.9.3',
+    id: 'NOMAD-ST-PRO-0.9.3.7',
     horizon: 'short_term',
     status: 'SHADOW_UNVALIDATED',
     realMoneyEligible: false,
@@ -20327,6 +20327,57 @@ const DECISION_TRADER_RISK_BUDGET_PCT = {
   balanced: 0.01,
   aggressive: 0.015
 };
+
+// 0.9.3.7 Trader execution policy. Short-term risk is expressed primarily
+// through setup quality, stop distance, position size and per-trade risk.
+// These thresholds do not alter the locked long-term investment brain.
+const DECISION_TRADER_PROFILE_POLICIES = {
+  conservative: {
+    id: 'TRADER-CONSERVATIVE-0.9.3.7',
+    minTimingScore: 66,
+    minTechnicalEvidenceScore: 80,
+    minRewardRisk: 1.80,
+    minRiskScore: 35,
+    maxStopRiskPct: 7.0,
+    maxConditionalPlans: 2,
+    activeSizeMultiplier: 0.78,
+    allowEarlyEntry: false
+  },
+  balanced: {
+    id: 'TRADER-BALANCED-0.9.3.7',
+    minTimingScore: 60,
+    minTechnicalEvidenceScore: 70,
+    minRewardRisk: 1.55,
+    minRiskScore: 30,
+    maxStopRiskPct: 10.0,
+    maxConditionalPlans: 3,
+    activeSizeMultiplier: 1.00,
+    allowEarlyEntry: false
+  },
+  aggressive: {
+    id: 'TRADER-AGGRESSIVE-0.9.3.7',
+    minTimingScore: 55,
+    minTechnicalEvidenceScore: 64,
+    minRewardRisk: 1.35,
+    minRiskScore: 25,
+    maxStopRiskPct: 14.0,
+    maxConditionalPlans: 4,
+    activeSizeMultiplier: 1.15,
+    allowEarlyEntry: true
+  }
+};
+
+function decisionTraderProfilePolicy(riskPolicy) {
+  if (riskPolicy?.id === 'RISK-CONSERVATIVE-0.1') {
+    return DECISION_TRADER_PROFILE_POLICIES.conservative;
+  }
+
+  if (riskPolicy?.id === 'RISK-AGGRESSIVE-0.1') {
+    return DECISION_TRADER_PROFILE_POLICIES.aggressive;
+  }
+
+  return DECISION_TRADER_PROFILE_POLICIES.balanced;
+}
 
 // Execution practicality. PSX regular-market equities use a one-share
 // marketable lot, but NOMAD still avoids economically trivial positions.
@@ -22831,7 +22882,7 @@ function professionalShortTermView(
     ) !== null &&
     safeNumber(
       conditionalTradePlan?.rewardRisk
-    ) >= DECISION_TRADER_MIN_REWARD_RISK;
+    ) >= 1.35;
 
   const rankingScore =
     decisionRound(
@@ -22919,12 +22970,11 @@ function professionalShortTermView(
       setup === 'TREND_PULLBACK' ||
       setup === 'UPTREND_CONTINUATION'
     ) &&
-    timingScore >= 68 &&
-    riskScore >= 45 &&
-    technicalEvidenceScore >= 70 &&
+    timingScore >= 60 &&
+    riskScore >= 30 &&
+    technicalEvidenceScore >= 65 &&
     definedTradePlan &&
-    rewardRisk >=
-      DECISION_TRADER_MIN_REWARD_RISK;
+    rewardRisk >= 1.40;
 
   if (actionableSetup) {
     return {
@@ -22997,9 +23047,9 @@ function professionalShortTermView(
   ) {
     reason =
       'Price is attempting a breakout, but confirmation is incomplete. NOMAD waits for confirmation rather than chasing the move.';
-  } else if (timingScore < 68) {
+  } else if (timingScore < 60) {
     reason =
-      'The setup exists, but current momentum/price-action timing is not strong enough for entry.';
+      'The setup exists, but current momentum/price-action timing is not yet strong enough for a profile-independent market BUY. The selected trader profile may still define a conditional or early-entry plan.';
   }
 
   return {
@@ -23220,6 +23270,9 @@ function decisionCenterSummary(
       canonical.allocationPermission,
     profileSuitability:
       candidate.profileSuitability ||
+      null,
+    shortTermExecution:
+      candidate.shortTermExecution ||
       null,
     opportunityRankScore:
       candidate.opportunityRankScore,
@@ -23735,14 +23788,17 @@ function decisionProfileSuitability(
       traderPlanForRisk?.riskPct
     );
 
+  const traderProfilePolicy =
+    shortTermMode
+      ? decisionTraderProfilePolicy(
+          riskPolicy
+        )
+      : null;
+
   const maxTraderStopRiskPct =
-    riskPolicy?.id ===
-      'RISK-CONSERVATIVE-0.1'
-      ? 7.5
-      : riskPolicy?.id ===
-          'RISK-AGGRESSIVE-0.1'
-        ? 14
-        : 10;
+    shortTermMode
+      ? traderProfilePolicy.maxStopRiskPct
+      : null;
 
   if (
     shortTermMode &&
@@ -23766,25 +23822,37 @@ function decisionProfileSuitability(
           candidate?.dataQuality?.score
         );
 
+  const minimumEvidenceScore =
+    shortTermMode
+      ? traderProfilePolicy.minTechnicalEvidenceScore
+      : riskPolicy.minDataQualityScore;
+
   if (
     applicableDataQualityScore <
-      riskPolicy.minDataQualityScore
+      minimumEvidenceScore
   ) {
     issues.push(
       shortTermMode
-        ? 'Technical evidence quality is below the selected risk profile minimum.'
+        ? 'Technical evidence quality is below the selected trader profile minimum.'
         : 'Data quality is below the selected risk profile minimum.'
     );
   }
+
+  const minimumRiskScore =
+    shortTermMode
+      ? traderProfilePolicy.minRiskScore
+      : riskPolicy.minRiskScore;
 
   if (
     safeNumber(
       candidate?.risk?.score
     ) <
-      riskPolicy.minRiskScore
+      minimumRiskScore
   ) {
     issues.push(
-      'Risk quality is below the selected risk profile minimum.'
+      shortTermMode
+        ? 'Trade risk/liquidity quality is below the selected trader profile minimum.'
+        : 'Risk quality is below the selected risk profile minimum.'
     );
   }
 
@@ -23807,9 +23875,13 @@ function decisionProfileSuitability(
           }
         : {}),
       minDataQualityScore:
-        riskPolicy.minDataQualityScore,
+        shortTermMode
+          ? traderProfilePolicy.minTechnicalEvidenceScore
+          : riskPolicy.minDataQualityScore,
       minRiskScore:
-        riskPolicy.minRiskScore
+        shortTermMode
+          ? traderProfilePolicy.minRiskScore
+          : riskPolicy.minRiskScore
     },
     observations: {
       averageVolume30d:
@@ -24357,6 +24429,421 @@ function decisionCenterFinancialSectorCandidate(
   );
 }
 
+function shortTermProfileExecutionDecision(
+  candidate,
+  riskPolicy
+) {
+  if (
+    String(
+      candidate?.horizon ||
+      'long_term'
+    ) !== 'short_term'
+  ) {
+    return null;
+  }
+
+  const policy =
+    decisionTraderProfilePolicy(
+      riskPolicy
+    );
+
+  const professional =
+    candidate?.canonicalState
+      ?.professional ||
+    candidate?.professional ||
+    {};
+
+  const evidence =
+    candidate?.canonicalState
+      ?.evidence ||
+    {};
+
+  const suitability =
+    candidate?.profileSuitability ||
+    decisionProfileSuitability(
+      candidate,
+      riskPolicy
+    );
+
+  const timingScore =
+    safeNumber(
+      professional.timingScore
+    ) || 0;
+
+  const evidenceScore =
+    safeNumber(
+      evidence.technicalCoveragePct ??
+      evidence.score
+    ) || 0;
+
+  const riskScore =
+    safeNumber(
+      professional.riskScore ??
+      candidate?.risk?.score
+    ) || 0;
+
+  const currentPlan =
+    professional.tradePlan ||
+    null;
+
+  const conditionalPlan =
+    professional.conditionalTradePlan ||
+    null;
+
+  const currentRewardRisk =
+    safeNumber(
+      currentPlan?.rewardRisk
+    );
+
+  const conditionalRewardRisk =
+    safeNumber(
+      conditionalPlan?.rewardRisk
+    );
+
+  const currentStopRiskPct =
+    safeNumber(
+      currentPlan?.riskPct
+    );
+
+  const conditionalStopRiskPct =
+    safeNumber(
+      conditionalPlan?.riskPct
+    );
+
+  const setup =
+    String(
+      professional.setup ||
+      'NO_CLEAR_SETUP'
+    );
+
+  if (
+    suitability?.state !==
+      'SUITABLE'
+  ) {
+    return {
+      policyId: policy.id,
+      state: 'PROFILE_BLOCKED',
+      action: 'PASS',
+      marketAction: 'WATCH',
+      actionableNow: false,
+      reservationEligible: false,
+      sizeMultiplier: 0,
+      reason:
+        (suitability?.issues || [])
+          .join(' ') ||
+        'The setup does not fit the selected trader profile.'
+    };
+  }
+
+  const profileGatePass =
+    timingScore >=
+      policy.minTimingScore &&
+    evidenceScore >=
+      policy.minTechnicalEvidenceScore &&
+    riskScore >=
+      policy.minRiskScore;
+
+  const currentPlanPass =
+    currentPlan?.complete === true &&
+    currentRewardRisk !== null &&
+    currentRewardRisk >=
+      policy.minRewardRisk &&
+    (
+      currentStopRiskPct === null ||
+      currentStopRiskPct <=
+        policy.maxStopRiskPct
+    );
+
+  if (
+    professional.marketAction ===
+      'BUY' &&
+    profileGatePass &&
+    currentPlanPass
+  ) {
+    return {
+      policyId: policy.id,
+      state: 'ENTER_NOW',
+      action: 'BUY',
+      marketAction: 'BUY',
+      actionableNow: true,
+      reservationEligible: false,
+      sizeMultiplier:
+        policy.activeSizeMultiplier,
+      reason:
+        'The current setup, timing, evidence, stop distance and reward-to-risk pass the selected trader profile.'
+    };
+  }
+
+  const conditionalPass =
+    conditionalPlan?.complete === true &&
+    conditionalRewardRisk !== null &&
+    conditionalRewardRisk >=
+      policy.minRewardRisk &&
+    evidenceScore >=
+      policy.minTechnicalEvidenceScore &&
+    riskScore >=
+      policy.minRiskScore &&
+    (
+      conditionalStopRiskPct === null ||
+      conditionalStopRiskPct <=
+        policy.maxStopRiskPct
+    );
+
+  // Aggressive can take a deliberately smaller early entry only when there is
+  // already a complete current trade plan. It never converts an incomplete
+  // setup into a BUY merely because the profile is aggressive.
+  const earlyEntryPass =
+    policy.allowEarlyEntry === true &&
+    currentPlan?.complete === true &&
+    currentRewardRisk !== null &&
+    currentRewardRisk >= 1.25 &&
+    timingScore >=
+      policy.minTimingScore &&
+    evidenceScore >=
+      policy.minTechnicalEvidenceScore &&
+    riskScore >=
+      policy.minRiskScore &&
+    (
+      currentStopRiskPct === null ||
+      currentStopRiskPct <=
+        policy.maxStopRiskPct
+    ) &&
+    [
+      'CONFIRMED_BREAKOUT',
+      'UNCONFIRMED_BREAKOUT',
+      'TREND_PULLBACK',
+      'UPTREND_CONTINUATION'
+    ].includes(setup);
+
+  if (earlyEntryPass) {
+    return {
+      policyId: policy.id,
+      state: 'EARLY_ENTRY',
+      action: 'BUY_SMALL',
+      marketAction: 'BUY',
+      actionableNow: true,
+      reservationEligible:
+        conditionalPass,
+      sizeMultiplier: 0.55,
+      reason:
+        'Aggressive profile permits a smaller early entry because a complete current trade plan exists and stop-based risk remains controlled. Full sizing still waits for stronger confirmation.'
+    };
+  }
+
+  if (conditionalPass) {
+    return {
+      policyId: policy.id,
+      state: 'WAIT_FOR_TRIGGER',
+      action: 'PLAN',
+      marketAction: 'WATCH',
+      actionableNow: false,
+      reservationEligible: true,
+      sizeMultiplier: 0,
+      reason:
+        'The stock is not a buy at the current reference price, but the selected profile has a valid conditional entry, stop and target plan.'
+    };
+  }
+
+  return {
+    policyId: policy.id,
+    state: 'WATCH',
+    action: 'WAIT',
+    marketAction: 'WATCH',
+    actionableNow: false,
+    reservationEligible: false,
+    sizeMultiplier: 0,
+    reason:
+      'The setup remains worth monitoring, but it does not yet pass this trader profile\'s execution thresholds.'
+  };
+}
+
+function buildShortTermTriggerPlan(
+  opportunityBoard,
+  amount,
+  riskPolicy
+) {
+  const policy =
+    decisionTraderProfilePolicy(
+      riskPolicy
+    );
+
+  const riskBudgetPct =
+    decisionTraderRiskBudgetPct(
+      riskPolicy
+    );
+
+  const candidates =
+    [
+      ...(opportunityBoard?.priority1 || []),
+      ...(opportunityBoard?.priority2 || [])
+    ]
+      .filter(
+        item =>
+          item?.shortTermExecution
+            ?.reservationEligible === true &&
+          item?.professional
+            ?.conditionalTradePlan
+            ?.complete === true
+      )
+      .sort(
+        (a, b) =>
+          (safeNumber(b?.professional?.rankingScore) || 0) -
+          (safeNumber(a?.professional?.rankingScore) || 0)
+      )
+      .slice(
+        0,
+        policy.maxConditionalPlans
+      );
+
+  const plans = [];
+  let reserved = 0;
+
+  for (const item of candidates) {
+    const plan =
+      item.professional
+        .conditionalTradePlan;
+
+    const entryLow =
+      safeNumber(plan.entryLow);
+    const entryHigh =
+      safeNumber(plan.entryHigh);
+    const stop =
+      safeNumber(plan.stop);
+
+    if (
+      entryLow === null ||
+      entryHigh === null ||
+      stop === null
+    ) {
+      continue;
+    }
+
+    const entry =
+      (entryLow + entryHigh) / 2;
+    const riskPerShare =
+      Math.max(
+        0,
+        entry - stop
+      );
+
+    if (
+      entry <= 0 ||
+      riskPerShare <= 0
+    ) {
+      continue;
+    }
+
+    const maxRiskPkr =
+      Number(amount) *
+      riskBudgetPct;
+    const sharesByRisk =
+      Math.floor(
+        maxRiskPkr /
+        riskPerShare
+      );
+
+    const maxPrincipalBySlot =
+      Number(amount) /
+      Math.max(
+        1,
+        Math.min(
+          policy.maxConditionalPlans,
+          candidates.length
+        )
+      );
+
+    const sharesBySlot =
+      Math.floor(
+        maxPrincipalBySlot /
+        entry
+      );
+
+    const shares =
+      Math.max(
+        0,
+        Math.min(
+          sharesByRisk,
+          sharesBySlot
+        )
+      );
+
+    if (shares < 1) {
+      continue;
+    }
+
+    const principal =
+      shares * entry;
+
+    reserved += principal;
+
+    plans.push({
+      symbol: item.symbol,
+      companyName:
+        item.companyName,
+      state: 'WAIT_FOR_TRIGGER',
+      setup:
+        item.professional.setup ||
+        null,
+      shares,
+      entryLow:
+        decisionRound(entryLow, 2),
+      entryHigh:
+        decisionRound(entryHigh, 2),
+      stop:
+        decisionRound(stop, 2),
+      target1:
+        safeNumber(plan.target1) !== null
+          ? decisionRound(
+              safeNumber(plan.target1),
+              2
+            )
+          : null,
+      rewardRisk:
+        safeNumber(plan.rewardRisk) !== null
+          ? decisionRound(
+              safeNumber(plan.rewardRisk),
+              2
+            )
+          : null,
+      plannedPrincipalPkr:
+        decisionRound(
+          principal,
+          2
+        ),
+      riskBudgetPct:
+        decisionRound(
+          riskBudgetPct * 100,
+          2
+        ),
+      profilePolicyId:
+        policy.id
+    });
+  }
+
+  return {
+    policyId: policy.id,
+    count: plans.length,
+    plannedCapitalPkr:
+      decisionRound(
+        Math.min(
+          Number(amount) || 0,
+          reserved
+        ),
+        2
+      ),
+    uncommittedCapitalPkr:
+      decisionRound(
+        Math.max(
+          0,
+          (Number(amount) || 0) -
+          reserved
+        ),
+        2
+      ),
+    plans
+  };
+}
+
 function decisionCenterAllocationCandidatePool(
   opportunityBoard,
   riskPolicy,
@@ -24383,18 +24870,46 @@ function decisionCenterAllocationCandidatePool(
         })
       )
       .filter(
-        wrapped =>
-          wrapped.item?.canonicalState
-            ?.allocationPermission
-            ?.allowed === true &&
-          wrapped.profileSuitability
-            ?.state === 'SUITABLE' &&
-          (
-            wrapped.item.canonicalState
-              ?.marketAction === 'BUY' ||
-            wrapped.item.canonicalState
-              ?.marketAction === 'ACCUMULATE'
-          )
+        wrapped => {
+          const shortTermMode =
+            String(
+              wrapped.item?.horizon ||
+              'long_term'
+            ) === 'short_term';
+
+          const execution =
+            shortTermMode
+              ? (
+                  wrapped.item
+                    ?.shortTermExecution ||
+                  shortTermProfileExecutionDecision(
+                    wrapped.item,
+                    riskPolicy
+                  )
+                )
+              : null;
+
+          return (
+            wrapped.profileSuitability
+              ?.state === 'SUITABLE' &&
+            (
+              shortTermMode
+                ? execution
+                    ?.actionableNow === true
+                : (
+                    wrapped.item?.canonicalState
+                      ?.allocationPermission
+                      ?.allowed === true &&
+                    (
+                      wrapped.item.canonicalState
+                        ?.marketAction === 'BUY' ||
+                      wrapped.item.canonicalState
+                        ?.marketAction === 'ACCUMULATE'
+                    )
+                  )
+            )
+          );
+        }
       )
       .map(
         wrapped => {
@@ -24403,9 +24918,30 @@ function decisionCenterAllocationCandidatePool(
 
           const profileSuitability =
             wrapped.profileSuitability;
+          const shortTermMode =
+            String(
+              item?.horizon ||
+              'long_term'
+            ) === 'short_term';
+
+          const shortTermExecution =
+            shortTermMode
+              ? (
+                  item.shortTermExecution ||
+                  shortTermProfileExecutionDecision(
+                    item,
+                    riskPolicy
+                  )
+                )
+              : null;
+
           const action =
-            item.canonicalState
-              .marketAction;
+            shortTermMode &&
+            shortTermExecution
+              ?.actionableNow === true
+              ? 'BUY'
+              : item.canonicalState
+                  .marketAction;
 
           const tier =
             item.canonicalState
@@ -24479,6 +25015,20 @@ function decisionCenterAllocationCandidatePool(
               : 0.84;
 
           if (
+            shortTermMode &&
+            shortTermExecution
+          ) {
+            allocationCapMultiplier *=
+              Math.max(
+                0.35,
+                safeNumber(
+                  shortTermExecution.sizeMultiplier
+                ) ||
+                1
+              );
+          }
+
+          if (
             tier === 'PRIORITY_2'
           ) {
             allocationCapMultiplier *=
@@ -24495,6 +25045,9 @@ function decisionCenterAllocationCandidatePool(
           return {
             ...item,
             profileSuitability,
+            shortTermExecution,
+            allocationAction:
+              action,
             allocationTier:
               tier,
             allocationConvictionScore,
@@ -25310,10 +25863,12 @@ function allocateDecisionCenterOpportunities(
       sector:
         candidate.sector,
       action:
+        candidate.allocationAction ||
         candidate.canonicalState
           ?.marketAction ||
         candidate.decisionCenterView,
       marketView:
+        candidate.allocationAction ||
         candidate.canonicalState
           ?.marketAction ||
         candidate.decisionCenterView,
@@ -28392,6 +28947,14 @@ async function runDecisionLab(
               riskPolicy
             );
 
+          candidate.shortTermExecution =
+            horizon === 'short_term'
+              ? shortTermProfileExecutionDecision(
+                  candidate,
+                  riskPolicy
+                )
+              : null;
+
           return candidate;
         }
       );
@@ -28417,18 +28980,25 @@ async function runDecisionLab(
           candidate &&
           !candidate.error &&
           candidate.symbol &&
-          candidate.canonicalState
-            ?.allocationPermission
-            ?.allowed === true &&
           candidate.profileSuitability
             ?.state === 'SUITABLE' &&
           safeNumber(candidate.price) !== null &&
           safeNumber(candidate.price) <= amount &&
           (
-            candidate.canonicalState
-              ?.marketAction === 'BUY' ||
-            candidate.canonicalState
-              ?.marketAction === 'ACCUMULATE'
+            horizon === 'short_term'
+              ? candidate.shortTermExecution
+                  ?.actionableNow === true
+              : (
+                  candidate.canonicalState
+                    ?.allocationPermission
+                    ?.allowed === true &&
+                  (
+                    candidate.canonicalState
+                      ?.marketAction === 'BUY' ||
+                    candidate.canonicalState
+                      ?.marketAction === 'ACCUMULATE'
+                  )
+                )
           )
       ).length;
   }
@@ -28469,6 +29039,15 @@ async function runDecisionLab(
           selectedSector
       }
     );
+
+  const shortTermTriggerPlan =
+    horizon === 'short_term'
+      ? buildShortTermTriggerPlan(
+          opportunityBoard,
+          amount,
+          riskPolicy
+        )
+      : null;
 
   let action = 'WATCH';
   let headline =
@@ -28562,21 +29141,32 @@ async function runDecisionLab(
   } else if (
     priorityTwoCount > 0
   ) {
-    action = 'WATCH';
+    action =
+      horizon === 'short_term' &&
+      shortTermTriggerPlan
+        ?.count > 0
+        ? 'TRIGGER_PLAN'
+        : 'WATCH';
     headline =
       horizon === 'short_term'
         ? (
-            conditionalSetupCount > 0
-              ? 'No trade is active at the current reference price; conditional setups are defined for the next valid trigger.'
-              : 'No active short-term setup passes the full trade gate; the best current setups remain on watch.'
+            shortTermTriggerPlan
+              ?.count > 0
+              ? 'No forced buy now. NOMAD has built a profile-specific short-term trigger plan for the next valid entries.'
+              : conditionalSetupCount > 0
+                ? 'No trade is active at the current reference price; conditional setups are defined for the next valid trigger.'
+                : 'No active short-term setup passes the full trade gate; the best current setups remain on watch.'
           )
         : 'No Priority 1 idea passes the full standard; the best current ideas remain Priority 2.';
     reason =
       horizon === 'short_term'
         ? (
-            conditionalSetupCount > 0
-              ? 'NOMAD will not lower the reward-to-risk threshold to manufacture a BUY. It has instead calculated pullback/retest or breakout-confirmation levels where selected setups become tradable with explicit stops and targets.'
-              : 'These stocks have technical context worth monitoring, but setup confirmation, timing, reward-to-risk or trade-plan completeness is not yet strong enough for entry.'
+            shortTermTriggerPlan
+              ?.count > 0
+              ? 'Short-term risk is handled through setup quality, explicit invalidation, reward-to-risk and stop-based position sizing. Capital is planned against valid triggers instead of being rejected simply because volatility is high or being deployed before the setup activates.'
+              : conditionalSetupCount > 0
+                ? 'NOMAD will not manufacture a BUY before the trigger. It has instead calculated pullback/retest or breakout-confirmation levels where selected setups become tradable with explicit stops and targets.'
+                : 'These stocks have technical context worth monitoring, but setup confirmation, timing, reward-to-risk or trade-plan completeness is not yet strong enough for entry.'
           )
         : 'These companies remain worth monitoring, but one or more thesis, evidence, valuation or entry conditions do not pass the current shadow allocation gate.';
   } else if (
@@ -28763,7 +29353,38 @@ async function runDecisionLab(
           100,
         maxSectorPct:
           riskPolicy.maxSectorPct *
-          100
+          100,
+        ...(horizon === 'short_term'
+          ? {
+              traderProfile:
+                decisionTraderProfilePolicy(
+                  riskPolicy
+                ).id,
+              minTraderTimingScore:
+                decisionTraderProfilePolicy(
+                  riskPolicy
+                ).minTimingScore,
+              minTraderTechnicalEvidenceScore:
+                decisionTraderProfilePolicy(
+                  riskPolicy
+                ).minTechnicalEvidenceScore,
+              minTraderRewardRisk:
+                decisionTraderProfilePolicy(
+                  riskPolicy
+                ).minRewardRisk,
+              maxTraderStopRiskPct:
+                decisionTraderProfilePolicy(
+                  riskPolicy
+                ).maxStopRiskPct,
+              perTradeRiskBudgetPct:
+                decisionRound(
+                  decisionTraderRiskBudgetPct(
+                    riskPolicy
+                  ) * 100,
+                  2
+                )
+            }
+          : {})
       }
     },
     input: {
@@ -28841,6 +29462,7 @@ async function runDecisionLab(
     },
     allocations:
       allocation.allocations,
+    shortTermTriggerPlan,
     opportunityBoard: {
       priority1:
         opportunityBoard.priority1,
@@ -33780,16 +34402,8 @@ body {
   border-bottom: 1px solid rgba(211,220,230,.75);
 }
 
-.topSearchWrap {
-  flex: 1;
-}
-
-.topSearch {
-  margin: 0;
-  background: #fff;
-  border-radius: 9px;
-  padding: 12px 15px;
-  border: 1px solid #d8e1ea;
+.topBarActionsOnly {
+  justify-content: flex-end;
 }
 
 .askNomadButton {
@@ -35411,6 +36025,23 @@ pre {
   margin-top: 3px;
 }
 
+.opportunityActionStack {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 5px;
+}
+
+.opportunityProfileAction {
+  font-size: 10px;
+  line-height: 1.1;
+  color: var(--muted);
+  border: 1px solid rgba(120,151,184,.28);
+  border-radius: 999px;
+  padding: 4px 7px;
+  white-space: nowrap;
+}
+
 .opportunityAction {
   display: inline-flex;
   align-items: center;
@@ -35943,17 +36574,6 @@ pre {
     gap: 8px;
   }
 
-  .topSearchWrap {
-    min-width: 0;
-  }
-
-  .topSearch {
-    min-width: 0;
-    height: 42px;
-    padding: 10px 12px;
-    font-size: 13px;
-  }
-
   .askNomadButton {
     min-height: 42px;
     padding: 9px 12px;
@@ -36343,10 +36963,7 @@ pre {
 
 <main class="appMain">
 
-<div class="topBar">
-<div class="topSearchWrap">
-<input id="globalSymbolSearch" class="topSearch" placeholder="Search company or PSX symbol...">
-</div>
+<div class="topBar topBarActionsOnly">
 <button id="askNomadButton" class="askNomadButton">Ask NOMAD</button>
 </div>
 
@@ -48060,40 +48677,6 @@ document
     }
   );
 
-if ($('globalSymbolSearch')) {
-  $('globalSymbolSearch')
-    .onkeydown =
-      event => {
-        if (event.key !== 'Enter') {
-          return;
-        }
-
-        const symbol =
-          String(
-            $('globalSymbolSearch')
-              .value ||
-            ''
-          )
-            .trim()
-            .toUpperCase();
-
-        if (!symbol) {
-          return;
-        }
-
-        $('stockSymbol')
-          .value =
-            symbol;
-
-        openAppPage(
-          'research'
-        );
-
-        $('loadQuote')
-          .click();
-      };
-}
-
 if ($('askNomadButton')) {
   $('askNomadButton')
     .onclick =
@@ -48299,7 +48882,12 @@ function decisionActionLabel(
       'PARTIAL INVEST',
     ADD: 'ADD',
     NO_ADD: 'NO ADD',
-    DO_NOT_ADD: 'DO NOT ADD'
+    DO_NOT_ADD: 'DO NOT ADD',
+    BUY_SMALL: 'BUY SMALL',
+    PLAN: 'PLAN',
+    PASS: 'PASS',
+    WAIT: 'WAIT',
+    TRIGGER_PLAN: 'TRIGGER PLAN'
   };
 
   return labels[action] ||
@@ -48528,6 +49116,7 @@ function renderOpportunityList(
               : ''
           ) +
           '</div>' +
+          '<div class="opportunityActionStack">' +
           '<div class="opportunityAction ' +
           escapeHtml(
             String(
@@ -48537,17 +49126,28 @@ function renderOpportunityList(
           ) +
           '">' +
           escapeHtml(
-            (
-              ['BUY', 'ACCUMULATE', 'WATCH', 'AVOID'].includes(
-                String(item.decisionCenterView || '').toUpperCase()
-              )
-                ? 'Market: '
-                : ''
-            ) +
+            'Market: ' +
             decisionActionLabel(
               item.decisionCenterView
             )
           ) +
+          '</div>' +
+          '<div class="opportunityProfileAction">' +
+          escapeHtml(
+            isShortTerm &&
+            item.shortTermExecution
+              ? 'For you: ' +
+                decisionActionLabel(
+                  item.shortTermExecution.action
+                )
+              : 'For profile: ' +
+                (
+                  item.profileSuitability?.state === 'SUITABLE'
+                    ? 'ELIGIBLE'
+                    : 'PASS'
+                )
+          ) +
+          '</div>' +
           '</div>' +
           '</div>'
         );
@@ -49998,6 +50598,75 @@ function renderShadowDecision(
   } else {
     html +=
       '<div class="decisionMetaLine">No capital is allocated unless a canonical BUY or ACCUMULATE state has allocation permission and at least one whole share fits the portfolio/risk limits.</div>';
+  }
+
+  const triggerPlan =
+    result?.shortTermTriggerPlan ||
+    null;
+
+  if (
+    result?.input?.horizon === 'short_term' &&
+    triggerPlan?.plans?.length
+  ) {
+    html +=
+      '<div class="decisionMetaLine"><strong>Next-trigger capital plan:</strong> PKR ' +
+      formatNumber(
+        triggerPlan.plannedCapitalPkr ||
+        0,
+        0
+      ) +
+      ' is reserved across ' +
+      formatNumber(
+        triggerPlan.count ||
+        0,
+        0
+      ) +
+      ' setup' +
+      (
+        Number(triggerPlan.count) === 1
+          ? ''
+          : 's'
+      ) +
+      '. This is not a buy-now instruction; each position activates only if its entry trigger remains valid.</div>';
+
+    html +=
+      triggerPlan.plans.map(
+        item =>
+          '<div class="decisionAllocationRow triggerPlanRow">' +
+          '<div class="decisionSymbol">' +
+          escapeHtml(item.symbol) +
+          '</div>' +
+          '<div><strong>' +
+          formatNumber(item.shares, 0) +
+          ' shares if triggered · ~PKR ' +
+          formatNumber(item.plannedPrincipalPkr, 0) +
+          '</strong><div class="decisionMinor">Entry PKR ' +
+          formatNumber(item.entryLow, 2) +
+          '–' +
+          formatNumber(item.entryHigh, 2) +
+          ' · stop PKR ' +
+          formatNumber(item.stop, 2) +
+          (
+            item.target1 !== null &&
+            item.target1 !== undefined
+              ? ' · target PKR ' +
+                formatNumber(item.target1, 2)
+              : ''
+          ) +
+          (
+            item.rewardRisk !== null &&
+            item.rewardRisk !== undefined
+              ? ' · R/R ' +
+                formatNumber(item.rewardRisk, 2) +
+                'x'
+              : ''
+          ) +
+          ' · risk budget ' +
+          formatNumber(item.riskBudgetPct, 2) +
+          '%</div></div>' +
+          '<div class="decisionActionTag watch">WAIT FOR TRIGGER</div>' +
+          '</div>'
+      ).join('');
   }
 
   const unfunded =
