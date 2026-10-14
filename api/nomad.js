@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.4.2';
+const VERSION = '0.9.4.4';
 
 
 const SUPABASE_URL =
@@ -37600,7 +37600,7 @@ button:not(.secondary):not(.miniButton):not(.chartModeButton):not(.navButton):no
   .portfolioValueSvg { height: 150px; }
   .portfolioChartHead { align-items:center; }
   .portfolioChartValue strong { font-size:16px; }
-  #researchSection > .actions { top:56px; overflow-x:auto; flex-wrap:nowrap; }
+  #researchSection > .actions { position:static; top:auto; overflow-x:auto; flex-wrap:nowrap; }
   .opportunityBoardGrid { gap:10px; }
   .opportunityCard.isEmptyOpportunity { padding:9px 10px; }
 }
@@ -37680,9 +37680,9 @@ button:not(.secondary):not(.miniButton):not(.chartModeButton):not(.navButton):no
 
 /* Research navigation: remove the dark strap; only the selected view is yellow. */
 #researchSection > .actions {
-  position: sticky;
-  top: 8px;
-  z-index: 20;
+  position: static;
+  top: auto;
+  z-index: auto;
   margin: 12px 0 16px;
   padding: 0;
   background: transparent !important;
@@ -37780,6 +37780,22 @@ button:not(.secondary):not(.miniButton):not(.chartModeButton):not(.navButton):no
   .portfolioBrokerSvg { height: 190px; }
   .portfolioChartAxisText { font-size:13px; }
   .portfolioChartToolbar { align-items:flex-start; flex-direction:column; }
+}
+
+
+/* BUILD 0.9.4.4 - Research tabs stay in normal document flow. */
+#researchSection > .actions {
+  position: static !important;
+  top: auto !important;
+  z-index: auto !important;
+}
+@media (max-width: 900px) {
+  #researchSection > .actions {
+    position: static !important;
+    top: auto !important;
+    overflow-x: auto;
+    flex-wrap: nowrap;
+  }
 }
 
 </style>
@@ -38754,6 +38770,13 @@ let lastLiveChartResult =
 
 let lastQuoteResult =
   null;
+
+let lastPortfolioIntradayChartResult =
+  null;
+
+let portfolioChartRequestId =
+  0;
+
 
 let selectedHistoryRange =
   '1Y';
@@ -40077,16 +40100,75 @@ function portfolioIntradayChartMarkup(result) {
 }
 
 async function loadPortfolioLiveChart() {
-  const target = $('portfolioLiveChartMount');
-  if (!target) return;
+  // Portfolio is re-rendered as live prices refresh. Never keep a stale DOM
+  // reference across the async chart request because that mount may have been
+  // replaced before the intraday response returns.
+  const requestId =
+    ++portfolioChartRequestId;
+
+  if (!$('portfolioLiveChartMount')) {
+    return;
+  }
+
   try {
-    const result = await api('portfolio-chart');
-    target.innerHTML = portfolioIntradayChartMarkup(result);
-  } catch (error) {
-    const fallback = target.querySelector('.portfolioLiveChart');
-    if (!fallback) {
-      target.innerHTML = '<div class="portfolioLiveChart"><div class="portfolioChartEmpty">Portfolio chart unavailable: '+escapeHtml(error.message || 'intraday feed unavailable')+'</div></div>';
+    const result =
+      await api(
+        'portfolio-chart'
+      );
+
+    if (
+      requestId !==
+      portfolioChartRequestId
+    ) {
+      return;
     }
+
+    lastPortfolioIntradayChartResult =
+      result;
+
+    // Re-query after await. renderPortfolioFull() may have replaced the entire
+    // portfolio DOM while this network request was in flight.
+    const currentTarget =
+      $('portfolioLiveChartMount');
+
+    if (!currentTarget) {
+      return;
+    }
+
+    currentTarget.innerHTML =
+      portfolioIntradayChartMarkup(
+        result
+      );
+  } catch (error) {
+    if (
+      requestId !==
+      portfolioChartRequestId
+    ) {
+      return;
+    }
+
+    const currentTarget =
+      $('portfolioLiveChartMount');
+
+    if (!currentTarget) {
+      return;
+    }
+
+    // If we already rendered a valid intraday chart, keep it visible during a
+    // temporary feed failure instead of replacing it with a flat fallback.
+    if (
+      lastPortfolioIntradayChartResult
+        ?.available
+    ) {
+      currentTarget.innerHTML =
+        portfolioIntradayChartMarkup(
+          lastPortfolioIntradayChartResult
+        );
+      return;
+    }
+
+    currentTarget.innerHTML =
+      '<div class="portfolioLiveChart"><div class="portfolioChartHead"><div><div class="eyebrow">PORTFOLIO PERFORMANCE</div><h2>Intraday value</h2></div><span class="portfolioChartRange active">1D</span></div><div class="portfolioChartEmpty">Intraday chart is temporarily unavailable. NOMAD will retry automatically.</div></div>';
   }
 }
 
@@ -40234,9 +40316,12 @@ function renderPortfolioFull(
     '</strong></div>' +
     '</div>' +
     '<div id="portfolioLiveChartMount">' +
-    portfolioLiveValueChart(
-      portfolioValueSeries,
-      summary
+    (
+      lastPortfolioIntradayChartResult
+        ? portfolioIntradayChartMarkup(
+            lastPortfolioIntradayChartResult
+          )
+        : '<div class="portfolioLiveChart"><div class="portfolioChartHead"><div><div class="eyebrow">PORTFOLIO PERFORMANCE</div><h2>Intraday value</h2></div><span class="portfolioChartRange active">1D</span></div><div class="portfolioChartEmpty">Loading intraday portfolio chart...</div></div>'
     ) +
     '</div>';
 
