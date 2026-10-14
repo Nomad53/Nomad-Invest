@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.3.4';
+const VERSION = '0.9.3.5';
 
 
 const SUPABASE_URL =
@@ -24609,14 +24609,22 @@ function allocateDecisionCenterOpportunities(
       targetPositionCount
     );
 
+  // Build 0.9.3.5: concentration caps are derived from the portfolio target,
+  // not from the number of currently actionable candidates. Relaxing the cap
+  // when only a few names pass research caused NOMAD to average further into
+  // already-large holdings instead of preserving diversification and cash.
+  // A thin opportunity set must therefore reduce deployment, not widen caps.
   const sizingPositionCount =
     Math.max(
       DECISION_CENTER_MIN_TARGET_POSITIONS,
       Math.min(
-        targetPositionCount,
+        DECISION_CENTER_MAX_TARGET_POSITIONS,
         Math.max(
-          DECISION_CENTER_MIN_TARGET_POSITIONS,
-          candidates.length
+          targetPositionCount,
+          Number(
+            portfolioContext?.holdingCount ||
+            0
+          )
         )
       )
     );
@@ -24868,16 +24876,19 @@ function allocateDecisionCenterOpportunities(
         existingSectorSpent
       );
 
+    // Test the concentration that exists BEFORE deploying the new cash.
+    // Using the post-funding denominator artificially diluted large holdings
+    // and could make an oversized position look eligible for another add.
     const preAddStockWeightPct =
-      postFundingCapitalBasePaisa > 0
+      existingPortfolioValuePaisa > 0
         ? existingStockValuePaisa /
-          postFundingCapitalBasePaisa
+          existingPortfolioValuePaisa
         : 0;
 
     const preAddSectorWeightPct =
-      postFundingCapitalBasePaisa > 0
+      existingPortfolioValuePaisa > 0
         ? existingSectorValuePaisa /
-          postFundingCapitalBasePaisa
+          existingPortfolioValuePaisa
         : 0;
 
     const existingHoldingAddThreshold =
