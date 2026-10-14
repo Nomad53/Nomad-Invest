@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.3.9';
+const VERSION = '0.9.4.0';
 
 
 const SUPABASE_URL =
@@ -37287,6 +37287,195 @@ pre {
 .decisionAllocationRow .decisionMinor { line-height:1.3; }
 #portfolioPage .muted, #exploreSection .muted { max-width:720px; }
 
+
+/* =========================================================
+   UI HIERARCHY + PORTFOLIO LIVE CHART - BUILD 0.9.4.0
+   Presentation layer only. Decision architecture is unchanged.
+========================================================= */
+:root {
+  --nomad-highlight: #f4c542;
+  --nomad-highlight-soft: rgba(244,197,66,.10);
+  --nomad-highlight-border: rgba(244,197,66,.42);
+  --nomad-blue: #49b9ff;
+}
+
+/* Yellow is the single attention accent. Blue remains structural/live information. */
+.navButton.active {
+  color: #fff7d6;
+  background: linear-gradient(90deg, rgba(244,197,66,.16), rgba(31,63,99,.55));
+  box-shadow: inset 3px 0 0 var(--nomad-highlight);
+}
+
+.primaryWide,
+button:not(.secondary):not(.miniButton):not(.chartModeButton):not(.navButton):not(.mobileMenuButton):not(.mobileNavClose) {
+  background: #1f6588;
+}
+
+.primaryWide:hover,
+button:not(.secondary):not(.miniButton):not(.chartModeButton):not(.navButton):not(.mobileMenuButton):not(.mobileNavClose):hover {
+  filter: brightness(1.08);
+}
+
+.decisionShadowBanner,
+.decisionModeBadge {
+  color: var(--nomad-highlight);
+  border-color: var(--nomad-highlight-border);
+  background: var(--nomad-highlight-soft);
+}
+
+.eyebrow { color: #7796b3; }
+.decisionVerdictCard { border-top: 2px solid var(--nomad-highlight-border); }
+.decisionLeadReason { border-left-color: var(--nomad-highlight); background: var(--nomad-highlight-soft); }
+
+/* Home: stop short cards from stretching to the height of unrelated content. */
+.terminalGrid,
+.moversGrid,
+.portfolioDashboardGrid {
+  align-items: start;
+}
+.plannerCardNew,
+.breadthCard,
+.attentionCardNew { height: auto; min-height: 0; }
+
+/* Decision Center: content-driven desktop flow. */
+.opportunityBoardGrid {
+  display: flex !important;
+  flex-direction: column;
+  gap: 12px;
+  align-items: stretch;
+}
+.opportunityCard {
+  width: 100%;
+  min-height: 0 !important;
+  height: auto !important;
+  margin: 0;
+}
+.opportunityCard.isEmptyOpportunity {
+  padding: 10px 12px;
+  background: rgba(16,27,42,.58);
+}
+.opportunityCard.isEmptyOpportunity .panelHeader {
+  margin-bottom: 0;
+}
+.opportunityCard.isEmptyOpportunity .terminalEmpty {
+  display: none;
+}
+.opportunityCard.isEmptyOpportunity h2 {
+  margin-bottom: 0;
+  font-size: 13px;
+  color: #91a4b9;
+}
+.opportunityCard.isEmptyOpportunity .eyebrow {
+  display: none;
+}
+.opportunityCard:not(.isEmptyOpportunity) .opportunityList {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  column-gap: 18px;
+  row-gap: 0;
+}
+.opportunityCard:not(.isEmptyOpportunity) .opportunityRow {
+  min-width: 0;
+}
+.stockStrategyCard { margin-top: 14px; }
+.decisionAuditCard { margin-top: 12px; }
+
+/* Portfolio: add a real theme-aware session chart and theme the horizontal scrollbar. */
+.portfolioLiveChart {
+  margin: 10px 0 12px;
+  padding: 14px 16px 10px;
+  border: 1px solid #263a52;
+  border-top: 2px solid var(--nomad-highlight-border);
+  border-radius: 8px;
+  background: linear-gradient(180deg, rgba(244,197,66,.035), rgba(10,20,33,.18));
+}
+.portfolioChartHead {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 8px;
+}
+.portfolioChartHead h2 { margin: 1px 0 0; }
+.portfolioChartValue { text-align: right; }
+.portfolioChartValue strong { display:block; font-size: 20px; color:#f4f8fc; }
+.portfolioChartValue span { display:block; margin-top:2px; font-size:11px; }
+.portfolioValueSvg { width: 100%; height: 190px; display:block; overflow:visible; }
+.portfolioChartGrid { stroke:#223349; stroke-width:1; }
+.portfolioCostLine { stroke:#4d718f; stroke-width:1.2; stroke-dasharray:7 7; opacity:.9; }
+.portfolioChartArea { fill:rgba(244,197,66,.07); }
+.portfolioChartLine { fill:none; stroke:var(--nomad-highlight); stroke-width:3; vector-effect:non-scaling-stroke; }
+.portfolioChartFoot { display:flex; justify-content:space-between; gap:12px; color:#71869c; font-size:9px; }
+.portfolioChartNote { margin-top:6px; color:#61778f; font-size:9px; }
+.portfolioChartEmpty { padding:22px 14px; text-align:center; color:#7f93aa; font-size:11px; }
+
+.portfolioTableScroller {
+  scrollbar-width: thin;
+  scrollbar-color: #d4ae3b #0b1625;
+}
+.portfolioTableScroller::-webkit-scrollbar { height: 7px; }
+.portfolioTableScroller::-webkit-scrollbar-track { background:#0b1625; border-radius:999px; }
+.portfolioTableScroller::-webkit-scrollbar-thumb { background:#7a682d; border-radius:999px; }
+.portfolioTableScroller::-webkit-scrollbar-thumb:hover { background:var(--nomad-highlight); }
+
+/* Research: strengthen the key hierarchy, reduce the feeling of one giant dark card. */
+#researchSection { max-width: 1280px; }
+#researchSection > .actions {
+  position: sticky;
+  top: 8px;
+  z-index: 20;
+  padding: 7px 0;
+  background: linear-gradient(180deg, rgba(9,17,29,.98), rgba(9,17,29,.88));
+}
+#researchSection > .actions button { background:#1d5877; }
+#researchSection > .actions button:hover { background:#246f95; }
+.liveChartPrice,
+.decisionPrice { color:#f5f8fb; }
+
+/* Explore: keep filters visually grouped and table header anchored. */
+.exploreFilters { padding: 10px 0 4px; }
+.exploreTableHeader { position: sticky; top: 0; z-index: 8; background:#142238; }
+
+/* Universe + System are diagnostic pages: compact them and reduce wall-of-text weight. */
+#universeMasterSection,
+#scannerSystemSection,
+#continuousMemorySection {
+  max-width: 1220px;
+}
+#universeMasterSection > .muted,
+#scannerSystemSection > .muted,
+#continuousMemorySection > .muted {
+  max-width: 980px;
+  line-height: 1.45;
+}
+#universeMasterSection .infoBox,
+#scannerSystemSection .infoBox,
+#continuousMemorySection .infoBox {
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+/* Make important actions and alerts easier to scan without turning the UI colourful. */
+.portfolioMetric strong.positive,
+.positive { color: var(--trade-positive); }
+.negative { color: var(--trade-negative); }
+.boardCount { border-color:#36516f; }
+.triggerStatePill,
+.profileActionBadge.plan { border-color:var(--nomad-highlight-border); }
+
+@media (max-width: 1100px) {
+  .opportunityCard:not(.isEmptyOpportunity) .opportunityList { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 900px) {
+  .portfolioValueSvg { height: 150px; }
+  .portfolioChartHead { align-items:center; }
+  .portfolioChartValue strong { font-size:16px; }
+  #researchSection > .actions { top:56px; overflow-x:auto; flex-wrap:nowrap; }
+  .opportunityBoardGrid { gap:10px; }
+  .opportunityCard.isEmptyOpportunity { padding:9px 10px; }
+}
+
 </style>
 
 </head>
@@ -39436,6 +39625,90 @@ function portfolioViewClass(
     );
 }
 
+
+function portfolioSessionKey(result) {
+  const raw = String(result?.asOf || '');
+  const date = raw && Number.isFinite(Date.parse(raw))
+    ? new Date(raw).toISOString().slice(0, 10)
+    : new Date().toISOString().slice(0, 10);
+  return 'nomadPortfolioLiveSeries:' + date;
+}
+
+function recordPortfolioValueSnapshot(result) {
+  const value = Number(result?.summary?.currentValue);
+  if (!Number.isFinite(value) || value <= 0) return [];
+
+  const key = portfolioSessionKey(result);
+  let series = [];
+  try {
+    series = JSON.parse(localStorage.getItem(key) || '[]');
+    if (!Array.isArray(series)) series = [];
+  } catch { series = []; }
+
+  const timestamp = Number.isFinite(Date.parse(result?.asOf || ''))
+    ? Date.parse(result.asOf)
+    : Date.now();
+
+  const last = series[series.length - 1];
+  if (!last || Math.abs(timestamp - Number(last.t || 0)) >= 15000 || Math.abs(value - Number(last.v || value)) > 0.01) {
+    series.push({ t: timestamp, v: value });
+  }
+
+  series = series
+    .filter(point => Number.isFinite(Number(point?.t)) && Number.isFinite(Number(point?.v)))
+    .slice(-360);
+
+  try { localStorage.setItem(key, JSON.stringify(series)); } catch {}
+  return series;
+}
+
+function portfolioLiveValueChart(series, summary) {
+  const points = Array.isArray(series) ? series : [];
+  const current = Number(summary?.currentValue || 0);
+  const cost = Number(summary?.investedCost || 0);
+
+  if (!points.length) {
+    return '<div class="portfolioChartEmpty">Live portfolio tracking will build the session chart as NOMAD records price snapshots.</div>';
+  }
+
+  const values = points.map(p => Number(p.v)).filter(Number.isFinite);
+  if (!values.length) return '';
+
+  let min = Math.min(...values, current || Infinity, cost || Infinity);
+  let max = Math.max(...values, current || -Infinity, cost || -Infinity);
+  if (!Number.isFinite(min) || !Number.isFinite(max)) return '';
+  if (min === max) { min *= .998; max *= 1.002; }
+  const pad = Math.max((max - min) * .12, Math.max(max, 1) * .0015);
+  min -= pad; max += pad;
+
+  const W = 1000, H = 210, L = 18, R = 18, T = 16, B = 24;
+  const uw = W - L - R, uh = H - T - B;
+  const x = i => L + (points.length <= 1 ? uw : (i / (points.length - 1)) * uw);
+  const y = v => T + (1 - ((v - min) / (max - min))) * uh;
+  const poly = points.map((p,i) => x(i).toFixed(1)+','+y(Number(p.v)).toFixed(1)).join(' ');
+  const area = L+','+(T+uh)+' '+poly+' '+(L+uw)+','+(T+uh);
+  const first = Number(points[0]?.v || current || 0);
+  const change = first ? ((current - first) / first) * 100 : 0;
+  const costY = cost > min && cost < max ? y(cost).toFixed(1) : null;
+  const startLabel = points[0]?.t ? new Date(Number(points[0].t)).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : '';
+  const endLabel = points[points.length-1]?.t ? new Date(Number(points[points.length-1].t)).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : '';
+
+  return '<div class="portfolioLiveChart">' +
+    '<div class="portfolioChartHead"><div><div class="eyebrow">LIVE VALUE</div><h2>Portfolio session</h2></div>' +
+    '<div class="portfolioChartValue"><strong>'+portfolioMoney(current)+'</strong><span class="'+percentClass(change)+'">'+(change>0?'+':'')+formatNumber(change,2)+'% tracked</span></div></div>' +
+    '<svg viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none" class="portfolioValueSvg" aria-label="Live portfolio value chart">' +
+    '<line x1="'+L+'" x2="'+(W-R)+'" y1="'+T+'" y2="'+T+'" class="portfolioChartGrid" />' +
+    '<line x1="'+L+'" x2="'+(W-R)+'" y1="'+(T+uh/2)+'" y2="'+(T+uh/2)+'" class="portfolioChartGrid" />' +
+    '<line x1="'+L+'" x2="'+(W-R)+'" y1="'+(T+uh)+'" y2="'+(T+uh)+'" class="portfolioChartGrid" />' +
+    (costY ? '<line x1="'+L+'" x2="'+(W-R)+'" y1="'+costY+'" y2="'+costY+'" class="portfolioCostLine" />' : '') +
+    '<polygon points="'+area+'" class="portfolioChartArea" />' +
+    '<polyline points="'+poly+'" class="portfolioChartLine" />' +
+    '</svg>' +
+    '<div class="portfolioChartFoot"><span>'+escapeHtml(startLabel)+'</span><span>Cost basis '+portfolioMoney(cost)+'</span><span>'+escapeHtml(endLabel)+'</span></div>' +
+    '<div class="portfolioChartNote">Session tracking uses NOMAD\'s verified portfolio snapshots. It builds as live prices refresh and is separate from broker account equity.</div>' +
+    '</div>';
+}
+
 function renderPortfolioFull(
   result,
   targetId = 'portfolioFull'
@@ -39474,6 +39747,11 @@ function renderPortfolioFull(
     )
       ? result.transactions
       : [];
+
+  const portfolioValueSeries =
+    recordPortfolioValueSnapshot(
+      result
+    );
 
   const previousTableScrollLeft =
     target.querySelector(
@@ -39573,7 +39851,11 @@ function renderPortfolioFull(
       summary.dividends
     ) +
     '</strong></div>' +
-    '</div>';
+    '</div>' +
+    portfolioLiveValueChart(
+      portfolioValueSeries,
+      summary
+    );
 
   if (!holdings.length) {
     html +=
@@ -50699,6 +50981,28 @@ function startDecisionTriggerMonitor() {
     );
 }
 
+
+function syncOpportunityLayout() {
+  const grid = document.querySelector('.opportunityBoardGrid');
+  if (!grid) return;
+  const pairs = [
+    ['priorityOneCount', '.priorityOneCard'],
+    ['priorityTwoCount', '.priorityTwoCard'],
+    ['researchRequiredCount', '.researchCard'],
+    ['avoidCount', '.avoidCard']
+  ];
+  let visible = 0;
+  for (const [countId, selector] of pairs) {
+    const count = Number(document.getElementById(countId)?.textContent || 0);
+    const card = grid.querySelector(selector);
+    if (!card) continue;
+    const empty = !Number.isFinite(count) || count <= 0;
+    card.classList.toggle('isEmptyOpportunity', empty);
+    if (!empty) visible += 1;
+  }
+  grid.dataset.visibleSections = String(visible);
+}
+
 function renderShadowDecision(
   result
 ) {
@@ -51216,6 +51520,8 @@ function renderShadowDecision(
   renderOpportunityBoard(
     result
   );
+
+  syncOpportunityLayout();
 
   renderDecisionAudit(
     result
