@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.4.5';
+const VERSION = '0.9.5.0';
 
 
 const SUPABASE_URL =
@@ -20368,7 +20368,7 @@ const DECISION_MODELS = {
     }
   },
   short_term: {
-    id: 'NOMAD-ST-PRO-0.9.3.7',
+    id: 'NOMAD-ST-PRO-0.9.5.0',
     horizon: 'short_term',
     status: 'SHADOW_UNVALIDATED',
     realMoneyEligible: false,
@@ -20450,35 +20450,59 @@ const DECISION_TRADER_RISK_BUDGET_PCT = {
 // These thresholds do not alter the locked long-term investment brain.
 const DECISION_TRADER_PROFILE_POLICIES = {
   conservative: {
-    id: 'TRADER-CONSERVATIVE-0.9.3.7',
-    minTimingScore: 66,
+    id: 'TRADER-CONSERVATIVE-0.9.5.0',
+    minTimingScore: 68,
     minTechnicalEvidenceScore: 80,
     minRewardRisk: 1.80,
     minRiskScore: 35,
+    minAverageVolume30d: 150000,
+    minVolumeRatio20d: 0.75,
     maxStopRiskPct: 7.0,
     maxConditionalPlans: 2,
+    maxOpenPositions: 2,
+    maxPositionValuePct: 0.22,
+    maxSectorValuePct: 0.45,
+    nearTriggerTolerancePct: 0.60,
+    maxChasePct: 0.40,
+    maxPlanAgeDays: 7,
     activeSizeMultiplier: 0.78,
     allowEarlyEntry: false
   },
   balanced: {
-    id: 'TRADER-BALANCED-0.9.3.7',
+    id: 'TRADER-BALANCED-0.9.5.0',
     minTimingScore: 60,
     minTechnicalEvidenceScore: 70,
     minRewardRisk: 1.55,
     minRiskScore: 30,
+    minAverageVolume30d: 50000,
+    minVolumeRatio20d: 0.60,
     maxStopRiskPct: 10.0,
     maxConditionalPlans: 3,
+    maxOpenPositions: 3,
+    maxPositionValuePct: 0.30,
+    maxSectorValuePct: 0.55,
+    nearTriggerTolerancePct: 1.00,
+    maxChasePct: 0.75,
+    maxPlanAgeDays: 7,
     activeSizeMultiplier: 1.00,
     allowEarlyEntry: false
   },
   aggressive: {
-    id: 'TRADER-AGGRESSIVE-0.9.3.7',
-    minTimingScore: 55,
+    id: 'TRADER-AGGRESSIVE-0.9.5.0',
+    minTimingScore: 54,
     minTechnicalEvidenceScore: 64,
     minRewardRisk: 1.35,
     minRiskScore: 25,
+    minAverageVolume30d: 15000,
+    minVolumeRatio20d: 0.45,
     maxStopRiskPct: 14.0,
     maxConditionalPlans: 4,
+    maxOpenPositions: 4,
+    maxPositionValuePct: 0.40,
+    maxSectorValuePct: 0.70,
+    nearTriggerTolerancePct: 1.50,
+    maxChasePct: 1.25,
+    maxPlanAgeDays: 7,
     activeSizeMultiplier: 1.15,
     allowEarlyEntry: true
   }
@@ -22933,6 +22957,59 @@ function decisionTraderRiskBudgetPct(
   return DECISION_TRADER_RISK_BUDGET_PCT.balanced;
 }
 
+
+function decisionTraderSetupFamily(setup) {
+  const value = String(setup || '').trim().toUpperCase();
+
+  if (value === 'CONFIRMED_BREAKOUT' || value === 'UNCONFIRMED_BREAKOUT') {
+    return 'BREAKOUT';
+  }
+  if (value === 'TREND_PULLBACK') {
+    return 'PULLBACK';
+  }
+  if (value === 'UPTREND_CONTINUATION') {
+    return 'CONTINUATION';
+  }
+  if (value === 'SUPPORT_BOUNCE' || value === 'BOUNCE') {
+    return 'SUPPORT_BOUNCE';
+  }
+  if (value === 'BREAKDOWN' || value === 'DOWNTREND') {
+    return 'BEARISH';
+  }
+  return 'NO_CLEAR_SETUP';
+}
+
+function decisionTraderSetupQuality(setup) {
+  const value = String(setup || '').trim().toUpperCase();
+  if (value === 'CONFIRMED_BREAKOUT') return 95;
+  if (value === 'TREND_PULLBACK') return 90;
+  if (value === 'SUPPORT_BOUNCE') return 84;
+  if (value === 'UPTREND_CONTINUATION') return 82;
+  if (value === 'UNCONFIRMED_BREAKOUT') return 64;
+  if (value === 'NO_CLEAR_SETUP') return 42;
+  if (value === 'DOWNTREND') return 20;
+  if (value === 'BREAKDOWN') return 8;
+  return 38;
+}
+
+function decisionTraderRewardRiskScore(value) {
+  const rr = safeNumber(value);
+  if (rr === null || rr <= 0) return 0;
+  if (rr >= 3) return 100;
+  if (rr >= 2.5) return 92;
+  if (rr >= 2) return 82;
+  if (rr >= 1.5) return 68;
+  if (rr >= 1.25) return 52;
+  return 30;
+}
+
+function decisionTraderPlanAgeDays(candidate) {
+  const raw = candidate?.historicalContext?.asOf || candidate?.historicalContext?.priceAction?.asOf || null;
+  const timestamp = Date.parse(raw || '');
+  if (!Number.isFinite(timestamp)) return null;
+  return Math.max(0, (Date.now() - timestamp) / (24 * 60 * 60 * 1000));
+}
+
 function professionalShortTermView(
   candidate,
   analystGate,
@@ -22976,21 +23053,9 @@ function professionalShortTermView(
     'NO_CLEAR_SETUP';
 
   const setupQuality =
-    setup === 'CONFIRMED_BREAKOUT'
-      ? 95
-      : setup === 'TREND_PULLBACK'
-        ? 88
-        : setup === 'UPTREND_CONTINUATION'
-          ? 76
-          : setup === 'UNCONFIRMED_BREAKOUT'
-            ? 62
-            : setup === 'NO_CLEAR_SETUP'
-              ? 45
-              : setup === 'DOWNTREND'
-                ? 25
-                : setup === 'BREAKDOWN'
-                  ? 10
-                  : 40;
+    decisionTraderSetupQuality(setup);
+  const setupFamily =
+    decisionTraderSetupFamily(setup);
 
   const conditionalReady =
     conditionalTradePlan?.complete === true &&
@@ -23001,15 +23066,23 @@ function professionalShortTermView(
       conditionalTradePlan?.rewardRisk
     ) >= 1.35;
 
+  const rewardRiskScore =
+    decisionTraderRewardRiskScore(
+      rewardRisk ??
+      conditionalTradePlan?.rewardRisk
+    );
+
+  // 0.9.5.0: short-term ranking is deliberately execution-first. Long-term
+  // valuation/fundamental weights do not leak into the Trader brain.
   const rankingScore =
     decisionRound(
       decisionClamp(
-        timingScore * 0.34 +
-        setupQuality * 0.22 +
-        riskScore * 0.14 +
-        liquidityScore * 0.10 +
-        technicalEvidenceScore * 0.12 +
-        (conditionalReady ? 8 : 0)
+        setupQuality * 0.28 +
+        timingScore * 0.26 +
+        technicalEvidenceScore * 0.18 +
+        liquidityScore * 0.12 +
+        rewardRiskScore * 0.10 +
+        riskScore * 0.06
       ),
       2
     );
@@ -23025,6 +23098,7 @@ function professionalShortTermView(
       timingScore,
       timingState: 'UNAVAILABLE',
       setup,
+      setupFamily,
       rewardRisk,
       riskScore,
       riskState:
@@ -23055,6 +23129,7 @@ function professionalShortTermView(
       timingState:
         priceAction.timingState,
       setup,
+      setupFamily,
       rewardRisk,
       riskScore,
       riskState:
@@ -23101,6 +23176,7 @@ function professionalShortTermView(
       timingState:
         priceAction.timingState,
       setup,
+      setupFamily,
       rewardRisk,
       riskScore,
       riskState:
@@ -23127,6 +23203,7 @@ function professionalShortTermView(
       timingState:
         priceAction.timingState,
       setup,
+      setupFamily,
       rewardRisk,
       riskScore,
       riskState:
@@ -23834,13 +23911,30 @@ function decisionProfileSuitability(
       candidate?.averageVolume30d
     );
 
+  const shortTermMode =
+    String(
+      candidate?.horizon ||
+      'long_term'
+    ) === 'short_term';
+
+  const traderProfilePolicy =
+    shortTermMode
+      ? decisionTraderProfilePolicy(riskPolicy)
+      : null;
+
+  const minimumAverageVolume30d =
+    shortTermMode
+      ? traderProfilePolicy.minAverageVolume30d
+      : riskPolicy.minAverageVolume30d;
+
   if (
     avgVolume === null ||
-    avgVolume <
-      riskPolicy.minAverageVolume30d
+    avgVolume < minimumAverageVolume30d
   ) {
     issues.push(
-      '30-day liquidity is below the selected risk profile minimum.'
+      shortTermMode
+        ? '30-day liquidity is below the selected trader profile minimum.'
+        : '30-day liquidity is below the selected risk profile minimum.'
     );
   }
 
@@ -23850,12 +23944,6 @@ function decisionProfileSuitability(
         ?.technical
         ?.annualizedVolatility20dPct
     );
-
-  const shortTermMode =
-    String(
-      candidate?.horizon ||
-      'long_term'
-    ) === 'short_term';
 
   if (
     !shortTermMode &&
@@ -23905,13 +23993,6 @@ function decisionProfileSuitability(
       traderPlanForRisk?.riskPct
     );
 
-  const traderProfilePolicy =
-    shortTermMode
-      ? decisionTraderProfilePolicy(
-          riskPolicy
-        )
-      : null;
-
   const maxTraderStopRiskPct =
     shortTermMode
       ? traderProfilePolicy.maxStopRiskPct
@@ -23926,6 +24007,30 @@ function decisionProfileSuitability(
     issues.push(
       'The defined stop distance is too wide for the selected short-term risk profile.'
     );
+  }
+
+  if (shortTermMode) {
+    const volumeRatio20d = safeNumber(
+      candidate?.historicalContext?.technical?.volumeRatio20d
+    );
+    if (
+      volumeRatio20d !== null &&
+      volumeRatio20d < traderProfilePolicy.minVolumeRatio20d
+    ) {
+      issues.push(
+        'Current participation is too weak for the selected trader profile.'
+      );
+    }
+
+    const planAgeDays = decisionTraderPlanAgeDays(candidate);
+    if (
+      planAgeDays !== null &&
+      planAgeDays > traderProfilePolicy.maxPlanAgeDays
+    ) {
+      issues.push(
+        'The short-term setup is stale and must be recalculated before entry.'
+      );
+    }
   }
 
   const applicableDataQualityScore =
@@ -23983,7 +24088,7 @@ function decisionProfileSuitability(
       riskPolicy.id,
     thresholds: {
       minAverageVolume30d:
-        riskPolicy.minAverageVolume30d,
+        minimumAverageVolume30d,
       maxAnnualizedVolatilityPct:
         riskPolicy.maxAnnualizedVolatilityPct,
       ...(shortTermMode
@@ -24007,7 +24112,11 @@ function decisionProfileSuitability(
         volatility,
       ...(shortTermMode
         ? {
-            traderStopRiskPct
+            traderStopRiskPct,
+            volumeRatio20d:
+              safeNumber(candidate?.historicalContext?.technical?.volumeRatio20d),
+            planAgeDays:
+              decisionTraderPlanAgeDays(candidate)
           }
         : {}),
       dataQualityScore:
@@ -24240,13 +24349,24 @@ function decisionCenterCandidateConviction(
       ) ??
       50;
 
+    const rewardRiskScore =
+      decisionTraderRewardRiskScore(
+        professional?.tradePlan?.rewardRisk ??
+        professional?.conditionalTradePlan?.rewardRisk
+      );
+    const setupQuality =
+      decisionTraderSetupQuality(
+        professional?.setup
+      );
+
     return decisionRound(
       decisionClamp(
-        rankingScore * 0.25 +
-        timingScore * 0.35 +
-        riskScore * 0.20 +
-        liquidityScore * 0.10 +
-        evidenceScore * 0.10
+        setupQuality * 0.24 +
+        timingScore * 0.24 +
+        rankingScore * 0.20 +
+        liquidityScore * 0.12 +
+        evidenceScore * 0.12 +
+        rewardRiskScore * 0.08
       ),
       2
     );
@@ -24632,6 +24752,21 @@ function shortTermProfileExecutionDecision(
       professional.setup ||
       'NO_CLEAR_SETUP'
     );
+  const setupFamily =
+    decisionTraderSetupFamily(setup);
+
+  if (setupFamily === 'BEARISH') {
+    return {
+      policyId: policy.id,
+      state: 'INVALID_SETUP',
+      action: 'PASS',
+      marketAction: 'AVOID',
+      actionableNow: false,
+      reservationEligible: false,
+      sizeMultiplier: 0,
+      reason: 'The short-term structure is bearish or broken. Risk preference cannot turn a failed setup into a long entry.'
+    };
+  }
 
   if (
     suitability?.state !==
@@ -24660,6 +24795,18 @@ function shortTermProfileExecutionDecision(
     riskScore >=
       policy.minRiskScore;
 
+  const currentTrigger =
+    currentPlan?.complete === true
+      ? shortTermTriggerSnapshot(
+          setup,
+          candidate?.price,
+          currentPlan?.entryLow ?? currentPlan?.entryReference,
+          currentPlan?.entryHigh ?? currentPlan?.entryReference,
+          currentPlan?.stop,
+          riskPolicy
+        )
+      : null;
+
   const currentPlanPass =
     currentPlan?.complete === true &&
     currentRewardRisk !== null &&
@@ -24669,6 +24816,10 @@ function shortTermProfileExecutionDecision(
       currentStopRiskPct === null ||
       currentStopRiskPct <=
         policy.maxStopRiskPct
+    ) &&
+    (
+      currentTrigger === null ||
+      currentTrigger.status === 'TRIGGERED'
     );
 
   if (
@@ -24684,6 +24835,7 @@ function shortTermProfileExecutionDecision(
       marketAction: 'BUY',
       actionableNow: true,
       reservationEligible: false,
+      triggerStatus: currentTrigger?.status || 'TRIGGERED',
       sizeMultiplier:
         policy.activeSizeMultiplier,
       reason:
@@ -24730,7 +24882,12 @@ function shortTermProfileExecutionDecision(
       'UNCONFIRMED_BREAKOUT',
       'TREND_PULLBACK',
       'UPTREND_CONTINUATION'
-    ].includes(setup);
+    ].includes(setup) &&
+    currentTrigger !== null &&
+    [
+      'NEAR_TRIGGER',
+      'TRIGGERED'
+    ].includes(currentTrigger.status);
 
   if (earlyEntryPass) {
     return {
@@ -24741,6 +24898,7 @@ function shortTermProfileExecutionDecision(
       actionableNow: true,
       reservationEligible:
         conditionalPass,
+      triggerStatus: currentTrigger?.status || 'EARLY_ENTRY',
       sizeMultiplier: 0.55,
       reason:
         'Aggressive profile permits a smaller early entry because a complete current trade plan exists and stop-based risk remains controlled. Full sizing still waits for stronger confirmation.'
@@ -24755,6 +24913,7 @@ function shortTermProfileExecutionDecision(
       marketAction: 'WATCH',
       actionableNow: false,
       reservationEligible: true,
+      triggerStatus: 'WAITING',
       sizeMultiplier: 0,
       reason:
         'The stock is not a buy at the current reference price, but the selected profile has a valid conditional entry, stop and target plan.'
@@ -24792,27 +24951,40 @@ function shortTermTriggerConditionText(setup) {
   return 'Price must enter the defined entry zone while the setup, stop and reward-to-risk remain valid.';
 }
 
-function shortTermTriggerSnapshot(currentPrice, entryLow, entryHigh, stop) {
+function shortTermTriggerSnapshot(
+  setup,
+  currentPrice,
+  entryLow,
+  entryHigh,
+  stop,
+  riskPolicy = null
+) {
   const current = safeNumber(currentPrice);
   const low = safeNumber(entryLow);
   const high = safeNumber(entryHigh);
   const invalidation = safeNumber(stop);
+  const family = decisionTraderSetupFamily(setup);
+  const policy = riskPolicy
+    ? decisionTraderProfilePolicy(riskPolicy)
+    : DECISION_TRADER_PROFILE_POLICIES.balanced;
 
   if (current === null || low === null || high === null) {
     return {
       status: 'WAITING',
       label: 'Waiting for live price',
       distancePct: null,
-      direction: 'unknown'
+      direction: 'unknown',
+      setupFamily: family
     };
   }
 
   if (invalidation !== null && current <= invalidation) {
     return {
       status: 'INVALIDATED',
-      label: 'Invalidated',
+      label: 'Invalidated — stop level broken',
       distancePct: 0,
-      direction: 'invalid'
+      direction: 'invalid',
+      setupFamily: family
     };
   }
 
@@ -24821,26 +24993,52 @@ function shortTermTriggerSnapshot(currentPrice, entryLow, entryHigh, stop) {
       status: 'TRIGGERED',
       label: 'Entry zone active',
       distancePct: 0,
-      direction: 'inside'
+      direction: 'inside',
+      setupFamily: family
     };
   }
 
+  if (family === 'PULLBACK' || family === 'SUPPORT_BOUNCE') {
+    if (current > high) {
+      const distancePct = ((current - high) / Math.max(high, 0.0001)) * 100;
+      return {
+        status: distancePct <= policy.nearTriggerTolerancePct ? 'NEAR_TRIGGER' : 'WAITING',
+        label: distancePct <= policy.nearTriggerTolerancePct ? 'Near pullback entry' : 'Waiting for pullback',
+        distancePct: decisionRound(distancePct, 2),
+        direction: 'above',
+        setupFamily: family
+      };
+    }
+
+    const belowPct = ((low - current) / Math.max(low, 0.0001)) * 100;
+    return {
+      status: 'BELOW_ENTRY_ZONE',
+      label: 'Below planned entry — reassess setup',
+      distancePct: decisionRound(belowPct, 2),
+      direction: 'below',
+      setupFamily: family
+    };
+  }
+
+  // Breakout/continuation logic: price normally approaches the entry zone from below.
   if (current < low) {
     const distancePct = ((low - current) / Math.max(current, 0.0001)) * 100;
     return {
-      status: distancePct <= 1.5 ? 'NEAR_TRIGGER' : 'WAITING',
-      label: distancePct <= 1.5 ? 'Near trigger' : 'Waiting below trigger',
+      status: distancePct <= policy.nearTriggerTolerancePct ? 'NEAR_TRIGGER' : 'WAITING',
+      label: distancePct <= policy.nearTriggerTolerancePct ? 'Near trigger' : 'Waiting below trigger',
       distancePct: decisionRound(distancePct, 2),
-      direction: 'below'
+      direction: 'below',
+      setupFamily: family
     };
   }
 
   const abovePct = ((current - high) / Math.max(high, 0.0001)) * 100;
   return {
-    status: abovePct <= 1.0 ? 'TRIGGERED' : 'ABOVE_ENTRY_ZONE',
-    label: abovePct <= 1.0 ? 'Entry still valid' : 'Above entry zone — do not chase',
+    status: abovePct <= policy.maxChasePct ? 'TRIGGERED' : 'ABOVE_ENTRY_ZONE',
+    label: abovePct <= policy.maxChasePct ? 'Entry still valid' : 'Above entry zone — do not chase',
     distancePct: decisionRound(abovePct, 2),
-    direction: 'above'
+    direction: 'above',
+    setupFamily: family
   };
 }
 
@@ -24965,10 +25163,12 @@ function buildShortTermTriggerPlan(
 
     const triggerSnapshot =
       shortTermTriggerSnapshot(
+        item.professional.setup,
         currentPrice,
         entryLow,
         entryHigh,
-        stop
+        stop,
+        riskPolicy
       );
 
     reserved += principal;
@@ -25295,22 +25495,84 @@ function decisionCenterAllocationCandidatePool(
   // Keep a small ranked reserve beyond the preferred funded count so the
   // allocator can backfill when a higher-ranked name cannot fit because of
   // whole-share, stock-cap, sector-cap, or existing-portfolio constraints.
-  const reserveLimit =
-    Math.min(
-      eligible.length,
-      Math.max(
-        DECISION_CENTER_MIN_TARGET_POSITIONS,
-        Math.min(
-          12,
-          Number(targetPositions || 0) + 4
-        )
-      )
+  const traderPool =
+    eligible.some(
+      item => item?.canonicalState?.professional?.framework === 'SHORT_TERM_TRADER'
     );
+
+  const reserveLimit =
+    traderPool
+      ? Math.min(
+          eligible.length,
+          Math.max(
+            1,
+            decisionTraderProfilePolicy(riskPolicy).maxOpenPositions + 2
+          )
+        )
+      : Math.min(
+          eligible.length,
+          Math.max(
+            DECISION_CENTER_MIN_TARGET_POSITIONS,
+            Math.min(
+              12,
+              Number(targetPositions || 0) + 4
+            )
+          )
+        );
 
   return eligible.slice(
     0,
     reserveLimit
   );
+}
+
+function decisionTraderAllocationCaps(riskPolicy) {
+  const policy = decisionTraderProfilePolicy(riskPolicy);
+  return {
+    maxOpenPositions: policy.maxOpenPositions,
+    stockCapPct: policy.maxPositionValuePct,
+    sectorCapPct: policy.maxSectorValuePct
+  };
+}
+
+function decisionTraderDeploymentPlan(candidates, riskPolicy) {
+  const list = Array.isArray(candidates) ? candidates : [];
+  const policy = decisionTraderProfilePolicy(riskPolicy);
+
+  if (!list.length) {
+    return {
+      targetDeploymentPct: 0,
+      intentionalCashReservePct: 100,
+      averageConvictionScore: 0,
+      averageExtendedCoveragePct: 0,
+      reason: 'No current short-term entry passes the selected profile. Capital remains available for valid triggers.'
+    };
+  }
+
+  const averageConvictionScore = list.reduce(
+    (sum, item) => sum + (safeNumber(item.allocationConvictionScore) || decisionCenterCandidateConviction(item)),
+    0
+  ) / list.length;
+
+  // Short-term cash is not a diversification failure. Stop-based risk budgets
+  // and the maximum number of simultaneous positions determine deployment.
+  const breadth = Math.min(1, list.length / Math.max(1, policy.maxOpenPositions));
+  let base = riskPolicy?.id === 'RISK-CONSERVATIVE-0.1'
+    ? 0.58
+    : riskPolicy?.id === 'RISK-AGGRESSIVE-0.1'
+      ? 0.88
+      : 0.74;
+  base += Math.max(-0.06, Math.min(0.06, (averageConvictionScore - 70) / 250));
+  base *= 0.78 + breadth * 0.22;
+
+  const pct = decisionRound(Math.max(20, Math.min(92, base * 100)), 2);
+  return {
+    targetDeploymentPct: pct,
+    intentionalCashReservePct: decisionRound(100 - pct, 2),
+    averageConvictionScore: decisionRound(averageConvictionScore, 2),
+    averageExtendedCoveragePct: 100,
+    reason: 'Trader deployment is governed by valid entries, stop-based risk budgets and simultaneous-position limits rather than long-term diversification targets.'
+  };
 }
 
 function allocateDecisionCenterOpportunities(
@@ -25354,12 +25616,24 @@ function allocateDecisionCenterOpportunities(
     existingPortfolioValuePaisa +
     budgetPaisa;
 
-  const targetPositionCount =
-    decisionCenterTargetPositionCount(
-      postFundingCapitalBasePaisa /
-      100,
-      riskPolicy
+  const traderMode =
+    (opportunityBoard?.all || []).some(
+      item => item?.canonicalState?.professional?.framework === 'SHORT_TERM_TRADER'
     );
+
+  const traderCaps =
+    traderMode
+      ? decisionTraderAllocationCaps(riskPolicy)
+      : null;
+
+  const targetPositionCount =
+    traderMode
+      ? traderCaps.maxOpenPositions
+      : decisionCenterTargetPositionCount(
+          postFundingCapitalBasePaisa /
+          100,
+          riskPolicy
+        );
 
   const existingSymbolValues =
     portfolioContext?.symbolValues ||
@@ -25382,6 +25656,9 @@ function allocateDecisionCenterOpportunities(
   // substantially stronger actionable holding.
   candidates = candidates
     .map(candidate => {
+      const shortTermCandidate =
+        candidate?.canonicalState?.professional?.framework === 'SHORT_TERM_TRADER';
+
       const meritScore =
         decisionClamp(
           safeNumber(
@@ -25483,29 +25760,30 @@ function allocateDecisionCenterOpportunities(
         );
 
       const marginalAllocationScore =
-        meritScore *
-          0.82 +
-        portfolioFitScore *
-          0.18;
+        shortTermCandidate
+          ? meritScore * 0.94 + portfolioFitScore * 0.06
+          : meritScore * 0.82 + portfolioFitScore * 0.18;
 
       const concentrationScale =
-        Math.max(
-          existingStockValue > 0
-            ? 0.30
-            : 0.70,
-          Math.min(
-            1,
-            1 -
-              stockWeight *
-              0.90 -
-              (
-                sectorConstraint
-                  ? 0
-                  : sectorWeight *
-                    0.35
+        shortTermCandidate
+          ? 1
+          : Math.max(
+              existingStockValue > 0
+                ? 0.30
+                : 0.70,
+              Math.min(
+                1,
+                1 -
+                  stockWeight *
+                  0.90 -
+                  (
+                    sectorConstraint
+                      ? 0
+                      : sectorWeight *
+                        0.35
+                  )
               )
-          )
-        );
+            );
 
       return {
         ...candidate,
@@ -25550,25 +25828,32 @@ function allocateDecisionCenterOpportunities(
   // already-large holdings instead of preserving diversification and cash.
   // A thin opportunity set must therefore reduce deployment, not widen caps.
   const sizingPositionCount =
-    Math.max(
-      DECISION_CENTER_MIN_TARGET_POSITIONS,
-      Math.min(
-        DECISION_CENTER_MAX_TARGET_POSITIONS,
-        Math.max(
-          targetPositionCount,
-          Number(
-            portfolioContext?.holdingCount ||
-            0
+    traderMode
+      ? targetPositionCount
+      : Math.max(
+          DECISION_CENTER_MIN_TARGET_POSITIONS,
+          Math.min(
+            DECISION_CENTER_MAX_TARGET_POSITIONS,
+            Math.max(
+              targetPositionCount,
+              Number(
+                portfolioContext?.holdingCount ||
+                0
+              )
+            )
           )
-        )
-      )
-    );
+        );
 
   const dynamicCaps =
-    decisionCenterDynamicCaps(
-      sizingPositionCount,
-      riskPolicy
-    );
+    traderMode
+      ? {
+          stockCapPct: traderCaps.stockCapPct,
+          sectorCapPct: traderCaps.sectorCapPct
+        }
+      : decisionCenterDynamicCaps(
+          sizingPositionCount,
+          riskPolicy
+        );
 
   const effectiveSectorCapPct =
     sectorConstraint
@@ -25586,11 +25871,16 @@ function allocateDecisionCenterOpportunities(
     );
 
   const deploymentPlan =
-    decisionCenterDeploymentPlan(
-      candidates,
-      targetPositionCount,
-      riskPolicy
-    );
+    traderMode
+      ? decisionTraderDeploymentPlan(
+          candidates,
+          riskPolicy
+        )
+      : decisionCenterDeploymentPlan(
+          candidates,
+          targetPositionCount,
+          riskPolicy
+        );
 
   const deployCap =
     Math.floor(
@@ -25632,14 +25922,16 @@ function allocateDecisionCenterOpportunities(
       cashReserveReason:
         deploymentPlan.reason,
       minimumTargetPositions:
-        DECISION_CENTER_MIN_TARGET_POSITIONS,
+        traderMode ? 1 : DECISION_CENTER_MIN_TARGET_POSITIONS,
       maximumTargetPositions:
-        DECISION_CENTER_MAX_TARGET_POSITIONS,
+        traderMode ? traderCaps.maxOpenPositions : DECISION_CENTER_MAX_TARGET_POSITIONS,
       achievedPositionCount: 0,
       diversificationException: {
-        triggered: true,
+        triggered: traderMode ? false : true,
         reason:
-          'No profile-suitable actionable stock currently passes the full allocation gate, so NOMAD retains the capital in cash rather than forcing positions.'
+          traderMode
+            ? 'No current short-term entry passes the selected trader profile. This is an execution-state result, not a diversification failure.'
+            : 'No profile-suitable actionable stock currently passes the full allocation gate, so NOMAD retains the capital in cash rather than forcing positions.'
       },
       eligibleAllocationCandidates: 0,
       priorityOneAllocationCandidates: 0,
@@ -25777,18 +26069,20 @@ function allocateDecisionCenterOpportunities(
         : 0;
 
     const effectiveStockCapPct =
-      existingStockValuePaisa > 0
-        ? Math.max(
-            dynamicCaps.stockCapPct,
-            Math.min(
-              safeNumber(
-                riskPolicy?.maxStockPct
-              ) ||
+      traderMode
+        ? dynamicCaps.stockCapPct
+        : existingStockValuePaisa > 0
+          ? Math.max(
               dynamicCaps.stockCapPct,
-              0.75
+              Math.min(
+                safeNumber(
+                  riskPolicy?.maxStockPct
+                ) ||
+                dynamicCaps.stockCapPct,
+                0.75
+              )
             )
-          )
-        : dynamicCaps.stockCapPct;
+          : dynamicCaps.stockCapPct;
 
     const stockTotalCap =
       Math.floor(
@@ -25824,19 +26118,21 @@ function allocateDecisionCenterOpportunities(
       0;
 
     const effectiveCandidateSectorCapPct =
-      existingSectorValuePaisa > 0 &&
-      !sectorConstraint
-        ? Math.max(
-            effectiveSectorCapPct,
-            Math.min(
-              safeNumber(
-                riskPolicy?.maxSectorPct
-              ) ||
+      traderMode
+        ? effectiveSectorCapPct
+        : existingSectorValuePaisa > 0 &&
+          !sectorConstraint
+          ? Math.max(
               effectiveSectorCapPct,
-              0.90
+              Math.min(
+                safeNumber(
+                  riskPolicy?.maxSectorPct
+                ) ||
+                effectiveSectorCapPct,
+                0.90
+              )
             )
-          )
-        : effectiveSectorCapPct;
+          : effectiveSectorCapPct;
 
     const sectorTotalCap =
       Math.floor(
@@ -26512,8 +26808,10 @@ function allocateDecisionCenterOpportunities(
     allocations.length;
 
   const diversificationExceptionTriggered =
-    achievedPositionCount <
-      DECISION_CENTER_MIN_TARGET_POSITIONS;
+    traderMode
+      ? false
+      : achievedPositionCount <
+          DECISION_CENTER_MIN_TARGET_POSITIONS;
 
   let diversificationExceptionReason = null;
 
@@ -26606,9 +26904,9 @@ function allocateDecisionCenterOpportunities(
     cashReserveReason:
       deploymentPlan.reason,
     minimumTargetPositions:
-      DECISION_CENTER_MIN_TARGET_POSITIONS,
+      traderMode ? 1 : DECISION_CENTER_MIN_TARGET_POSITIONS,
     maximumTargetPositions:
-      DECISION_CENTER_MAX_TARGET_POSITIONS,
+      traderMode ? traderCaps.maxOpenPositions : DECISION_CENTER_MAX_TARGET_POSITIONS,
     achievedPositionCount,
     diversificationException: {
       triggered:
@@ -26643,6 +26941,11 @@ function allocateDecisionCenterOpportunities(
         2
       ),
     sectorConstraint,
+    traderMode,
+    traderMaxOpenPositions:
+      traderMode ? traderCaps.maxOpenPositions : null,
+    traderRiskBudgetPct:
+      traderMode ? decisionRound(decisionTraderRiskBudgetPct(riskPolicy) * 100, 2) : null,
     concentrationWarning:
       sectorConstraint
         ? 'This plan is intentionally restricted to ' + sectorConstraint + '. Cross-sector diversification is disabled by user choice; stock-level evidence, risk and sizing gates remain active.'
@@ -31148,6 +31451,66 @@ function runDecisionEngineSelfTests() {
     conditionalTraderPlan.entryHigh < 110,
     'Trader brain must be able to convert a poor current R/R into a conditional pullback entry without lowering the minimum R/R gate'
   );
+
+  // 0.9.5.0 Trader stabilization stress tests.
+  const triggerBreakoutWaiting = shortTermTriggerSnapshot(
+    'CONFIRMED_BREAKOUT', 98, 100, 101, 94, riskBalanced
+  );
+  const triggerBreakoutActive = shortTermTriggerSnapshot(
+    'CONFIRMED_BREAKOUT', 100.5, 100, 101, 94, riskBalanced
+  );
+  const triggerPullbackWaiting = shortTermTriggerSnapshot(
+    'TREND_PULLBACK', 106, 100, 102, 96, riskBalanced
+  );
+  const triggerPullbackActive = shortTermTriggerSnapshot(
+    'TREND_PULLBACK', 101, 100, 102, 96, riskBalanced
+  );
+  const triggerInvalidated = shortTermTriggerSnapshot(
+    'TREND_PULLBACK', 95, 100, 102, 96, riskBalanced
+  );
+
+  assert.equal(triggerBreakoutWaiting.status, 'WAITING', 'breakout below its entry zone must wait');
+  assert.equal(triggerBreakoutActive.status, 'TRIGGERED', 'breakout inside its entry zone must trigger');
+  assert.equal(triggerPullbackWaiting.status, 'WAITING', 'pullback above its entry zone must wait for price to come down');
+  assert.equal(triggerPullbackActive.status, 'TRIGGERED', 'pullback inside its entry zone must trigger');
+  assert.equal(triggerInvalidated.status, 'INVALIDATED', 'price through the stop must invalidate the setup');
+
+  const traderPolicyConservative = decisionTraderProfilePolicy(riskConservative);
+  const traderPolicyBalanced = decisionTraderProfilePolicy(riskBalanced);
+  const traderPolicyAggressive = decisionTraderProfilePolicy(riskAggressive);
+  assert.ok(
+    traderPolicyConservative.minRewardRisk > traderPolicyBalanced.minRewardRisk &&
+    traderPolicyBalanced.minRewardRisk > traderPolicyAggressive.minRewardRisk,
+    'Trader profiles must differ by execution strictness rather than by changing the objective setup'
+  );
+  assert.ok(
+    traderPolicyConservative.maxOpenPositions < traderPolicyAggressive.maxOpenPositions,
+    'Aggressive short-term mode may run more simultaneous positions than conservative mode'
+  );
+
+  const bearishTraderState = decisionCanonicalCompanyState({
+    ...longTermProfessionalCandidate,
+    horizon: 'short_term',
+    historicalContext: {
+      available: true,
+      contextSchemaVersion: DECISION_HISTORICAL_CONTEXT_SCHEMA_VERSION,
+      asOf: new Date().toISOString().slice(0, 10),
+      validSessions: 120,
+      technical: { rsi14: 38, macdHistogram: -0.8, volumeRatio20d: 1.1, annualizedVolatility20dPct: 35 },
+      priceAction: {
+        available: true,
+        timingScore: 78,
+        timingState: 'GOOD',
+        setup: 'BREAKDOWN',
+        atr14: 3,
+        support: 95,
+        resistance: 105,
+        structure: { bias: 'BEARISH' },
+        tradePlan: { complete: true, entryLow: 100, entryHigh: 101, stop: 96, target1: 112, rewardRisk: 2.5, riskPerShare: 4.5, riskPct: 4.5 }
+      }
+    }
+  });
+  assert.equal(bearishTraderState.marketAction, 'AVOID', 'risk appetite must never convert a bearish/broken setup into a long BUY');
 
   const extensionSynthetic =
     professionalLongTermEntryExtension({
