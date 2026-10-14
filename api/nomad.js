@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.3.2.5';
+const VERSION = '0.9.3.3';
 
 
 const SUPABASE_URL =
@@ -35273,11 +35273,561 @@ pre {
 
 }
 
+
+/* =========================================================
+   MOBILE UX SHELL - BUILD 0.9.3.3
+   Presentation only. Decision logic is unchanged.
+========================================================= */
+.mobileHeader,
+.mobileNavScrim,
+.mobileNavClose {
+  display: none;
+}
+
+@media (max-width: 900px) {
+  html,
+  body {
+    overflow-x: hidden;
+  }
+
+  body.mobileNavOpen {
+    overflow: hidden;
+  }
+
+  .mobileHeader {
+    position: sticky;
+    top: 0;
+    z-index: 90;
+    height: 56px;
+    padding: 0 12px;
+    box-sizing: border-box;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    background: rgba(7,16,29,.98);
+    border-bottom: 1px solid #1e2c3f;
+    backdrop-filter: blur(12px);
+  }
+
+  .mobileHeaderBrand {
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 9px;
+  }
+
+  .mobileBrandMark {
+    width: 30px;
+    height: 30px;
+    flex: 0 0 30px;
+    display: grid;
+    place-items: center;
+    border-radius: 7px;
+    background: #eaf2fb;
+    color: #07101d;
+    font-size: 13px;
+    font-weight: 900;
+  }
+
+  .mobileHeaderCopy {
+    min-width: 0;
+  }
+
+  .mobileHeaderCopy strong {
+    display: block;
+    font-size: 13px;
+    line-height: 1.1;
+    color: #f4f8fc;
+  }
+
+  .mobileHeaderCopy span {
+    display: block;
+    margin-top: 2px;
+    max-width: 180px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: #8094aa;
+    font-size: 10px;
+  }
+
+  .mobileMenuButton,
+  .mobileNavClose {
+    width: 38px;
+    height: 38px;
+    padding: 0;
+    border: 1px solid #2a3b53;
+    border-radius: 8px;
+    background: #101c2b;
+    color: #eaf2fb;
+  }
+
+  .mobileMenuButton {
+    display: grid;
+    place-content: center;
+    gap: 4px;
+  }
+
+  .mobileMenuButton span {
+    width: 17px;
+    height: 2px;
+    display: block;
+    border-radius: 999px;
+    background: #eaf2fb;
+  }
+
+  .mobileNavClose {
+    display: grid;
+    place-items: center;
+    position: absolute;
+    top: 14px;
+    right: 12px;
+    z-index: 2;
+    font-size: 24px;
+    line-height: 1;
+  }
+
+  .mobileNavScrim {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 74;
+    background: rgba(0,0,0,.55);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity .18s ease;
+  }
+
+  body.mobileNavOpen .mobileNavScrim {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  .sidebar {
+    position: fixed !important;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: min(82vw, 292px) !important;
+    min-height: 100dvh !important;
+    padding: 14px 12px 16px !important;
+    z-index: 80;
+    overflow-y: auto;
+    transform: translateX(-105%);
+    transition: transform .2s ease;
+    box-shadow: 18px 0 48px rgba(0,0,0,.28);
+  }
+
+  body.mobileNavOpen .sidebar {
+    transform: translateX(0);
+  }
+
+  .sidebar .brandBlock {
+    display: flex !important;
+    padding: 3px 48px 18px 4px;
+  }
+
+  .sidebar .sideNav {
+    display: grid !important;
+    grid-template-columns: 1fr !important;
+    gap: 4px;
+  }
+
+  .sidebar .navButton {
+    justify-content: flex-start !important;
+    min-height: 44px;
+    padding: 10px 12px !important;
+    font-size: 14px !important;
+  }
+
+  .sidebar .navButton span {
+    width: 20px;
+    display: inline-flex !important;
+    justify-content: center;
+  }
+
+  .sidebar .sideSpacer {
+    display: block !important;
+    min-height: 20px;
+  }
+
+  .sidebar .sideNavBottom {
+    display: grid !important;
+  }
+
+  .sidebar .sidebarFoot {
+    display: block !important;
+    padding: 12px 12px 0;
+  }
+
+  .appShell {
+    display: block;
+  }
+
+  .appMain {
+    width: 100% !important;
+    margin: 0 !important;
+    padding: 0 12px 28px !important;
+  }
+
+  .topBar {
+    position: relative;
+    top: auto;
+    z-index: 10;
+    min-height: 58px;
+    padding: 8px 0;
+    gap: 8px;
+  }
+
+  .topSearchWrap {
+    min-width: 0;
+  }
+
+  .topSearch {
+    min-width: 0;
+    height: 42px;
+    padding: 10px 12px;
+    font-size: 13px;
+  }
+
+  .askNomadButton {
+    min-height: 42px;
+    padding: 9px 12px;
+    font-size: 13px;
+  }
+
+  .appPage,
+  .card.appPage {
+    max-width: 100%;
+  }
+
+  .card.appPage {
+    margin-top: 12px;
+    padding: 15px 12px;
+    border-radius: 10px;
+  }
+
+  .terminalHeader,
+  .pageTitleRow,
+  .decisionTitleRow {
+    margin: 15px 0 10px;
+  }
+
+  .terminalHeader,
+  .pageTitleRow,
+  .decisionTitleRow {
+    display: block !important;
+  }
+
+  .terminalHeader h1,
+  .pageTitleRow h1,
+  .decisionTitleRow h1 {
+    margin: 3px 0 3px;
+    font-size: 24px !important;
+    line-height: 1.15;
+  }
+
+  .eyebrow {
+    font-size: 9px;
+    letter-spacing: .1em;
+  }
+
+  .terminalSub,
+  .pageTitleRow > div > p.muted,
+  .decisionTitleRow p.muted,
+  #researchSection > p.muted,
+  #exploreSection .panelHeader p.muted,
+  .decisionBoardNote {
+    display: none !important;
+  }
+
+  .decisionModeBadge {
+    display: inline-flex;
+    margin-top: 8px;
+    padding: 6px 9px;
+    font-size: 9px;
+  }
+
+  .marketStateBox {
+    width: 100%;
+    min-width: 0;
+    margin-top: 9px;
+    box-sizing: border-box;
+    padding: 9px 10px;
+  }
+
+  .marketRibbon {
+    grid-template-columns: repeat(2, minmax(0,1fr)) !important;
+    margin-bottom: 10px;
+  }
+
+  .ribbonMetric {
+    min-height: 58px;
+    padding: 9px 10px;
+    border-right: 1px solid #223249 !important;
+    border-bottom: 1px solid #223249 !important;
+  }
+
+  .ribbonMetric:nth-child(2n) {
+    border-right: 0 !important;
+  }
+
+  .ribbonMetric:nth-last-child(-n+2) {
+    border-bottom: 0 !important;
+  }
+
+  .terminalGrid,
+  .moversGrid,
+  .decisionWorkspaceGrid,
+  .opportunityBoardGrid,
+  .strategySections {
+    gap: 10px;
+  }
+
+  .terminalCard,
+  .decisionCard,
+  .decisionSetupCard,
+  .decisionVerdictCard,
+  .opportunityCard,
+  .decisionAuditCard {
+    padding: 13px;
+    border-radius: 8px;
+  }
+
+  .panelHeader {
+    gap: 8px;
+  }
+
+  .panelHeader h2,
+  .terminalCard h2 {
+    font-size: 17px;
+  }
+
+  .pageTitleRow > .panelActions {
+    width: 100%;
+    margin-top: 10px;
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0,1fr));
+    gap: 6px;
+  }
+
+  .pageTitleRow > .panelActions .miniButton {
+    width: 100%;
+    min-height: 40px;
+    padding: 7px 6px;
+    font-size: 10px;
+  }
+
+  .decisionPrinciple {
+    display: none;
+  }
+
+  .decisionWorkspaceGrid {
+    margin-bottom: 12px;
+  }
+
+  .decisionMoneyLine {
+    grid-template-columns: repeat(3, minmax(0,1fr)) !important;
+  }
+
+  .decisionMoneyLine div {
+    padding: 7px 6px;
+  }
+
+  .decisionMoneyLine strong {
+    font-size: 11px;
+  }
+
+  .decisionOutcome {
+    gap: 8px;
+  }
+
+  .decisionOutcome span {
+    font-size: 10px;
+    text-align: right;
+  }
+
+  .decisionAllocationRow,
+  .decisionCandidateRow {
+    grid-template-columns: 58px minmax(0,1fr) auto;
+  }
+
+  .decisionAudit {
+    gap: 6px;
+  }
+
+  .auditMetric,
+  .strategyMetric {
+    padding: 8px;
+    border-radius: 7px;
+  }
+
+  .stockStrategyControls {
+    gap: 8px;
+  }
+
+  #researchSection h2 {
+    margin: 2px 0 10px;
+    font-size: 23px;
+  }
+
+  #stockSymbol {
+    min-height: 44px;
+  }
+
+  .companyHeader {
+    margin-top: 13px;
+  }
+
+  .companyHeader strong {
+    font-size: 19px;
+    line-height: 1.2;
+  }
+
+  .identityLine {
+    gap: 5px;
+    line-height: 1.35;
+  }
+
+  .actions {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    gap: 7px;
+    margin: 12px -2px 10px;
+    padding: 0 2px 6px;
+    scrollbar-width: none;
+  }
+
+  .actions::-webkit-scrollbar {
+    display: none;
+  }
+
+  .actions button {
+    flex: 0 0 auto;
+    min-height: 40px;
+    padding: 8px 12px;
+    font-size: 12px;
+  }
+
+  #exploreSection .panelHeader {
+    align-items: center;
+  }
+
+  #exploreSection .panelHeader > div {
+    min-width: 0;
+  }
+
+  #exploreSection .panelHeader h2 {
+    margin-bottom: 0;
+    font-size: 22px;
+  }
+
+  #exploreSection #loadMarket {
+    flex: 0 0 auto;
+    min-height: 38px;
+    padding: 7px 9px;
+    font-size: 10px;
+  }
+
+  .filters,
+  .auditFilters {
+    gap: 9px;
+    margin: 13px 0;
+  }
+
+  .filters label,
+  .auditFilters label {
+    font-size: 11px;
+  }
+
+  .filters input,
+  .filters select,
+  .auditFilters input,
+  .auditFilters select {
+    min-height: 42px;
+  }
+
+  .pagination {
+    gap: 8px;
+  }
+
+  .paginationControls {
+    width: 100%;
+  }
+
+  .paginationControls button {
+    flex: 1;
+  }
+
+  .opportunityRow {
+    gap: 8px;
+  }
+
+  .opportunityIdentity strong {
+    font-size: 13px;
+  }
+
+  .opportunityIdentity span,
+  .opportunityMeta,
+  .opportunityReason,
+  .opportunityConcern {
+    font-size: 10px;
+  }
+}
+
+@media (max-width: 480px) {
+  .appMain {
+    padding-left: 10px !important;
+    padding-right: 10px !important;
+  }
+
+  .mobileHeader {
+    padding-left: 10px;
+    padding-right: 10px;
+  }
+
+  .topBar {
+    gap: 6px;
+  }
+
+  .askNomadButton {
+    padding-left: 10px;
+    padding-right: 10px;
+  }
+
+  .pageTitleRow > .panelActions {
+    grid-template-columns: repeat(2, minmax(0,1fr));
+  }
+
+  .pageTitleRow > .panelActions .miniButton:first-child {
+    grid-column: 1 / -1;
+  }
+
+  .decisionMoneyLine {
+    grid-template-columns: 1fr !important;
+  }
+
+  .strategyMetricGrid,
+  .decisionAudit {
+    grid-template-columns: repeat(2, minmax(0,1fr)) !important;
+  }
+}
+
 </style>
 
 </head>
 
 <body>
+
+<header class="mobileHeader" aria-label="NOMAD mobile header">
+<div class="mobileHeaderBrand">
+<div class="mobileBrandMark">N</div>
+<div class="mobileHeaderCopy"><strong>NOMAD Invest</strong><span id="mobilePageTitle">Home</span></div>
+</div>
+<button id="mobileMenuButton" class="mobileMenuButton" type="button" aria-label="Open navigation" aria-expanded="false"><span></span><span></span><span></span></button>
+</header>
+<div id="mobileNavScrim" class="mobileNavScrim" aria-hidden="true"></div>
 
 <div class="appShell">
 
@@ -35290,6 +35840,8 @@ pre {
 <div class="brandSub">Decision intelligence</div>
 </div>
 </div>
+
+<button id="mobileNavClose" class="mobileNavClose" type="button" aria-label="Close navigation">&times;</button>
 
 <nav class="sideNav">
 <button class="navButton active" data-nav="home"><span>⌂</span>Home</button>
@@ -36839,6 +37391,53 @@ function appPageFromLocation() {
   return 'home';
 }
 
+const NOMAD_MOBILE_PAGE_LABELS = {
+  home: 'Home',
+  portfolio: 'Portfolio',
+  decision: 'Decision Center',
+  research: 'Research',
+  explore: 'Explore PSX',
+  universe: 'Universe',
+  system: 'System'
+};
+
+function syncMobilePageTitle(page) {
+  const target = $('mobilePageTitle');
+  if (!target) {
+    return;
+  }
+
+  target.textContent =
+    NOMAD_MOBILE_PAGE_LABELS[page] ||
+    'NOMAD Invest';
+}
+
+function setMobileNavigationOpen(open) {
+  const isOpen = Boolean(open);
+  document.body.classList.toggle(
+    'mobileNavOpen',
+    isOpen
+  );
+
+  if ($('mobileMenuButton')) {
+    $('mobileMenuButton').setAttribute(
+      'aria-expanded',
+      isOpen ? 'true' : 'false'
+    );
+  }
+
+  if ($('mobileNavScrim')) {
+    $('mobileNavScrim').setAttribute(
+      'aria-hidden',
+      isOpen ? 'false' : 'true'
+    );
+  }
+}
+
+function closeMobileNavigation() {
+  setMobileNavigationOpen(false);
+}
+
 function openAppPage(
   page,
   options = {}
@@ -36847,6 +37446,9 @@ function openAppPage(
     normalizedAppPage(
       page
     );
+
+  syncMobilePageTitle(page);
+  closeMobileNavigation();
 
   // Clear page-scoped errors when the user navigates. A failed Research
   // request must not leave a stale red error banner on Decision Center,
@@ -46800,6 +47402,42 @@ async function saveHoldingFromForm() {
 /* =========================================================
    APP SHELL EVENTS
 ========================================================= */
+
+if ($('mobileMenuButton')) {
+  $('mobileMenuButton').onclick =
+    () => setMobileNavigationOpen(true);
+}
+
+if ($('mobileNavClose')) {
+  $('mobileNavClose').onclick =
+    () => closeMobileNavigation();
+}
+
+if ($('mobileNavScrim')) {
+  $('mobileNavScrim').onclick =
+    () => closeMobileNavigation();
+}
+
+window.addEventListener(
+  'keydown',
+  event => {
+    if (
+      event.key === 'Escape' &&
+      document.body.classList.contains('mobileNavOpen')
+    ) {
+      closeMobileNavigation();
+    }
+  }
+);
+
+window.addEventListener(
+  'resize',
+  () => {
+    if (window.innerWidth > 900) {
+      closeMobileNavigation();
+    }
+  }
+);
 
 document
   .querySelectorAll(
