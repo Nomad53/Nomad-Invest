@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.5.1';
+const VERSION = '0.9.5.2';
 
 
 const SUPABASE_URL =
@@ -25058,7 +25058,7 @@ function buildShortTermTriggerPlan(
       riskPolicy
     );
 
-  const candidates =
+  const allCandidates =
     [
       ...(opportunityBoard?.priority1 || []),
       ...(opportunityBoard?.priority2 || [])
@@ -25075,13 +25075,10 @@ function buildShortTermTriggerPlan(
         (a, b) =>
           (safeNumber(b?.professional?.rankingScore) || 0) -
           (safeNumber(a?.professional?.rankingScore) || 0)
-      )
-      .slice(
-        0,
-        policy.maxConditionalPlans
       );
 
   const plans = [];
+  const unfunded = [];
   let reserved = 0;
 
   const totalCapital =
@@ -25105,7 +25102,16 @@ function buildShortTermTriggerPlan(
       totalCapital - investedNow
     );
 
-  for (const item of candidates) {
+  const slotDivisor =
+    Math.max(
+      1,
+      Math.min(
+        policy.maxConditionalPlans,
+        allCandidates.length || 1
+      )
+    );
+
+  for (const item of allCandidates) {
     const plan =
       item.professional
         .conditionalTradePlan;
@@ -25124,6 +25130,56 @@ function buildShortTermTriggerPlan(
       entryHigh === null ||
       stop === null
     ) {
+      unfunded.push({
+        symbol: item.symbol,
+        state: 'READY_UNFUNDED',
+        reasonCode: 'INVALID_PLAN_LEVELS',
+        reason: 'The conditional setup is visible, but its entry or stop levels are incomplete.'
+      });
+      continue;
+    }
+
+    const triggerSnapshot =
+      shortTermTriggerSnapshot(
+        item.professional.setup,
+        currentPrice,
+        entryLow,
+        entryHigh,
+        stop,
+        riskPolicy
+      );
+
+    if (
+      [
+        'INVALIDATED',
+        'BELOW_ENTRY_ZONE',
+        'ABOVE_ENTRY_ZONE'
+      ].includes(triggerSnapshot.status)
+    ) {
+      unfunded.push({
+        symbol: item.symbol,
+        state: 'READY_UNFUNDED',
+        reasonCode: triggerSnapshot.status,
+        reason: triggerSnapshot.label
+      });
+      continue;
+    }
+
+    if (
+      plans.length >=
+        policy.maxConditionalPlans
+    ) {
+      unfunded.push({
+        symbol: item.symbol,
+        state: 'READY_UNFUNDED',
+        reasonCode: 'PROFILE_SLOT_LIMIT',
+        reason:
+          'Valid setup, but the selected profile funds at most ' +
+          policy.maxConditionalPlans +
+          ' simultaneous trigger plan' +
+          (policy.maxConditionalPlans === 1 ? '' : 's') +
+          '. Higher-ranked setups received the available slots.'
+      });
       continue;
     }
 
@@ -25139,6 +25195,12 @@ function buildShortTermTriggerPlan(
       entry <= 0 ||
       riskPerShare <= 0
     ) {
+      unfunded.push({
+        symbol: item.symbol,
+        state: 'READY_UNFUNDED',
+        reasonCode: 'INVALID_RISK_GEOMETRY',
+        reason: 'The setup does not have a positive stop-defined risk per share.'
+      });
       continue;
     }
 
@@ -25153,13 +25215,7 @@ function buildShortTermTriggerPlan(
 
     const maxPrincipalBySlot =
       availableForTriggers /
-      Math.max(
-        1,
-        Math.min(
-          policy.maxConditionalPlans,
-          candidates.length
-        )
-      );
+      slotDivisor;
 
     const sharesBySlot =
       Math.floor(
@@ -25177,6 +25233,12 @@ function buildShortTermTriggerPlan(
       );
 
     if (shares < 1) {
+      unfunded.push({
+        symbol: item.symbol,
+        state: 'READY_UNFUNDED',
+        reasonCode: 'RISK_OR_SLOT_TOO_SMALL',
+        reason: 'The setup is technically valid, but one whole share cannot fit the profile risk budget and trigger-plan sizing limit.'
+      });
       continue;
     }
 
@@ -25202,21 +25264,17 @@ function buildShortTermTriggerPlan(
       );
 
     if (fundedShares < 1) {
+      unfunded.push({
+        symbol: item.symbol,
+        state: 'READY_UNFUNDED',
+        reasonCode: 'NO_TRIGGER_CAPITAL_LEFT',
+        reason: 'The setup remains valid, but higher-ranked immediate and trigger plans already use the available capital.'
+      });
       continue;
     }
 
     const principal =
       fundedShares * entry;
-
-    const triggerSnapshot =
-      shortTermTriggerSnapshot(
-        item.professional.setup,
-        currentPrice,
-        entryLow,
-        entryHigh,
-        stop,
-        riskPolicy
-      );
 
     reserved += principal;
 
@@ -25281,27 +25339,42 @@ function buildShortTermTriggerPlan(
     });
   }
 
+  const plannedCapitalPkr =
+    decisionRound(
+      Math.min(
+        availableForTriggers,
+        reserved
+      ),
+      2
+    );
+
+  const uncommittedCapitalPkr =
+    decisionRound(
+      Math.max(
+        0,
+        totalCapital -
+        investedNow -
+        plannedCapitalPkr
+      ),
+      2
+    );
+
+  const reconciliationDeltaPkr =
+    decisionRound(
+      totalCapital -
+      investedNow -
+      plannedCapitalPkr -
+      uncommittedCapitalPkr,
+      2
+    );
+
   return {
     policyId: policy.id,
+    readyCount: allCandidates.length,
     count: plans.length,
-    plannedCapitalPkr:
-      decisionRound(
-        Math.min(
-          availableForTriggers,
-          reserved
-        ),
-        2
-      ),
-    uncommittedCapitalPkr:
-      decisionRound(
-        Math.max(
-          0,
-          totalCapital -
-          investedNow -
-          reserved
-        ),
-        2
-      ),
+    fundedCount: plans.length,
+    plannedCapitalPkr,
+    uncommittedCapitalPkr,
     buyNowCapitalPkr:
       decisionRound(
         investedNow,
@@ -25312,7 +25385,112 @@ function buildShortTermTriggerPlan(
         availableForTriggers,
         2
       ),
-    plans
+    reconciliation: {
+      totalCapitalPkr:
+        decisionRound(totalCapital, 2),
+      buyNowPkr:
+        decisionRound(investedNow, 2),
+      reservedPkr:
+        plannedCapitalPkr,
+      freeCashPkr:
+        uncommittedCapitalPkr,
+      deltaPkr:
+        reconciliationDeltaPkr,
+      ok:
+        Math.abs(reconciliationDeltaPkr) <= 0.02
+    },
+    plans,
+    unfunded
+  };
+}
+
+function shortTermDecisionStabilityAudit(
+  amount,
+  allocation,
+  triggerPlan,
+  riskPolicy
+) {
+  const issues = [];
+  const total = Math.max(0, safeNumber(amount) || 0);
+  const buyNow = Math.max(0, safeNumber(allocation?.amountInvestedPkr) || 0);
+  const reserved = Math.max(0, safeNumber(triggerPlan?.plannedCapitalPkr) || 0);
+  const freeCash = Math.max(0, safeNumber(triggerPlan?.uncommittedCapitalPkr) || 0);
+  const delta = decisionRound(total - buyNow - reserved - freeCash, 2);
+  const policy = decisionTraderProfilePolicy(riskPolicy);
+  const plans = Array.isArray(triggerPlan?.plans) ? triggerPlan.plans : [];
+  const symbols = new Set();
+
+  if (Math.abs(delta) > 0.02) {
+    issues.push('Capital reconciliation failed by PKR ' + delta + '.');
+  }
+
+  if (plans.length > policy.maxConditionalPlans) {
+    issues.push('Funded trigger count exceeds the selected profile limit.');
+  }
+
+  let principalSum = 0;
+
+  for (const plan of plans) {
+    if (!plan?.symbol) {
+      issues.push('A funded trigger plan is missing its symbol.');
+      continue;
+    }
+
+    if (symbols.has(plan.symbol)) {
+      issues.push('Duplicate funded trigger plan for ' + plan.symbol + '.');
+    }
+    symbols.add(plan.symbol);
+
+    const shares = safeNumber(plan.shares);
+    const entryLow = safeNumber(plan.entryLow);
+    const entryHigh = safeNumber(plan.entryHigh);
+    const stop = safeNumber(plan.stop);
+    const target1 = safeNumber(plan.target1);
+    const rr = safeNumber(plan.rewardRisk);
+    const principal = safeNumber(plan.plannedPrincipalPkr) || 0;
+    principalSum += principal;
+
+    if (shares === null || shares < 1) {
+      issues.push(plan.symbol + ' funded trigger has no whole-share quantity.');
+    }
+
+    if (
+      entryLow === null ||
+      entryHigh === null ||
+      stop === null ||
+      target1 === null ||
+      !(stop < entryLow && entryLow <= entryHigh && entryHigh < target1)
+    ) {
+      issues.push(plan.symbol + ' funded trigger has invalid entry/stop/target geometry.');
+    }
+
+    if (rr === null || rr < policy.minRewardRisk) {
+      issues.push(plan.symbol + ' funded trigger is below the selected profile reward-to-risk floor.');
+    }
+  }
+
+  if (
+    Math.abs(
+      decisionRound(principalSum, 2) -
+      reserved
+    ) > 0.05
+  ) {
+    issues.push('Funded trigger principals do not match reserved capital.');
+  }
+
+  return {
+    status: issues.length ? 'BLOCKED' : 'PASS',
+    ok: issues.length === 0,
+    issues,
+    capital: {
+      requestedPkr: decisionRound(total, 2),
+      buyNowPkr: decisionRound(buyNow, 2),
+      reservedPkr: decisionRound(reserved, 2),
+      freeCashPkr: decisionRound(freeCash, 2),
+      deltaPkr: delta
+    },
+    fundedTriggerCount: plans.length,
+    profileTriggerLimit: policy.maxConditionalPlans
   };
 }
 
@@ -29625,6 +29803,16 @@ async function runDecisionLab(
         )
       : null;
 
+  const shortTermStability =
+    horizon === 'short_term'
+      ? shortTermDecisionStabilityAudit(
+          amount,
+          allocation,
+          shortTermTriggerPlan,
+          riskPolicy
+        )
+      : null;
+
   let action = 'WATCH';
   let headline =
     'No Priority 1 allocation currently passes the shadow allocation gates.';
@@ -30039,6 +30227,7 @@ async function runDecisionLab(
     allocations:
       allocation.allocations,
     shortTermTriggerPlan,
+    shortTermStability,
     opportunityBoard: {
       priority1:
         opportunityBoard.priority1,
@@ -30171,6 +30360,29 @@ async function runDecisionLab(
       )
     ]
   };
+
+  if (
+    horizon === 'short_term' &&
+    shortTermStability &&
+    shortTermStability.ok !== true
+  ) {
+    result.decision.action = 'DATA_BLOCKED';
+    result.decision.headline = 'Trader plan withheld — internal consistency check failed.';
+    result.decision.reason = 'NOMAD detected an internal capital or trade-plan inconsistency and withheld the short-term plan rather than presenting an unreliable action.';
+    result.allocations = [];
+    if (result.shortTermTriggerPlan) {
+      result.shortTermTriggerPlan.plans = [];
+      result.shortTermTriggerPlan.count = 0;
+      result.shortTermTriggerPlan.fundedCount = 0;
+      result.shortTermTriggerPlan.plannedCapitalPkr = 0;
+      result.shortTermTriggerPlan.uncommittedCapitalPkr = decisionRound(amount, 2);
+    }
+    result.warnings.push(
+      ...shortTermStability.issues.map(
+        issue => 'TRADER STABILITY CHECK: ' + issue
+      )
+    );
+  }
 
   result.recording =
     await recordDecisionRun(
@@ -31437,6 +31649,75 @@ function runDecisionEngineSelfTests() {
     !shortTermRiskSized.allocations.length ||
     shortTermRiskSized.allocations[0].principalPkr <= 10000.01,
     'Balanced short-term sizing must respect the 1% capital-at-risk budget when stop risk is PKR 10 per share at a PKR 100 price'
+  );
+
+
+  const triggerFundingSynthetic =
+    buildShortTermTriggerPlan(
+      {
+        priority1: [],
+        priority2: [
+          {
+            symbol: 'TRIG1',
+            companyName: 'Trigger One',
+            price: 110,
+            shortTermExecution: {
+              reservationEligible: true
+            },
+            professional: {
+              setup: 'TREND_PULLBACK',
+              rankingScore: 90,
+              conditionalTradePlan: {
+                complete: true,
+                entryLow: 100,
+                entryHigh: 101,
+                stop: 96,
+                target1: 111,
+                rewardRisk: 2.2
+              }
+            }
+          },
+          {
+            symbol: 'TRIG2',
+            companyName: 'Trigger Two',
+            price: 55,
+            shortTermExecution: {
+              reservationEligible: true
+            },
+            professional: {
+              setup: 'TREND_PULLBACK',
+              rankingScore: 85,
+              conditionalTradePlan: {
+                complete: true,
+                entryLow: 50,
+                entryHigh: 51,
+                stop: 48,
+                target1: 56,
+                rewardRisk: 2.2
+              }
+            }
+          }
+        ]
+      },
+      100000,
+      riskBalanced,
+      15000
+    );
+
+  assert.ok(
+    Math.abs(
+      100000 -
+      triggerFundingSynthetic.buyNowCapitalPkr -
+      triggerFundingSynthetic.plannedCapitalPkr -
+      triggerFundingSynthetic.uncommittedCapitalPkr
+    ) <= 0.02,
+    'short-term buy-now + trigger reserve + free cash must reconcile exactly to requested capital'
+  );
+
+  assert.ok(
+    triggerFundingSynthetic.count <=
+      decisionTraderProfilePolicy(riskBalanced).maxConditionalPlans,
+    'short-term funded trigger count must respect the selected profile slot limit'
   );
 
   const shortTermMissingPlan =
@@ -38403,6 +38684,71 @@ button:not(.secondary):not(.miniButton):not(.chartModeButton):not(.navButton):no
   .opportunityActionStack {
     min-width: 0;
     padding-left: 0;
+  }
+}
+
+
+/* =========================================================
+   TRADER STABLE BASELINE - BUILD 0.9.5.2
+========================================================= */
+.triggerFundingLine {
+  margin-top: 8px;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 11px;
+  line-height: 1.35;
+}
+.triggerFundingLine span {
+  flex: 0 0 auto;
+  font-weight: 800;
+  letter-spacing: .04em;
+}
+.triggerFundingLine strong {
+  text-align: right;
+  font-weight: 650;
+  color: var(--text);
+}
+.triggerFundingLine.funded {
+  border-color: rgba(251, 197, 49, .45);
+  background: rgba(251, 197, 49, .06);
+}
+.triggerFundingLine.funded span {
+  color: var(--accent-yellow, #fbc531);
+}
+.triggerFundingLine.unfunded {
+  background: rgba(255,255,255,.018);
+}
+.triggerFundingLine.unfunded span {
+  color: var(--muted);
+}
+.closestTriggerCard {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+.opportunityProfileAction.funded_trigger,
+.opportunityProfileAction.ready_unfunded {
+  white-space: nowrap;
+}
+.opportunityProfileAction.funded_trigger {
+  border-color: rgba(251, 197, 49, .55);
+  color: var(--accent-yellow, #fbc531);
+}
+.opportunityProfileAction.ready_unfunded {
+  color: var(--muted);
+}
+@media (max-width: 900px) {
+  .closestTriggerCard {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .triggerFundingLine {
+    flex-direction: column;
+  }
+  .triggerFundingLine strong {
+    text-align: left;
   }
 }
 </style>
@@ -50641,6 +50987,8 @@ function decisionActionLabel(
     DO_NOT_ADD: 'DO NOT ADD',
     BUY_SMALL: 'BUY SMALL',
     PLAN: 'PLAN',
+    FUNDED_TRIGGER: 'FUNDED TRIGGER',
+    READY_UNFUNDED: 'READY · UNFUNDED',
     PASS: 'PASS',
     WAIT: 'WAIT',
     TRIGGER_PLAN: 'TRIGGER PLAN'
@@ -50764,6 +51112,33 @@ function renderOpportunityList(
               )
             : '';
 
+        const triggerFundingLine =
+          isShortTerm && item.fundedTrigger
+            ? (
+                '<div class="triggerFundingLine funded"><span>FUNDED TRIGGER</span><strong>PKR ' +
+                formatNumber(
+                  item.fundedTrigger.plannedPrincipalPkr || 0,
+                  0
+                ) +
+                ' reserved · ' +
+                formatNumber(
+                  item.fundedTrigger.shares || 0,
+                  0
+                ) +
+                ' shares</strong></div>'
+              )
+            : isShortTerm &&
+              item?.shortTermExecution?.reservationEligible === true
+              ? (
+                  '<div class="triggerFundingLine unfunded"><span>READY · UNFUNDED</span><strong>' +
+                  escapeHtml(
+                    item.unfundedTrigger?.reason ||
+                    'Valid setup, but this plan did not receive reserved capital under the selected profile.'
+                  ) +
+                  '</strong></div>'
+                )
+              : '';
+
         const compactReason =
           String(item.reason || '')
             .split(/(?<=[.!?])\s+/)[0]
@@ -50838,6 +51213,7 @@ function renderOpportunityList(
           escapeHtml(item.sector || 'Unknown sector') +
           '</span></div>' +
           quickTradeLine +
+          triggerFundingLine +
           (
             compactReason
               ? '<div class="opportunityReason compact">' +
@@ -51671,6 +52047,20 @@ function renderOpportunityBoard(
         .filter(Boolean)
     );
 
+  const fundedTriggerBySymbol =
+    new Map(
+      (result?.shortTermTriggerPlan?.plans || [])
+        .filter(item => item?.symbol)
+        .map(item => [item.symbol, item])
+    );
+
+  const unfundedTriggerBySymbol =
+    new Map(
+      (result?.shortTermTriggerPlan?.unfunded || [])
+        .filter(item => item?.symbol)
+        .map(item => [item.symbol, item])
+    );
+
   const personalActionBySymbol =
     new Map(
       (result?.allocationDiagnostics?.personalActions || [])
@@ -51688,6 +52078,14 @@ function renderOpportunityBoard(
         personalActionBySymbol.get(
           item.symbol
         );
+      const fundedTrigger =
+        fundedTriggerBySymbol.get(
+          item.symbol
+        ) || null;
+      const unfundedTrigger =
+        unfundedTriggerBySymbol.get(
+          item.symbol
+        ) || null;
 
       let displayProfileAction =
         null;
@@ -51700,6 +52098,21 @@ function renderOpportunityBoard(
       } else if (personal?.portfolioAction) {
         displayProfileAction =
           personal.portfolioAction;
+      } else if (fundedTrigger) {
+        displayProfileAction =
+          'FUNDED_TRIGGER';
+      } else if (
+        item?.shortTermExecution
+          ?.reservationEligible === true
+      ) {
+        displayProfileAction =
+          'READY_UNFUNDED';
+      } else if (
+        item?.shortTermExecution
+          ?.actionableNow === true
+      ) {
+        displayProfileAction =
+          'PASS';
       } else if (item?.shortTermExecution?.action) {
         displayProfileAction =
           item.shortTermExecution.action;
@@ -51707,7 +52120,9 @@ function renderOpportunityBoard(
 
       return {
         ...item,
-        displayProfileAction
+        displayProfileAction,
+        fundedTrigger,
+        unfundedTrigger
       };
     };
 
@@ -51726,7 +52141,7 @@ function renderOpportunityBoard(
   }
   if ($('priorityOneTitle')) {
     $('priorityOneTitle').textContent =
-      isShortTerm ? 'Trades valid right now' : 'Best current opportunities';
+      isShortTerm ? 'Active market setups' : 'Best current opportunities';
   }
   if ($('priorityTwoEyebrow')) {
     $('priorityTwoEyebrow').textContent =
@@ -51757,7 +52172,7 @@ function renderOpportunityBoard(
     'priorityOneList',
     priority1Display,
     isShortTerm
-      ? 'No entry is valid right now.'
+      ? 'No active market setup right now.'
       : 'No company currently earns Priority 1 under the tiered analyst-evidence gate.'
   );
 
@@ -51871,7 +52286,15 @@ function renderDecisionAudit(
     [
       'Data blocked',
       screening.dataBlocked
-    ]
+    ],
+    ...(
+      result?.input?.horizon === 'short_term'
+        ? [[
+            'Trader integrity',
+            result?.shortTermStability?.status || 'UNAVAILABLE'
+          ]]
+        : []
+    )
   ];
 
   if ($('decisionAuditSummary')) {
@@ -52270,7 +52693,7 @@ function renderShadowDecision(
     '<span>' +
     escapeHtml(
       isShortTermDecision
-        ? ((triggerPlan?.count || 0) + ' funded trigger plan' + ((triggerPlan?.count || 0) === 1 ? '' : 's') + ' · ' + (decision.amountInvestedPkr > 0 ? 'entry valid now' : 'no buy-now entry'))
+        ? ((triggerPlan?.fundedCount ?? triggerPlan?.count ?? 0) + ' funded of ' + (triggerPlan?.readyCount ?? result?.screening?.conditionalSetups ?? 0) + ' ready setup' + ((triggerPlan?.readyCount ?? result?.screening?.conditionalSetups ?? 0) === 1 ? '' : 's') + ' · ' + (decision.amountInvestedPkr > 0 ? 'entry valid now' : 'no buy-now entry'))
         : ((allocations.length || 0) + ' funded position' + (allocations.length === 1 ? '' : 's') + ' · ' + formatNumber(decision.cashRemainingPkr || 0, 0) + ' PKR retained')
     ) +
     '</span>' +
@@ -52595,6 +53018,10 @@ function renderShadowDecision(
       '<div><span>Status</span><strong>' +
       escapeHtml(closest.triggerLabel || 'Waiting') +
       '</strong></div>' +
+      '<div><span>Reserved</span><strong>PKR ' +
+      formatNumber(closest.plannedPrincipalPkr || 0, 0) +
+      ' · ' + formatNumber(closest.shares || 0, 0) +
+      ' shares</strong></div>' +
       '</div>';
   }
 
