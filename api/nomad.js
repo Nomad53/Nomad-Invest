@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.4.1';
+const VERSION = '0.9.4.2';
 
 
 const SUPABASE_URL =
@@ -19341,6 +19341,123 @@ async function refreshHistoricalSituation(
   return context;
 }
 
+async function getPortfolioIntradayChart() {
+  const snapshot = await getPortfolioSnapshot();
+  const holdings = Array.isArray(snapshot?.holdings)
+    ? snapshot.holdings.filter(item => Number(item?.quantity) > 0)
+    : [];
+
+  if (!holdings.length) {
+    return {
+      available: false,
+      data: [],
+      currentValue: 0,
+      investedCost: Number(snapshot?.summary?.investedCost || 0),
+      source: 'pyPSX intraday aggregation'
+    };
+  }
+
+  const results = await Promise.allSettled(
+    holdings.map(async holding => {
+      const context = await resolveSymbolContext(holding.symbol);
+      const live = await getLiveForContext(context);
+      return {
+        symbol: holding.symbol,
+        quantity: Number(holding.quantity) || 0,
+        currentPrice: Number(holding.currentPrice) || 0,
+        data: Array.isArray(live?.data) ? live.data : [],
+        marketStatus: live?.marketStatus || null,
+        sessionDate: live?.sessionDate || null,
+        timestamp: live?.timestamp || null
+      };
+    })
+  );
+
+  const seriesBySymbol = [];
+  for (const result of results) {
+    if (result.status !== 'fulfilled') continue;
+    const row = result.value;
+    if (!row.quantity || !row.data.length) continue;
+    seriesBySymbol.push({
+      ...row,
+      data: row.data
+        .map(point => ({
+          t: Date.parse(point.timestamp),
+          price: Number(point.close)
+        }))
+        .filter(point => Number.isFinite(point.t) && Number.isFinite(point.price) && point.price > 0)
+        .sort((a,b) => a.t - b.t)
+    });
+  }
+
+  if (!seriesBySymbol.length) {
+    return {
+      available: false,
+      data: [],
+      currentValue: Number(snapshot?.summary?.currentValue || 0),
+      investedCost: Number(snapshot?.summary?.investedCost || 0),
+      source: 'pyPSX intraday aggregation'
+    };
+  }
+
+  const timestamps = Array.from(new Set(
+    seriesBySymbol.flatMap(item => item.data.map(point => point.t))
+  )).sort((a,b) => a-b);
+
+  const states = seriesBySymbol.map(item => ({
+    ...item,
+    index: 0,
+    lastPrice: item.data[0]?.price || item.currentPrice || 0
+  }));
+
+  const data = [];
+  for (const t of timestamps) {
+    let value = 0;
+    let covered = 0;
+    for (const state of states) {
+      while (
+        state.index < state.data.length &&
+        state.data[state.index].t <= t
+      ) {
+        state.lastPrice = state.data[state.index].price;
+        state.index += 1;
+      }
+      if (Number.isFinite(state.lastPrice) && state.lastPrice > 0) {
+        value += state.quantity * state.lastPrice;
+        covered += 1;
+      }
+    }
+    if (covered === states.length && value > 0) {
+      data.push({
+        timestamp: new Date(t).toISOString(),
+        value: Math.round(value * 100) / 100
+      });
+    }
+  }
+
+  const trimmed = data.slice(-480);
+  const currentValue = Number(snapshot?.summary?.currentValue || trimmed[trimmed.length - 1]?.value || 0);
+  const firstValue = Number(trimmed[0]?.value || currentValue || 0);
+  const changeValue = currentValue - firstValue;
+  const changePct = firstValue > 0 ? changeValue / firstValue * 100 : 0;
+
+  return {
+    available: trimmed.length > 1,
+    range: '1D',
+    data: trimmed,
+    currentValue,
+    investedCost: Number(snapshot?.summary?.investedCost || 0),
+    changeValue: Math.round(changeValue * 100) / 100,
+    changePct: Math.round(changePct * 100) / 100,
+    holdingsCovered: states.length,
+    holdingsTotal: holdings.length,
+    asOf: trimmed[trimmed.length - 1]?.timestamp || snapshot?.asOf || null,
+    sessionDate: seriesBySymbol.find(item => item.sessionDate)?.sessionDate || null,
+    marketStatus: seriesBySymbol.find(item => item.marketStatus)?.marketStatus || null,
+    source: 'pyPSX 1-minute intraday candles aggregated across NOMAD holdings'
+  };
+}
+
 async function getPortfolioSnapshot() {
   const [
     holdingsResult,
@@ -32984,6 +33101,18 @@ async function handler(
 
     if (
       request.method ===
+        'GET' &&
+      action ===
+        'portfolio-chart'
+    ) {
+      return sendJSON(
+        response,
+        await getPortfolioIntradayChart()
+      );
+    }
+
+    if (
+      request.method ===
         'POST' &&
       action ===
         'portfolio-holding'
@@ -37476,6 +37605,183 @@ button:not(.secondary):not(.miniButton):not(.chartModeButton):not(.navButton):no
   .opportunityCard.isEmptyOpportunity { padding:9px 10px; }
 }
 
+
+/* =========================================================
+   UI CLARITY + PORTFOLIO INTRADAY CHART - BUILD 0.9.4.2
+========================================================= */
+:root {
+  --nomad-highlight: #f4c542;
+  --nomad-highlight-strong: #ffd84d;
+  --nomad-highlight-ink: #151203;
+}
+
+/* Major actions use the yellow attention accent. */
+#findBestOption,
+#strategyAnalyze,
+#analyzeStockStrategy,
+#portfolioRecordTrade,
+#homeRecordTrade,
+#runIntelligenceScan,
+#runMemoryTest,
+.miniButton:not(.secondary),
+.paginationControls button:not(:disabled) {
+  background: var(--nomad-highlight) !important;
+  color: var(--nomad-highlight-ink) !important;
+  border-color: rgba(255,216,77,.72) !important;
+  font-weight: 850;
+}
+#findBestOption:hover,
+#strategyAnalyze:hover,
+#analyzeStockStrategy:hover,
+#portfolioRecordTrade:hover,
+#homeRecordTrade:hover,
+#runIntelligenceScan:hover,
+#runMemoryTest:hover,
+.miniButton:not(.secondary):hover {
+  background: var(--nomad-highlight-strong) !important;
+  filter: none !important;
+}
+
+/* Home portfolio CTA should read as a button, not a full-width strap. */
+.quickAction {
+  width: auto !important;
+  display: inline-flex !important;
+  justify-content: center !important;
+  gap: 12px;
+  margin-top: 12px;
+  padding: 9px 14px !important;
+  border: 1px solid rgba(255,216,77,.72) !important;
+  border-radius: 8px !important;
+  background: var(--nomad-highlight) !important;
+  color: var(--nomad-highlight-ink) !important;
+  font-weight: 850;
+}
+.quickAction:hover { background: var(--nomad-highlight-strong) !important; }
+
+/* Small Analyze actions must be unmistakable. */
+.opportunityAnalyzeButton {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 3px 7px !important;
+  margin-left: 7px;
+  border: 1px solid rgba(255,216,77,.62) !important;
+  border-radius: 6px;
+  background: rgba(244,197,66,.14) !important;
+  color: var(--nomad-highlight-strong) !important;
+  font-size: 9px;
+  font-weight: 900;
+  line-height: 1;
+}
+.opportunityAnalyzeButton:hover {
+  background: var(--nomad-highlight) !important;
+  color: var(--nomad-highlight-ink) !important;
+}
+
+/* Research navigation: remove the dark strap; only the selected view is yellow. */
+#researchSection > .actions {
+  position: sticky;
+  top: 8px;
+  z-index: 20;
+  margin: 12px 0 16px;
+  padding: 0;
+  background: transparent !important;
+  backdrop-filter: none;
+}
+#researchSection > .actions button {
+  background: #173a55 !important;
+  color: #dce9f4 !important;
+  border: 1px solid #28506d !important;
+  box-shadow: none !important;
+}
+#researchSection > .actions button:hover {
+  background: #1d506f !important;
+}
+#researchSection > .actions button.researchTabActive {
+  background: var(--nomad-highlight) !important;
+  color: var(--nomad-highlight-ink) !important;
+  border-color: rgba(255,216,77,.8) !important;
+  font-weight: 900;
+}
+
+/* Home attention should stay focused instead of becoming a scanner log. */
+.attentionMore { margin-top: 6px; border-top: 1px solid #26384d; }
+.attentionMore summary {
+  cursor: pointer;
+  padding: 10px 0 2px;
+  color: var(--nomad-highlight);
+  font-size: 10px;
+  font-weight: 850;
+}
+.attentionItem.compact { padding: 9px 0; }
+
+/* Portfolio graph: closer to a broker dashboard, but computed from NOMAD holdings. */
+.portfolioBrokerChart {
+  padding: 18px 18px 12px;
+  background: #152131;
+  border-color: #314257;
+  border-top: 1px solid #314257;
+}
+.portfolioChartToolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 4px 0 8px;
+}
+.portfolioChartRange {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 38px;
+  height: 28px;
+  padding: 0 10px;
+  border-radius: 7px;
+  border: 1px solid #42546b;
+  color: #a9b7c7;
+  font-size: 10px;
+  font-weight: 850;
+}
+.portfolioChartRange.active {
+  background: var(--nomad-highlight);
+  border-color: var(--nomad-highlight);
+  color: var(--nomad-highlight-ink);
+}
+.portfolioChartSource,
+.portfolioChartAsOf { color:#8092a8; font-size:9px; }
+.portfolioBrokerSvg { height: 250px; }
+.portfolioChartAxisText { fill:#728398; font-size:11px; font-family:system-ui,sans-serif; }
+.portfolioBrokerChart .portfolioChartLine { stroke:#ff7a1a; stroke-width:3; }
+.portfolioBrokerChart .portfolioChartArea { fill:rgba(255,122,26,.10); }
+.portfolioBrokerChart .portfolioChartGrid { stroke:#334153; }
+
+
+@media (min-width: 901px) {
+  /* Give the positions table the full content width so desktop does not need a browser scrollbar. */
+  .portfolioDashboardGrid {
+    grid-template-columns: 1fr !important;
+  }
+  .portfolioTableScroller {
+    overflow-x: hidden !important;
+    scrollbar-width: none;
+  }
+  .portfolioTableScroller::-webkit-scrollbar { display: none; }
+  .portfolioPositionHeader,
+  .portfolioPositionRow {
+    min-width: 0 !important;
+    grid-template-columns: 70px minmax(165px,1.45fr) 72px 86px 86px 104px 108px 76px 100px;
+  }
+  .portfolioHealthGrid {
+    grid-template-columns: repeat(4,minmax(0,1fr));
+  }
+}
+
+@media (max-width: 900px) {
+  .portfolioBrokerSvg { height: 190px; }
+  .portfolioChartAxisText { font-size:13px; }
+  .portfolioChartToolbar { align-items:flex-start; flex-direction:column; }
+}
+
 </style>
 
 </head>
@@ -39393,12 +39699,26 @@ function renderAttentionFeed(
     !items.length
   ) {
     target.innerHTML =
-      '<div class="emptyState">No material changes are waiting for you right now. NOMAD will surface them here when the scanner detects something meaningful.</div>';
+      '<div class="emptyState">No material changes are waiting for you right now.</div>';
     return;
   }
 
+  const severityRank = { critical: 4, high: 3, medium: 2, low: 1 };
+  const seenSymbols = new Set();
+  const focused = items
+    .slice()
+    .sort((a,b) => (severityRank[String(b?.significance || '').toLowerCase()] || 0) - (severityRank[String(a?.significance || '').toLowerCase()] || 0))
+    .filter(item => {
+      const symbol = String(item?.symbol || '').trim().toUpperCase();
+      if (!symbol || seenSymbols.has(symbol)) return false;
+      seenSymbols.add(symbol);
+      return true;
+    });
+  const visible = focused.slice(0, 5);
+  const hidden = focused.slice(5);
+
   target.innerHTML =
-    items
+    visible
       .map(
         item =>
           '<div class="attentionItem">' +
@@ -39435,7 +39755,12 @@ function renderAttentionFeed(
           '</div>' +
           '</div>'
       )
-      .join('');
+      .join('') +
+    (hidden.length
+      ? '<details class="attentionMore"><summary>Show '+hidden.length+' more changes</summary>' +
+        hidden.map(item => '<div class="attentionItem compact"><div class="attentionSymbol">'+escapeHtml(item.symbol || '-')+'</div><div><div class="attentionSummary">'+escapeHtml(item.summary || 'Meaningful state change detected.')+'</div><div class="attentionTime">'+escapeHtml(relativeTime(item.detected_at))+'</div></div><div class="severityPill '+escapeHtml(item.significance || 'medium')+'">'+escapeHtml(item.significance || 'medium')+'</div></div>').join('') +
+        '</details>'
+      : '');
 }
 
 function renderMoverList(
@@ -39709,6 +40034,62 @@ function portfolioLiveValueChart(series, summary) {
     '</div>';
 }
 
+function portfolioIntradayChartMarkup(result) {
+  const rows = Array.isArray(result?.data) ? result.data : [];
+  if (!result?.available || rows.length < 2) {
+    return '<div class="portfolioLiveChart"><div class="portfolioChartHead"><div><div class="eyebrow">PORTFOLIO PERFORMANCE</div><h2>Intraday value</h2></div><span class="portfolioChartRange active">1D</span></div><div class="portfolioChartEmpty">Intraday portfolio history is unavailable right now. NOMAD will keep trying the connected pyPSX candle feed.</div></div>';
+  }
+
+  const values = rows.map(row => Number(row.value)).filter(Number.isFinite);
+  const current = Number(result.currentValue || values[values.length - 1] || 0);
+  const first = Number(values[0] || current || 0);
+  const changeValue = Number(result.changeValue ?? (current - first));
+  const changePct = Number(result.changePct ?? (first ? changeValue / first * 100 : 0));
+  const cost = Number(result.investedCost || 0);
+  let min = Math.min(...values);
+  let max = Math.max(...values);
+  if (min === max) { min *= .998; max *= 1.002; }
+  const pad = Math.max((max-min)*.10, Math.max(max,1)*.0008);
+  min -= pad; max += pad;
+
+  const W=1000,H=250,L=70,R=18,T=18,B=30;
+  const uw=W-L-R, uh=H-T-B;
+  const x=i => L + (i/(rows.length-1))*uw;
+  const y=v => T + (1-((v-min)/(max-min)))*uh;
+  const poly = rows.map((row,i)=>x(i).toFixed(1)+','+y(Number(row.value)).toFixed(1)).join(' ');
+  const area = L+','+(T+uh)+' '+poly+' '+(W-R)+','+(T+uh);
+  const ticks=[max,(max+min)/2,min];
+  const startLabel = new Date(rows[0].timestamp).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+  const endLabel = new Date(rows[rows.length-1].timestamp).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+
+  return '<div class="portfolioLiveChart portfolioBrokerChart">' +
+    '<div class="portfolioChartHead"><div><div class="eyebrow">PORTFOLIO PERFORMANCE</div><h2>Intraday value</h2><div class="portfolioChartAsOf">'+escapeHtml(result?.marketStatus?.isOpen ? 'Live session' : 'Latest completed session')+' · '+escapeHtml(relativeTime(result.asOf))+'</div></div>' +
+    '<div class="portfolioChartValue"><strong>'+portfolioMoney(current)+'</strong><span class="'+percentClass(changePct)+'">'+(changeValue>0?'+':'')+portfolioMoney(changeValue)+' · '+(changePct>0?'+':'')+formatNumber(changePct,2)+'%</span></div></div>' +
+    '<div class="portfolioChartToolbar"><span class="portfolioChartRange active">1D</span><span class="portfolioChartSource">'+escapeHtml(result.holdingsCovered)+'/'+escapeHtml(result.holdingsTotal)+' holdings · pyPSX intraday</span></div>' +
+    '<svg viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none" class="portfolioValueSvg portfolioBrokerSvg" aria-label="Intraday portfolio value chart">' +
+    ticks.map(v=>'<line x1="'+L+'" x2="'+(W-R)+'" y1="'+y(v).toFixed(1)+'" y2="'+y(v).toFixed(1)+'" class="portfolioChartGrid" />').join('') +
+    ticks.map(v=>'<text x="4" y="'+(y(v)+4).toFixed(1)+'" class="portfolioChartAxisText">'+escapeHtml('PKR '+formatCompactPKR(v))+'</text>').join('') +
+    '<polygon points="'+area+'" class="portfolioChartArea" />' +
+    '<polyline points="'+poly+'" class="portfolioChartLine" />' +
+    '</svg>' +
+    '<div class="portfolioChartFoot"><span>'+escapeHtml(startLabel)+'</span><span>Cost basis '+portfolioMoney(cost)+'</span><span>'+escapeHtml(endLabel)+'</span></div>' +
+    '</div>';
+}
+
+async function loadPortfolioLiveChart() {
+  const target = $('portfolioLiveChartMount');
+  if (!target) return;
+  try {
+    const result = await api('portfolio-chart');
+    target.innerHTML = portfolioIntradayChartMarkup(result);
+  } catch (error) {
+    const fallback = target.querySelector('.portfolioLiveChart');
+    if (!fallback) {
+      target.innerHTML = '<div class="portfolioLiveChart"><div class="portfolioChartEmpty">Portfolio chart unavailable: '+escapeHtml(error.message || 'intraday feed unavailable')+'</div></div>';
+    }
+  }
+}
+
 function renderPortfolioFull(
   result,
   targetId = 'portfolioFull'
@@ -39852,10 +40233,12 @@ function renderPortfolioFull(
     ) +
     '</strong></div>' +
     '</div>' +
+    '<div id="portfolioLiveChartMount">' +
     portfolioLiveValueChart(
       portfolioValueSeries,
       summary
-    );
+    ) +
+    '</div>';
 
   if (!holdings.length) {
     html +=
@@ -40175,6 +40558,8 @@ function renderPortfolioFull(
     refreshedPortfolioScroller.scrollLeft =
       previousTableScrollLeft;
   }
+
+  loadPortfolioLiveChart().catch(() => {});
 
   target
     .querySelectorAll(
@@ -48046,6 +48431,21 @@ $('nextPage')
         renderStocks();
       }
     };
+
+function setActiveResearchTab(button) {
+  const wrap = document.querySelector('#researchSection > .actions');
+  if (!wrap) return;
+  wrap.querySelectorAll('button').forEach(item => item.classList.remove('researchTabActive'));
+  if (button) button.classList.add('researchTabActive');
+}
+
+const researchActionBar = document.querySelector('#researchSection > .actions');
+if (researchActionBar) {
+  researchActionBar.addEventListener('click', event => {
+    const button = event.target?.closest('button');
+    if (button) setActiveResearchTab(button);
+  });
+}
 
 /* =========================================================
    OVERVIEW BUTTON
