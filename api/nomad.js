@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.3.3';
+const VERSION = '0.9.3.4';
 
 
 const SUPABASE_URL =
@@ -4121,21 +4121,27 @@ async function loadMarketWatchSnapshot(
     marketWatchCache &&
     Date.now() -
       marketWatchCache.fetchedAt <
-      30000
+      10000
   ) {
     return marketWatchCache.data;
   }
 
   const html =
     await fetchText(
-      PSX_MARKET_WATCH_URL,
+      `${PSX_MARKET_WATCH_URL}?_nomad=${Date.now()}`,
       30000,
       {
         Referer:
           `${PSX_DPS_BASE}/`,
 
         'X-Requested-With':
-          'XMLHttpRequest'
+          'XMLHttpRequest',
+
+        'Cache-Control':
+          'no-cache, no-store, max-age=0',
+
+        Pragma:
+          'no-cache'
       }
     );
 
@@ -4256,6 +4262,8 @@ async function loadMarketWatchSnapshot(
     asOf:
       new Date()
         .toISOString(),
+    source:
+      'PSX Data Portal market watch',
     total:
       rows.length,
     rows
@@ -4939,11 +4947,17 @@ async function loadOfficialPSXScreenerSnapshot(
 ) {
   const html =
     await fetchText(
-      PSX_SCREENER_URL,
+      `${PSX_SCREENER_URL}?_nomad=${Date.now()}`,
       30000,
       {
         Referer:
-          `${PSX_DPS_BASE}/`
+          `${PSX_DPS_BASE}/`,
+
+        'Cache-Control':
+          'no-cache, no-store, max-age=0',
+
+        Pragma:
+          'no-cache'
       }
     );
 
@@ -8390,8 +8404,10 @@ async function loadPSXMarket() {
     }
   } catch {}
 
-  // Official Market Watch, when available, is used only for session
-  // OHLCV enrichment. Official screener price/change stays canonical.
+  // Official Market Watch is the freshest canonical Official PSX session
+  // source when available. The Official PSX screener remains the canonical
+  // fallback. pyPSX stays secondary and can never overwrite either official
+  // source.
   try {
     marketWatch =
       await loadMarketWatchSnapshot(
@@ -8427,6 +8443,44 @@ async function loadPSXMarket() {
       if (!watch) {
         continue;
       }
+
+      const watchCurrent =
+        safeNumber(
+          watch.current
+        );
+
+      const watchChangePct =
+        safeNumber(
+          watch.changePct
+        );
+
+      if (
+        watchCurrent !== null &&
+        watchCurrent > 0
+      ) {
+        stock.price =
+          watchCurrent;
+        stock.canonicalMarketPrice =
+          watchCurrent;
+        stock.canonicalMarketAsOf =
+          marketWatch.asOf;
+        stock.canonicalMarketSource =
+          marketWatch.source;
+      }
+
+      if (
+        watchChangePct !== null
+      ) {
+        stock.dayChangePct =
+          watchChangePct;
+        stock.canonicalDayChangePct =
+          watchChangePct;
+        stock.sessionChangeSource =
+          marketWatch.source;
+      }
+
+      stock.marketWatchAsOf =
+        marketWatch.asOf;
 
       stock.previousClose =
         safeNumber(
@@ -8563,9 +8617,15 @@ async function loadPSXMarket() {
               'Unknown',
             price:
               safeNumber(
+                stock?.canonicalMarketPrice
+              ) ??
+              safeNumber(
                 row.price
               ),
             changePct:
+              safeNumber(
+                stock?.canonicalDayChangePct
+              ) ??
               safeNumber(
                 row.changePct
               ),
@@ -8595,6 +8655,7 @@ async function loadPSXMarket() {
             marketFactEligible:
               true,
             source:
+              stock?.canonicalMarketSource ||
               officialScreener?.source ||
               'PSX Data Portal screener'
           };
@@ -8625,11 +8686,15 @@ async function loadPSXMarket() {
           )
         : 'OFFICIAL_UNAVAILABLE',
     canonicalSource:
-      officialScreener?.source ||
-      null,
+      marketWatch?.rows?.length
+        ? marketWatch.source
+        : officialScreener?.source ||
+          null,
     canonicalAsOf:
-      officialScreener?.asOf ||
-      null,
+      marketWatch?.rows?.length
+        ? marketWatch.asOf
+        : officialScreener?.asOf ||
+          null,
     canonicalScope:
       'MAIN_BOARD_ORDINARY_EQUITIES',
     officialTotalRows:
@@ -8757,15 +8822,19 @@ async function loadPSXMarket() {
     rawRows:
       normalizedRows.length,
     asOf:
+      marketWatch?.asOf ||
       officialScreener?.asOf ||
       screener.timestamp ||
       null,
     marketWatchAsOf:
+      marketWatch?.asOf ||
       officialScreener?.asOf ||
       null,
     sessionChangeSource:
-      officialScreener?.source ||
-      null,
+      marketWatch?.rows?.length
+        ? marketWatch.source
+        : officialScreener?.source ||
+          null,
     secondaryMarketSource:
       pyPSXPublicMarket?.source ||
       null,
@@ -20089,6 +20158,15 @@ async function getPortfolioSnapshot() {
     asOf:
       market.marketWatchAsOf ||
       market.asOf,
+    marketSource:
+      market.marketDataIntegrity
+        ?.canonicalSource ||
+      market.sessionChangeSource ||
+      market.sourceName ||
+      'Official PSX Data Portal',
+    marketIntegrity:
+      market.marketDataIntegrity ||
+      null,
     summary,
     health,
     holdings:
@@ -23334,20 +23412,107 @@ async function buildDecisionPortfolioContext(
   market
 ) {
   try {
-    const holdings =
-      await readPortfolioHoldings();
+    const [
+      holdings,
+      transactions
+    ] =
+      await Promise.all([
+        readPortfolioHoldings(),
+        readPortfolioTransactions()
+          .catch(
+            () => ({
+              configured: false,
+              rows: []
+            })
+          )
+      ]);
+
+    // Portfolio context must mirror the same effective positions shown on the
+    // Portfolio page. Transaction-ledger positions therefore override/augment
+    // manual opening holdings instead of being invisible to the allocator.
+    const effectiveHoldings =
+      new Map();
+
+    for (
+      const holding
+      of holdings.rows || []
+    ) {
+      const symbol =
+        normalizeSymbol(
+          holding.symbol
+        );
+
+      if (!symbol) {
+        continue;
+      }
+
+      effectiveHoldings.set(
+        symbol,
+        {
+          ...holding,
+          symbol,
+          ledgerBacked: false
+        }
+      );
+    }
 
     if (
-      !holdings.configured ||
-      !holdings.rows.length
+      transactions.configured &&
+      Array.isArray(
+        transactions.rows
+      )
     ) {
+      const ledger =
+        computePortfolioTransactionLedger(
+          transactions.rows
+        );
+
+      for (
+        const [
+          symbol,
+          state
+        ]
+        of ledger.bySymbol.entries()
+      ) {
+        if (
+          !state ||
+          state.quantity <= 0
+        ) {
+          continue;
+        }
+
+        effectiveHoldings.set(
+          normalizeSymbol(symbol),
+          {
+            symbol:
+              normalizeSymbol(symbol),
+            quantity:
+              state.quantity,
+            average_cost:
+              state.averageCost,
+            purchase_date:
+              state.openDate,
+            ledgerBacked: true
+          }
+        );
+      }
+    }
+
+    if (!effectiveHoldings.size) {
       return {
         configured:
-          holdings.configured,
+          Boolean(
+            holdings.configured ||
+            transactions.configured
+          ),
+        ledgerConfigured:
+          transactions.configured ===
+          true,
         holdingCount: 0,
         currentValuePkr: 0,
         symbolValues: {},
-        sectorValues: {}
+        sectorValues: {},
+        symbols: []
       };
     }
 
@@ -23370,7 +23535,7 @@ async function buildDecisionPortfolioContext(
 
     for (
       const holding
-      of holdings.rows
+      of effectiveHoldings.values()
     ) {
       const symbol =
         normalizeSymbol(
@@ -23433,7 +23598,14 @@ async function buildDecisionPortfolioContext(
     }
 
     return {
-      configured: true,
+      configured:
+        Boolean(
+          holdings.configured ||
+          transactions.configured
+        ),
+      ledgerConfigured:
+        transactions.configured ===
+        true,
       holdingCount:
         Object.keys(
           symbolValues
@@ -23444,15 +23616,21 @@ async function buildDecisionPortfolioContext(
           2
         ),
       symbolValues,
-      sectorValues
+      sectorValues,
+      symbols:
+        Object.keys(
+          symbolValues
+        )
     };
   } catch {
     return {
       configured: false,
+      ledgerConfigured: false,
       holdingCount: 0,
       currentValuePkr: 0,
       symbolValues: {},
-      sectorValues: {}
+      sectorValues: {},
+      symbols: []
     };
   }
 }
@@ -24689,6 +24867,69 @@ function allocateDecisionCenterOpportunities(
         existingSectorValuePaisa -
         existingSectorSpent
       );
+
+    const preAddStockWeightPct =
+      postFundingCapitalBasePaisa > 0
+        ? existingStockValuePaisa /
+          postFundingCapitalBasePaisa
+        : 0;
+
+    const preAddSectorWeightPct =
+      postFundingCapitalBasePaisa > 0
+        ? existingSectorValuePaisa /
+          postFundingCapitalBasePaisa
+        : 0;
+
+    const existingHoldingAddThreshold =
+      dynamicCaps.stockCapPct *
+      0.85;
+
+    const existingSectorAddThreshold =
+      effectiveSectorCapPct *
+      0.85;
+
+    if (
+      existingStockValuePaisa > 0 &&
+      (
+        preAddStockWeightPct >=
+          existingHoldingAddThreshold ||
+        preAddSectorWeightPct >=
+          existingSectorAddThreshold
+      )
+    ) {
+      personalActions.push({
+        symbol:
+          candidate.symbol,
+        marketView:
+          candidate.canonicalState
+            ?.marketAction ||
+          candidate.decisionCenterView,
+        portfolioAction:
+          preAddStockWeightPct >=
+            existingHoldingAddThreshold
+            ? 'HOLD'
+            : 'DO_NOT_ADD',
+        allocationTier:
+          candidate.allocationTier,
+        existingWeightPct:
+          decisionRound(
+            existingStockWeightPct,
+            2
+          ),
+        targetWeightPct:
+          decisionRound(
+            dynamicCaps.stockCapPct *
+            100,
+            2
+          ),
+        reason:
+          preAddStockWeightPct >=
+            existingHoldingAddThreshold
+            ? 'The market thesis remains actionable, but this is already a large portfolio position. NOMAD prioritizes diversification for the next rupee instead of automatically averaging further into the same holding.'
+            : 'The market thesis remains actionable, but this sector already consumes most of the current portfolio allowance. NOMAD searches other eligible opportunities before adding more sector concentration.'
+      });
+      continue;
+    }
 
     const shortTermCandidate =
       candidate?.canonicalState
@@ -36774,6 +37015,7 @@ const METADATA_AUDIT_PAGE_SIZE =
 let liveRefreshTimer = null;
 let portfolioRefreshTimer = null;
 let exploreRefreshTimer = null;
+let homeRefreshTimer = null;
 let exploreRefreshInFlight = false;
 let explorePreviousPrices = new Map();
 
@@ -37541,6 +37783,31 @@ function openAppPage(
       null;
   }
 
+  if (homeRefreshTimer) {
+    clearInterval(
+      homeRefreshTimer
+    );
+    homeRefreshTimer =
+      null;
+  }
+
+  if (page === 'home') {
+    // Home is a live market surface too. Refresh the lightweight intelligence
+    // feed plus portfolio mirror without requiring a browser reload.
+    homeRefreshTimer =
+      setInterval(
+        () => {
+          if (
+            document.visibilityState ===
+            'visible'
+          ) {
+            loadDecisionCenter();
+          }
+        },
+        20000
+      );
+  }
+
   if (page === 'portfolio') {
     loadPortfolioViews();
 
@@ -37554,7 +37821,7 @@ function openAppPage(
             loadPortfolioViews();
           }
         },
-        10000
+        20000
       );
   }
 
@@ -37580,10 +37847,69 @@ function openAppPage(
             );
           }
         },
-        10000
+        20000
       );
   }
 }
+
+async function refreshVisibleLiveSurface() {
+  if (
+    document.visibilityState !==
+    'visible'
+  ) {
+    return;
+  }
+
+  const page =
+    appPageFromLocation();
+
+  if (
+    page === 'home'
+  ) {
+    await loadDecisionCenter();
+    return;
+  }
+
+  if (
+    page === 'portfolio'
+  ) {
+    await loadPortfolioViews();
+    return;
+  }
+
+  if (
+    page === 'explore'
+  ) {
+    await loadExploreMarket(
+      false
+    );
+  }
+}
+
+window.addEventListener(
+  'focus',
+  () => {
+    refreshVisibleLiveSurface()
+      .catch(
+        () => {}
+      );
+  }
+);
+
+document.addEventListener(
+  'visibilitychange',
+  () => {
+    if (
+      document.visibilityState ===
+      'visible'
+    ) {
+      refreshVisibleLiveSurface()
+        .catch(
+          () => {}
+        );
+    }
+  }
+);
 
 function relativeTime(
   value
