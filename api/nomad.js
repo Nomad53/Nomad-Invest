@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.4.0';
+const VERSION = '0.9.4.1';
 
 
 const SUPABASE_URL =
@@ -39705,7 +39705,7 @@ function portfolioLiveValueChart(series, summary) {
     '<polyline points="'+poly+'" class="portfolioChartLine" />' +
     '</svg>' +
     '<div class="portfolioChartFoot"><span>'+escapeHtml(startLabel)+'</span><span>Cost basis '+portfolioMoney(cost)+'</span><span>'+escapeHtml(endLabel)+'</span></div>' +
-    '<div class="portfolioChartNote">Session tracking uses NOMAD\'s verified portfolio snapshots. It builds as live prices refresh and is separate from broker account equity.</div>' +
+    '<div class="portfolioChartNote">Session tracking uses NOMAD\\'s verified portfolio snapshots. It builds as live prices refresh and is separate from broker account equity.</div>' +
     '</div>';
 }
 
