@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.3.5';
+const VERSION = '0.9.3.6';
 
 
 const SUPABASE_URL =
@@ -24602,12 +24602,180 @@ function allocateDecisionCenterOpportunities(
     portfolioContext?.sectorValues ||
     {};
 
-  const candidates =
+  let candidates =
     decisionCenterAllocationCandidatePool(
       opportunityBoard,
       riskPolicy,
       targetPositionCount
     );
+
+  // Build 0.9.3.6: rank the next rupee, not just the stock in isolation.
+  // Investment merit stays dominant. Portfolio fit adjusts sizing and ordering,
+  // but diversification must never force a materially weaker name ahead of a
+  // substantially stronger actionable holding.
+  candidates = candidates
+    .map(candidate => {
+      const meritScore =
+        decisionClamp(
+          safeNumber(
+            candidate.allocationConvictionScore
+          ) ||
+          decisionCenterCandidateConviction(
+            candidate
+          )
+        );
+
+      const existingStockValue =
+        safeNumber(
+          existingSymbolValues[
+            candidate.symbol
+          ]
+        ) ||
+        0;
+
+      const existingSectorValue =
+        safeNumber(
+          existingSectorValues[
+            candidate.sector
+          ]
+        ) ||
+        0;
+
+      const stockWeight =
+        existingPortfolioValuePaisa > 0
+          ? existingStockValue /
+            (existingPortfolioValuePaisa / 100)
+          : 0;
+
+      const sectorWeight =
+        existingPortfolioValuePaisa > 0
+          ? existingSectorValue /
+            (existingPortfolioValuePaisa / 100)
+          : 0;
+
+      const hardStockCap =
+        Math.max(
+          0.01,
+          safeNumber(
+            riskPolicy?.maxStockPct
+          ) ||
+          0.45
+        );
+
+      const hardSectorCap =
+        sectorConstraint
+          ? 1
+          : Math.max(
+              0.01,
+              safeNumber(
+                riskPolicy?.maxSectorPct
+              ) ||
+              0.60
+            );
+
+      let portfolioFitScore = 100;
+
+      if (existingStockValue > 0) {
+        portfolioFitScore -=
+          Math.min(
+            42,
+            stockWeight *
+            100 *
+            1.15
+          );
+      }
+
+      if (existingSectorValue > 0) {
+        portfolioFitScore -=
+          Math.min(
+            24,
+            sectorWeight *
+            100 *
+            0.45
+          );
+      }
+
+      if (
+        stockWeight >=
+          hardStockCap
+      ) {
+        portfolioFitScore -= 25;
+      }
+
+      if (
+        !sectorConstraint &&
+        sectorWeight >=
+          hardSectorCap
+      ) {
+        portfolioFitScore -= 18;
+      }
+
+      portfolioFitScore =
+        decisionClamp(
+          portfolioFitScore
+        );
+
+      const marginalAllocationScore =
+        meritScore *
+          0.82 +
+        portfolioFitScore *
+          0.18;
+
+      const concentrationScale =
+        Math.max(
+          existingStockValue > 0
+            ? 0.30
+            : 0.70,
+          Math.min(
+            1,
+            1 -
+              stockWeight *
+              0.90 -
+              (
+                sectorConstraint
+                  ? 0
+                  : sectorWeight *
+                    0.35
+              )
+          )
+        );
+
+      return {
+        ...candidate,
+        marginalInvestmentMeritScore:
+          decisionRound(
+            meritScore,
+            2
+          ),
+        portfolioFitScore:
+          decisionRound(
+            portfolioFitScore,
+            2
+          ),
+        marginalAllocationScore:
+          decisionRound(
+            marginalAllocationScore,
+            2
+          ),
+        concentrationScale
+      };
+    })
+    .sort((a, b) => {
+      if (
+        a.allocationTier !==
+        b.allocationTier
+      ) {
+        return a.allocationTier ===
+          'PRIORITY_1'
+            ? -1
+            : 1;
+      }
+
+      return (
+        b.marginalAllocationScore -
+        a.marginalAllocationScore
+      );
+    });
 
   // Build 0.9.3.5: concentration caps are derived from the portfolio target,
   // not from the number of currently actionable candidates. Relaxing the cap
@@ -24750,7 +24918,13 @@ function allocateDecisionCenterOpportunities(
             candidate
           )
         ) *
-        candidate.allocationStrengthMultiplier,
+        candidate.allocationStrengthMultiplier *
+        (
+          safeNumber(
+            candidate.concentrationScale
+          ) ||
+          1
+        ),
       0
     );
 
@@ -24800,7 +24974,13 @@ function allocateDecisionCenterOpportunities(
           candidate
         )
       ) *
-      candidate.allocationStrengthMultiplier;
+      candidate.allocationStrengthMultiplier *
+      (
+        safeNumber(
+          candidate.concentrationScale
+        ) ||
+        1
+      );
 
     const proportionalTarget =
       Math.floor(
@@ -24829,10 +25009,24 @@ function allocateDecisionCenterOpportunities(
           100
         : 0;
 
+    const effectiveStockCapPct =
+      existingStockValuePaisa > 0
+        ? Math.max(
+            dynamicCaps.stockCapPct,
+            Math.min(
+              safeNumber(
+                riskPolicy?.maxStockPct
+              ) ||
+              dynamicCaps.stockCapPct,
+              0.75
+            )
+          )
+        : dynamicCaps.stockCapPct;
+
     const stockTotalCap =
       Math.floor(
         postFundingCapitalBasePaisa *
-        dynamicCaps.stockCapPct *
+        effectiveStockCapPct *
         candidate.allocationCapMultiplier
       );
 
@@ -24862,10 +25056,25 @@ function allocateDecisionCenterOpportunities(
       ) ||
       0;
 
+    const effectiveCandidateSectorCapPct =
+      existingSectorValuePaisa > 0 &&
+      !sectorConstraint
+        ? Math.max(
+            effectiveSectorCapPct,
+            Math.min(
+              safeNumber(
+                riskPolicy?.maxSectorPct
+              ) ||
+              effectiveSectorCapPct,
+              0.90
+            )
+          )
+        : effectiveSectorCapPct;
+
     const sectorTotalCap =
       Math.floor(
         postFundingCapitalBasePaisa *
-        effectiveSectorCapPct
+        effectiveCandidateSectorCapPct
       );
 
     const sectorGap =
@@ -24876,9 +25085,10 @@ function allocateDecisionCenterOpportunities(
         existingSectorSpent
       );
 
-    // Test the concentration that exists BEFORE deploying the new cash.
-    // Using the post-funding denominator artificially diluted large holdings
-    // and could make an oversized position look eligible for another add.
+    // Build 0.9.3.6: concentration is a sizing penalty before it becomes a
+    // hard veto. A strong existing holding may still receive additional capital
+    // when weaker alternatives would reduce investment quality. The absolute
+    // risk-profile stock/sector caps remain hard limits.
     const preAddStockWeightPct =
       existingPortfolioValuePaisa > 0
         ? existingStockValuePaisa /
@@ -24891,56 +25101,18 @@ function allocateDecisionCenterOpportunities(
           existingPortfolioValuePaisa
         : 0;
 
-    const existingHoldingAddThreshold =
-      dynamicCaps.stockCapPct *
-      0.85;
-
-    const existingSectorAddThreshold =
-      effectiveSectorCapPct *
-      0.85;
-
-    if (
+    const existingHoldingElevated =
       existingStockValuePaisa > 0 &&
-      (
-        preAddStockWeightPct >=
-          existingHoldingAddThreshold ||
-        preAddSectorWeightPct >=
-          existingSectorAddThreshold
-      )
-    ) {
-      personalActions.push({
-        symbol:
-          candidate.symbol,
-        marketView:
-          candidate.canonicalState
-            ?.marketAction ||
-          candidate.decisionCenterView,
-        portfolioAction:
-          preAddStockWeightPct >=
-            existingHoldingAddThreshold
-            ? 'HOLD'
-            : 'DO_NOT_ADD',
-        allocationTier:
-          candidate.allocationTier,
-        existingWeightPct:
-          decisionRound(
-            existingStockWeightPct,
-            2
-          ),
-        targetWeightPct:
-          decisionRound(
-            dynamicCaps.stockCapPct *
-            100,
-            2
-          ),
-        reason:
-          preAddStockWeightPct >=
-            existingHoldingAddThreshold
-            ? 'The market thesis remains actionable, but this is already a large portfolio position. NOMAD prioritizes diversification for the next rupee instead of automatically averaging further into the same holding.'
-            : 'The market thesis remains actionable, but this sector already consumes most of the current portfolio allowance. NOMAD searches other eligible opportunities before adding more sector concentration.'
-      });
-      continue;
-    }
+      preAddStockWeightPct >=
+        dynamicCaps.stockCapPct *
+        0.85;
+
+    const existingSectorElevated =
+      existingSectorValuePaisa > 0 &&
+      !sectorConstraint &&
+      preAddSectorWeightPct >=
+        dynamicCaps.sectorCapPct *
+        0.85;
 
     const shortTermCandidate =
       candidate?.canonicalState
@@ -25255,6 +25427,12 @@ function allocateDecisionCenterOpportunities(
         candidate.opportunityRankScore,
       allocationConvictionScore:
         candidate.allocationConvictionScore,
+      marginalInvestmentMeritScore:
+        candidate.marginalInvestmentMeritScore,
+      portfolioFitScore:
+        candidate.portfolioFitScore,
+      marginalAllocationScore:
+        candidate.marginalAllocationScore,
       evidenceStrength:
         candidate.analystCore
           ?.coverage
@@ -25313,7 +25491,12 @@ function allocateDecisionCenterOpportunities(
         shortTermCandidate
           ? 'The trade setup passes the Trader brain and the position fits the selected profile\'s stop-based risk budget plus portfolio concentration limits.'
           : existingStockValuePaisa > 0
-            ? 'The holding is below NOMAD\'s current target exposure, so some of the new capital can be added without breaching stock or sector limits.'
+            ? (
+                existingHoldingElevated ||
+                existingSectorElevated
+                  ? 'The investment thesis remains strong enough to justify adding, but existing stock/sector concentration reduces the recommended size. NOMAD prefers diversification when comparable-quality alternatives exist, without replacing this holding with a materially weaker idea.'
+                  : 'The holding remains attractive and has room for additional capital within the selected risk profile and portfolio limits.'
+              )
             : candidate.allocationTier ===
                 'PRIORITY_2'
               ? 'The canonical market action is actionable, but this is a lower-priority opportunity, so NOMAD limits the position size.'
@@ -25410,10 +25593,29 @@ function allocateDecisionCenterOpportunities(
           100
         );
 
+      const effectiveRoundingSectorCapPct =
+        existingSectorValuePaisa > 0 &&
+        !sectorConstraint
+          ? Math.max(
+              dynamicCaps.sectorCapPct,
+              Math.min(
+                safeNumber(
+                  riskPolicy?.maxSectorPct
+                ) ||
+                dynamicCaps.sectorCapPct,
+                0.90
+              )
+            )
+          : (
+              sectorConstraint
+                ? 1
+                : dynamicCaps.sectorCapPct
+            );
+
       const sectorTotalCap =
         Math.floor(
           postFundingCapitalBasePaisa *
-          dynamicCaps.sectorCapPct
+          effectiveRoundingSectorCapPct
         );
 
       const shortTermCandidate =
@@ -29698,12 +29900,15 @@ function runDecisionEngineSelfTests() {
   );
 
   assert.ok(
-    portfolioAwareAllocation.allocations.length === 0 ||
     portfolioAwareAllocation.allocations.every(
       item =>
-        item.symbol !== 'VALID'
+        item.symbol !== 'VALID' ||
+        item.postPortfolioWeightPct <=
+          riskBalanced.maxStockPct *
+          100 +
+          0.01
     ),
-    'existing concentration above the balanced stock cap must prevent NOMAD from adding more of the same stock'
+    'portfolio-aware adds may reinforce a strong existing holding, but must remain inside the selected profile hard stock cap'
   );
 
   const dynamicSmall =
@@ -34805,7 +35010,13 @@ tbody tr:hover {
 
 .portfolioTableScroller {
   width: 100%;
+  max-width: 100%;
   overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-x: contain;
+  touch-action: pan-x pan-y;
+  scrollbar-gutter: stable;
 }
 
 .portfolioPositionHeader,
@@ -36014,6 +36225,22 @@ pre {
 
   .opportunityRow {
     gap: 8px;
+  }
+
+  .portfolioTableScroller {
+    width: 100%;
+    max-width: calc(100vw - 50px);
+    overflow-x: scroll !important;
+    overflow-y: hidden !important;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior-x: contain;
+    touch-action: pan-x pan-y !important;
+    pointer-events: auto;
+  }
+
+  .portfolioPositionHeader,
+  .portfolioPositionRow {
+    min-width: 1040px;
   }
 
   .opportunityIdentity strong {
@@ -38257,6 +38484,12 @@ function renderPortfolioFull(
       ? result.transactions
       : [];
 
+  const previousTableScrollLeft =
+    target.querySelector(
+      '.portfolioTableScroller'
+    )?.scrollLeft ||
+    0;
+
   let html =
     '<div class="portfolioLiveStrip"><div><strong>Portfolio mirror</strong> · ' +
     (
@@ -38659,6 +38892,16 @@ function renderPortfolioFull(
 
   target.innerHTML =
     html;
+
+  const refreshedPortfolioScroller =
+    target.querySelector(
+      '.portfolioTableScroller'
+    );
+
+  if (refreshedPortfolioScroller) {
+    refreshedPortfolioScroller.scrollLeft =
+      previousTableScrollLeft;
+  }
 
   target
     .querySelectorAll(
