@@ -9,10 +9,12 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.6.5';
+const VERSION = '0.9.6.6';
 
-// Core production hardening: Ask NOMAD is intentionally disabled so the
+// Core production hardening: Ask NOMAD remains intentionally disabled so the
 // conversational layer cannot interfere with the production decision path.
+// 0.9.6.6 adds Trader plan-integrity guards only; Investor/Trader scoring and
+// portfolio construction remain otherwise frozen.
 const NOMAD_ASK_NOMAD_ENABLED = false;
 
 
@@ -23094,6 +23096,78 @@ function decisionTraderPlanAgeDays(candidate) {
   return Math.max(0, (Date.now() - timestamp) / (24 * 60 * 60 * 1000));
 }
 
+// Production integrity 0.9.6.6: one canonical execution plan is exposed for
+// each Trader view. A market BUY always uses the active trade plan; a WATCH
+// setup may expose the conditional plan. This prevents the UI from showing a
+// different stop/target than the allocator is actually using.
+function decisionTraderCanonicalPlan(professional) {
+  const currentPlan = professional?.tradePlan || null;
+  const conditionalPlan = professional?.conditionalTradePlan || null;
+  const marketAction = String(professional?.marketAction || '').toUpperCase();
+
+  if (marketAction === 'BUY' && currentPlan?.complete === true) {
+    return {
+      kind: 'ACTIVE',
+      source: 'TRADE_PLAN',
+      plan: currentPlan
+    };
+  }
+
+  if (marketAction === 'WATCH' && conditionalPlan?.complete === true) {
+    return {
+      kind: 'CONDITIONAL',
+      source: 'CONDITIONAL_TRADE_PLAN',
+      plan: conditionalPlan
+    };
+  }
+
+  if (currentPlan?.complete === true) {
+    return {
+      kind: 'ACTIVE',
+      source: 'TRADE_PLAN',
+      plan: currentPlan
+    };
+  }
+
+  if (conditionalPlan?.complete === true) {
+    return {
+      kind: 'CONDITIONAL',
+      source: 'CONDITIONAL_TRADE_PLAN',
+      plan: conditionalPlan
+    };
+  }
+
+  return {
+    kind: 'NONE',
+    source: null,
+    plan: null
+  };
+}
+
+function decisionTraderPlanPriceState(currentPrice, plan) {
+  const current = safeNumber(currentPrice);
+  const stop = safeNumber(plan?.stop);
+  const target = safeNumber(plan?.target1);
+
+  if (plan?.complete !== true) {
+    return { state: 'INCOMPLETE', current, stop, target };
+  }
+
+  if (current === null) {
+    return { state: 'UNKNOWN', current, stop, target };
+  }
+
+  if (stop !== null && current <= stop) {
+    return { state: 'INVALIDATED', current, stop, target };
+  }
+
+  if (target !== null && current >= target) {
+    return { state: 'TARGET_REACHED', current, stop, target };
+  }
+
+  return { state: 'OPEN', current, stop, target };
+}
+
 function professionalShortTermView(
   candidate,
   analystGate,
@@ -23155,6 +23229,15 @@ function professionalShortTermView(
       rewardRisk ??
       conditionalTradePlan?.rewardRisk
     );
+
+  const activePlanPriceState =
+    decisionTraderPlanPriceState(
+      candidate?.price,
+      tradePlan
+    );
+
+  const activeTargetStillAhead =
+    activePlanPriceState.state !== 'TARGET_REACHED';
 
   // 0.9.5.0: short-term ranking is deliberately execution-first. Long-term
   // valuation/fundamental weights do not leak into the Trader brain.
@@ -23250,7 +23333,8 @@ function professionalShortTermView(
     riskScore >= 30 &&
     technicalEvidenceScore >= 65 &&
     definedTradePlan &&
-    rewardRisk >= 1.40;
+    rewardRisk >= 1.40 &&
+    activeTargetStillAhead;
 
   if (actionableSetup) {
     return {
@@ -23276,6 +23360,36 @@ function professionalShortTermView(
       opportunityTier: 'PRIORITY_1',
       reason:
         'A defined short-term setup passes trend/price-action, risk, technical-evidence and reward-to-risk gates. Entry, invalidation and target are explicitly defined.'
+    };
+  }
+
+  if (
+    activePlanPriceState.state ===
+      'TARGET_REACHED'
+  ) {
+    return {
+      framework: 'SHORT_TERM_TRADER',
+      thesisStatus: 'TARGET_REACHED',
+      timingScore,
+      timingState:
+        priceAction.timingState,
+      setup,
+      setupFamily,
+      rewardRisk,
+      riskScore,
+      riskState:
+        professionalRiskState(
+          riskScore
+        ),
+      rankingScore,
+      technicalEvidence:
+        traderEvidence,
+      tradePlan,
+      conditionalTradePlan,
+      marketAction: 'WATCH',
+      opportunityTier: 'PRIORITY_2',
+      reason:
+        'The current price has reached or exceeded the active plan target. NOMAD will not issue a fresh BUY above its own target; wait for a new or conditional setup.'
     };
   }
 
@@ -24852,6 +24966,16 @@ function shortTermProfileExecutionDecision(
       currentPlan?.riskPct
     );
 
+  const currentPlanPriceState =
+    decisionTraderPlanPriceState(
+      candidate?.price,
+      currentPlan
+    );
+
+  const currentTargetStillAhead =
+    currentPlanPriceState.state !==
+      'TARGET_REACHED';
+
   const conditionalStopRiskPct =
     safeNumber(
       conditionalPlan?.riskPct
@@ -24922,6 +25046,7 @@ function shortTermProfileExecutionDecision(
     currentRewardRisk !== null &&
     currentRewardRisk >=
       policy.minRewardRisk &&
+    currentTargetStillAhead &&
     (
       currentStopRiskPct === null ||
       currentStopRiskPct <=
@@ -24976,6 +25101,7 @@ function shortTermProfileExecutionDecision(
     currentPlan?.complete === true &&
     currentRewardRisk !== null &&
     currentRewardRisk >= 1.25 &&
+    currentTargetStillAhead &&
     timingScore >=
       policy.minTimingScore &&
     evidenceScore >=
@@ -26905,6 +27031,21 @@ function allocateDecisionCenterOpportunities(
       existingStockValuePaisa +
       spent;
 
+    const canonicalTraderPlanSelection =
+      shortTermCandidate
+        ? decisionTraderCanonicalPlan(
+            candidate.canonicalState
+              ?.professional ||
+            candidate.professional ||
+            {}
+          )
+        : null;
+
+    const canonicalTraderPlan =
+      canonicalTraderPlanSelection
+        ?.plan ||
+      null;
+
     allocations.push({
       symbol:
         candidate.symbol,
@@ -26933,39 +27074,33 @@ function allocateDecisionCenterOpportunities(
       traderPlan:
         shortTermCandidate
           ? {
+              source:
+                canonicalTraderPlanSelection
+                  ?.source ||
+                'TRADE_PLAN',
               setup:
                 candidate.canonicalState
                   ?.professional
                   ?.setup ||
                 null,
               entryLow:
-                candidate.canonicalState
-                  ?.professional
-                  ?.tradePlan
+                canonicalTraderPlan
                   ?.entryLow ??
                 null,
               entryHigh:
-                candidate.canonicalState
-                  ?.professional
-                  ?.tradePlan
+                canonicalTraderPlan
                   ?.entryHigh ??
                 null,
               stop:
-                candidate.canonicalState
-                  ?.professional
-                  ?.tradePlan
+                canonicalTraderPlan
                   ?.stop ??
                 null,
               target1:
-                candidate.canonicalState
-                  ?.professional
-                  ?.tradePlan
+                canonicalTraderPlan
                   ?.target1 ??
                 null,
               rewardRisk:
-                candidate.canonicalState
-                  ?.professional
-                  ?.tradePlan
+                canonicalTraderPlan
                   ?.rewardRisk ??
                 null,
               riskPerShare:
@@ -29364,6 +29499,20 @@ async function runSingleStockStrategy(
       ?.priceAction ||
     null;
 
+  const strategyTraderPlanSelection =
+    horizon === 'short_term'
+      ? decisionTraderCanonicalPlan(
+          canonical.professional ||
+          {}
+        )
+      : null;
+
+  const strategyTraderPlan =
+    strategyTraderPlanSelection
+      ?.plan ||
+    priceAction?.tradePlan ||
+    null;
+
   const volatility =
     safeNumber(
       historicalContext
@@ -29610,48 +29759,48 @@ async function runSingleStockStrategy(
         priceAction?.resistance ??
         null,
       rewardRisk:
-        priceAction?.tradePlan
+        strategyTraderPlan
           ?.rewardRisk ??
         priceAction?.rewardRisk ??
         null,
       entryLow:
-        priceAction?.tradePlan
+        strategyTraderPlan
           ?.entryLow ??
         null,
       entryHigh:
-        priceAction?.tradePlan
+        strategyTraderPlan
           ?.entryHigh ??
         null,
       stop:
-        priceAction?.tradePlan
+        strategyTraderPlan
           ?.stop ??
         null,
       target1:
-        priceAction?.tradePlan
+        strategyTraderPlan
           ?.target1 ??
         null,
       target2:
-        priceAction?.tradePlan
+        strategyTraderPlan
           ?.target2 ??
         null,
       riskPerShare:
-        priceAction?.tradePlan
+        strategyTraderPlan
           ?.riskPerShare ??
         null,
       riskPct:
-        priceAction?.tradePlan
+        strategyTraderPlan
           ?.riskPct ??
         null,
       targetSource:
-        priceAction?.tradePlan
+        strategyTraderPlan
           ?.targetSource ||
         null,
       tradePlanState:
-        priceAction?.tradePlan
+        strategyTraderPlan
           ?.state ||
         'INCOMPLETE',
       invalidation:
-        priceAction?.tradePlan
+        strategyTraderPlan
           ?.invalidation ||
         null,
       conditionalPlanState:
@@ -32426,6 +32575,126 @@ function runDecisionEngineSelfTests() {
     'confirmed short-term setup with acceptable reward-to-risk must be actionable'
   );
 
+  const canonicalDisplayedPlan =
+    decisionTraderCanonicalPlan({
+      marketAction: 'BUY',
+      tradePlan: {
+        complete: true,
+        entryLow: 50,
+        entryHigh: 51,
+        stop: 46,
+        target1: 61.53,
+        rewardRisk: 2.1
+      },
+      conditionalTradePlan: {
+        complete: true,
+        entryLow: 46.90,
+        entryHigh: 46.93,
+        stop: 46.04,
+        target1: 48.49,
+        rewardRisk: 1.81
+      }
+    });
+
+  assert.equal(
+    canonicalDisplayedPlan.source,
+    'TRADE_PLAN',
+    'a Trader market BUY must expose the same active plan used for execution rather than a different conditional plan'
+  );
+
+  assert.equal(
+    canonicalDisplayedPlan.plan.target1,
+    61.53,
+    'the canonical Trader plan target must match the active allocation target'
+  );
+
+  const targetPassedTraderCandidate = {
+    ...longTermProfessionalCandidate,
+    horizon: 'short_term',
+    price: 113,
+    averageVolume30d: 500000,
+    entry: { score: 82 },
+    risk: { score: 72, liquidityScore: 85 },
+    dataQuality: { score: 90 },
+    historicalContext: {
+      available: true,
+      contextSchemaVersion:
+        DECISION_HISTORICAL_CONTEXT_SCHEMA_VERSION,
+      asOf:
+        new Date()
+          .toISOString()
+          .slice(0, 10),
+      validSessions: 120,
+      technical: {
+        rsi14: 58,
+        macdHistogram: 0.8,
+        volumeRatio20d: 1.4,
+        annualizedVolatility20dPct: 32
+      },
+      priceAction: {
+        available: true,
+        timingScore: 82,
+        timingState: 'GOOD',
+        setup: 'CONFIRMED_BREAKOUT',
+        atr14: 3.2,
+        support: 95,
+        resistance: 112,
+        structure: { bias: 'BULLISH' },
+        tradePlan: {
+          complete: true,
+          state: 'DEFINED',
+          entryLow: 100,
+          entryHigh: 101,
+          entryReference: 100.5,
+          stop: 96,
+          target1: 112,
+          target2: 116,
+          riskPerShare: 4.5,
+          riskPct: 4.48,
+          rewardRisk: 2.56
+        },
+        conditionalTradePlan: {
+          complete: true,
+          state: 'WAIT_FOR_RETEST',
+          entryLow: 103,
+          entryHigh: 104,
+          stop: 99,
+          target1: 112,
+          rewardRisk: 1.8
+        }
+      }
+    }
+  };
+
+  targetPassedTraderCandidate.canonicalState =
+    decisionCanonicalCompanyState(
+      targetPassedTraderCandidate
+    );
+
+  targetPassedTraderCandidate.profileSuitability =
+    decisionProfileSuitability(
+      targetPassedTraderCandidate,
+      riskAggressive
+    );
+
+  assert.notEqual(
+    targetPassedTraderCandidate.canonicalState.marketAction,
+    'BUY',
+    'Trader brain must never issue a fresh BUY when the current price has already reached or exceeded the active target'
+  );
+
+  const targetPassedAggressiveExecution =
+    shortTermProfileExecutionDecision(
+      targetPassedTraderCandidate,
+      riskAggressive
+    );
+
+  assert.equal(
+    targetPassedAggressiveExecution.actionableNow,
+    false,
+    'Aggressive execution must not resurrect a BUY after the active target has already been reached'
+  );
+
   const shortTermAllocationCandidate = {
     ...longTermProfessionalCandidate,
     symbol: 'TRADER1',
@@ -32541,6 +32810,19 @@ function runDecisionEngineSelfTests() {
     shortTermRiskSized.allocations[0].principalPkr <= 10000.01,
     'Balanced short-term sizing must respect the 1% capital-at-risk budget when stop risk is PKR 10 per share at a PKR 100 price'
   );
+
+  if (shortTermRiskSized.allocations.length) {
+    assert.equal(
+      shortTermRiskSized.allocations[0].traderPlan.target1,
+      shortTermAllocationCandidate.canonicalState.professional.tradePlan.target1,
+      'the allocator must carry the exact same canonical Trader target shown for the active market plan'
+    );
+    assert.equal(
+      shortTermRiskSized.allocations[0].traderPlan.stop,
+      shortTermAllocationCandidate.canonicalState.professional.tradePlan.stop,
+      'the allocator must carry the exact same canonical Trader stop shown for the active market plan'
+    );
+  }
 
 
   const triggerFundingSynthetic =
@@ -52307,8 +52589,15 @@ function renderOpportunityList(
         const isShortTerm =
           professional.framework ===
             'SHORT_TERM_TRADER';
+        const canonicalPlanSelection =
+          isShortTerm
+            ? decisionTraderCanonicalPlan(
+                professional
+              )
+            : null;
         const plan =
-          professional.conditionalTradePlan ||
+          canonicalPlanSelection
+            ?.plan ||
           null;
         const execution =
           item.shortTermExecution ||
@@ -52335,7 +52624,9 @@ function renderOpportunityList(
           isShortTerm && plan?.complete
             ? (
                 '<div class="tradeQuickLine">' +
-                '<span class="tradeMetric trigger"><small>Trigger</small><strong>PKR ' +
+                '<span class="tradeMetric trigger"><small>' +
+                (canonicalPlanSelection?.kind === 'ACTIVE' ? 'Entry' : 'Trigger') +
+                '</small><strong>PKR ' +
                 formatNumber(plan.entryLow, 2) +
                 '–' +
                 formatNumber(plan.entryHigh, 2) +
