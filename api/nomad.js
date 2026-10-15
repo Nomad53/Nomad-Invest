@@ -9,12 +9,14 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.6.7';
+const VERSION = '0.9.6.8';
 
 // Core production hardening: Ask NOMAD remains intentionally disabled so the
 // conversational layer cannot interfere with the production decision path.
-// 0.9.6.7 adds a read-only execution-price layer and Trader plan-integrity
-// guards. Investor/Trader scoring, ranking and portfolio construction stay frozen.
+// 0.9.6.8 hardens the execution-to-allocation handoff: only an execution state
+// that explicitly permits a purchase may receive capital. It also labels every
+// rendered Decision Center result with the exact horizon/risk profile that was
+// analyzed. Investor/Trader scoring and ranking remain frozen.
 const NOMAD_ASK_NOMAD_ENABLED = false;
 
 
@@ -23783,6 +23785,38 @@ function decisionExecutionGuidance(
   };
 }
 
+
+function decisionExecutionAllowsAllocation(
+  guidance
+) {
+  const status =
+    String(
+      guidance?.status ||
+      ''
+    ).toUpperCase();
+  const action =
+    String(
+      guidance?.action ||
+      ''
+    ).toUpperCase();
+
+  if (status === 'BUY_NOW') {
+    return (
+      action === 'BUY' ||
+      action === 'BUY_SMALL'
+    );
+  }
+
+  if (status === 'STAGED_BUY') {
+    return (
+      action === 'BUY' ||
+      action === 'ACCUMULATE'
+    );
+  }
+
+  return false;
+}
+
 function professionalShortTermView(
   candidate,
   analystGate,
@@ -26516,10 +26550,26 @@ function shortTermDecisionStabilityAudit(
     );
   }
 
-  const allocationPrincipalPaisa =
-    (Array.isArray(allocation?.allocations)
+  const immediateAllocations =
+    Array.isArray(allocation?.allocations)
       ? allocation.allocations
-      : [])
+      : [];
+
+  for (const item of immediateAllocations) {
+    if (
+      !decisionExecutionAllowsAllocation(
+        item?.executionGuidance
+      )
+    ) {
+      issues.push(
+        String(item?.symbol || 'Unknown') +
+        ' received buy-now capital despite a non-actionable execution state.'
+      );
+    }
+  }
+
+  const allocationPrincipalPaisa =
+    immediateAllocations
       .reduce(
         (sum, item) =>
           sum +
@@ -26594,6 +26644,12 @@ function decisionCenterAllocationCandidatePool(
             decisionProfileSuitability(
               item,
               riskPolicy
+            ),
+          executionGuidance:
+            item?.executionGuidance ||
+            decisionExecutionGuidance(
+              item,
+              riskPolicy
             )
         })
       )
@@ -26620,6 +26676,9 @@ function decisionCenterAllocationCandidatePool(
           return (
             wrapped.profileSuitability
               ?.state === 'SUITABLE' &&
+            decisionExecutionAllowsAllocation(
+              wrapped.executionGuidance
+            ) &&
             (
               shortTermMode
                 ? execution
@@ -26774,6 +26833,8 @@ function decisionCenterAllocationCandidatePool(
             ...item,
             profileSuitability,
             shortTermExecution,
+            executionGuidance:
+              wrapped.executionGuidance,
             allocationAction:
               action,
             allocationTier:
@@ -27341,6 +27402,18 @@ function allocateDecisionCenterOpportunities(
         targetPositionCount
     ) {
       break;
+    }
+
+    if (
+      !decisionExecutionAllowsAllocation(
+        candidate.executionGuidance ||
+        decisionExecutionGuidance(
+          candidate,
+          riskPolicy
+        )
+      )
+    ) {
+      continue;
     }
 
     const pricePaisa =
@@ -31341,6 +31414,9 @@ async function runDecisionLab(
             ?.state === 'SUITABLE' &&
           safeNumber(candidate.price) !== null &&
           safeNumber(candidate.price) <= amount &&
+          decisionExecutionAllowsAllocation(
+            candidate.executionGuidance
+          ) &&
           (
             horizon === 'short_term'
               ? candidate.shortTermExecution
@@ -33408,6 +33484,59 @@ function runDecisionEngineSelfTests() {
     'execution layer must explicitly block a new buy after the target has been reached'
   );
 
+  assert.equal(
+    decisionExecutionAllowsAllocation(
+      targetReachedCandidate.executionGuidance
+    ),
+    false,
+    'DO_NOT_CHASE must never be allowed through the allocation gate'
+  );
+
+  const targetReachedBoard =
+    buildDecisionOpportunityBoard([
+      targetReachedCandidate
+    ]);
+
+  const targetReachedAllocation =
+    allocateDecisionCenterOpportunities(
+      targetReachedBoard,
+      100000,
+      riskAggressive
+    );
+
+  assert.equal(
+    targetReachedAllocation.amountInvestedPkr,
+    0,
+    'a short-term setup marked DO_NOT_CHASE must receive PKR 0 immediate allocation'
+  );
+
+  assert.equal(
+    targetReachedAllocation.allocations.length,
+    0,
+    'a short-term setup marked DO_NOT_CHASE must not appear in funded allocations'
+  );
+
+  for (
+    const blockedExecutionStatus
+    of [
+      'WAIT_FOR_ENTRY',
+      'WAIT_FOR_CONFIRMATION',
+      'DO_NOT_CHASE',
+      'INVALIDATED',
+      'PROFILE_BLOCKED'
+    ]
+  ) {
+    assert.equal(
+      decisionExecutionAllowsAllocation({
+        status: blockedExecutionStatus,
+        action: 'NO_BUY'
+      }),
+      false,
+      blockedExecutionStatus +
+      ' must be a hard PKR 0 execution gate'
+    );
+  }
+
   const longTermExecutionCandidate = {
     ...longTermProfessionalCandidate,
     horizon: 'long_term',
@@ -33588,6 +33717,13 @@ function runDecisionEngineSelfTests() {
       shortTermRiskSized.allocations[0].executionGuidance.orderType,
       'LIMIT',
       'an actionable short-term allocation must include a LIMIT execution instruction'
+    );
+    assert.equal(
+      decisionExecutionAllowsAllocation(
+        shortTermRiskSized.allocations[0].executionGuidance
+      ),
+      true,
+      'every funded short-term position must carry an execution state that explicitly permits buying'
     );
   }
 
@@ -41054,7 +41190,7 @@ Checking connection...
 </div>
 
 <div class="terminalCard decisionVerdictCard">
-<div class="panelHeader"><div><div class="eyebrow">CAPITAL DECISION</div><h2>What NOMAD would do now</h2></div></div>
+<div class="panelHeader"><div><div class="eyebrow">CAPITAL DECISION</div><h2 id="decisionVerdictTitle">What NOMAD would do now</h2></div></div>
 <div id="decisionResult" class="decisionResult">Run an analysis to generate the current ranked opportunity board and a separate whole-share allocation for your amount.</div>
 </div>
 </div>
@@ -55053,6 +55189,32 @@ function renderShadowDecision(
   const decision =
     result.decision;
 
+  const decisionVerdictTitle =
+    $('decisionVerdictTitle');
+
+  if (decisionVerdictTitle) {
+    const horizonLabel =
+      result?.input?.horizon === 'short_term'
+        ? 'Short-term'
+        : 'Long-term';
+    const riskLabel =
+      String(
+        result?.input?.risk ||
+        'balanced'
+      )
+        .replace(/_/g, ' ')
+        .replace(
+          /\b\w/g,
+          character => character.toUpperCase()
+        );
+
+    decisionVerdictTitle.textContent =
+      'What NOMAD will do — ' +
+      horizonLabel +
+      ' / ' +
+      riskLabel;
+  }
+
   const allocations =
     Array.isArray(
       result.allocations
@@ -55812,6 +55974,22 @@ if ($('findBestOption')) {
         button.textContent =
           'Analyzing PSX...';
 
+        if ($('decisionVerdictTitle')) {
+          const horizonLabel =
+            context.horizon === 'short_term'
+              ? 'Short-term'
+              : 'Long-term';
+          const riskLabel =
+            String(context.risk || 'balanced')
+              .replace(/_/g, ' ')
+              .replace(/\b\w/g, character => character.toUpperCase());
+          $('decisionVerdictTitle').textContent =
+            'Analyzing — ' +
+            horizonLabel +
+            ' / ' +
+            riskLabel;
+        }
+
         $('decisionResult')
           .innerHTML =
             '<div class="decisionShadowBanner">SHADOW</div>' +
@@ -55829,6 +56007,21 @@ if ($('findBestOption')) {
             result
           );
         } catch (error) {
+          if ($('decisionVerdictTitle')) {
+            const horizonLabel =
+              context.horizon === 'short_term'
+                ? 'Short-term'
+                : 'Long-term';
+            const riskLabel =
+              String(context.risk || 'balanced')
+                .replace(/_/g, ' ')
+                .replace(/\b\w/g, character => character.toUpperCase());
+            $('decisionVerdictTitle').textContent =
+              'Analysis failed — ' +
+              horizonLabel +
+              ' / ' +
+              riskLabel;
+          }
           $('decisionResult')
             .innerHTML =
               '<strong>Decision engine unavailable.</strong><br>' +
