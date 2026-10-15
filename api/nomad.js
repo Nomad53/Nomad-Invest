@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.6.4';
+const VERSION = '0.9.7.0';
 
 
 const SUPABASE_URL =
@@ -22340,6 +22340,773 @@ function decisionEvidenceProfile(
 
 
 /* =========================================================
+   EVIDENCE INTELLIGENCE LAYER - BUILD 0.9.7.0 (SHADOW ONLY)
+
+   PURPOSE
+   - Separate missing evidence from negative evidence.
+   - Judge whether the available evidence is sufficient for the specific
+     decision being asked (long-term investor vs short-term trader).
+   - Track known / partial / unknown / stale / conflicting evidence by domain.
+   - Produce an independent confidence view without changing the live brain.
+
+   SAFETY / REGRESSION RULE
+   - This layer is observational. It MUST NOT change marketAction,
+     opportunityTier, allocationPermission, profile suitability, position
+     sizing, trigger logic or any other live Investor / Trader output.
+   - Promotion into live decision logic requires a separate validated build.
+========================================================= */
+
+const EVIDENCE_INTELLIGENCE_VERSION = 'EIL-SHADOW-0.1';
+
+function evidenceIntelligenceAgeDays(value) {
+  const timestamp = Date.parse(String(value || ''));
+  if (!Number.isFinite(timestamp)) {
+    return null;
+  }
+  return Math.max(
+    0,
+    (Date.now() - timestamp) /
+      (24 * 60 * 60 * 1000)
+  );
+}
+
+function evidenceIntelligenceConflictText(candidate) {
+  const diagnostics =
+    candidate?.fundamentalEvidenceDiagnostics ||
+    null;
+
+  let text = '';
+  try {
+    text = diagnostics
+      ? JSON.stringify(diagnostics)
+      : '';
+  } catch {
+    text = String(diagnostics || '');
+  }
+
+  return text.toLowerCase();
+}
+
+function evidenceIntelligenceStatus({
+  coveragePct,
+  stale = false,
+  conflicting = false
+}) {
+  const coverage =
+    decisionClamp(
+      safeNumber(coveragePct) ?? 0
+    );
+
+  if (conflicting) {
+    return 'CONFLICTING';
+  }
+
+  if (coverage <= 0) {
+    return 'UNKNOWN';
+  }
+
+  if (stale) {
+    return 'STALE';
+  }
+
+  if (coverage < 70) {
+    return 'PARTIAL';
+  }
+
+  return 'KNOWN';
+}
+
+function buildDecisionEvidenceIntelligence(
+  candidate,
+  analystGate,
+  evidence,
+  professional
+) {
+  const horizon =
+    String(
+      candidate?.horizon ||
+      'long_term'
+    ) === 'short_term'
+      ? 'short_term'
+      : 'long_term';
+
+  const shortTerm =
+    horizon === 'short_term';
+
+  const analyst =
+    candidate?.analystCore ||
+    null;
+
+  const context =
+    candidate?.historicalContext ||
+    {};
+
+  const technical =
+    context?.technical ||
+    {};
+
+  const priceAction =
+    context?.priceAction ||
+    {};
+
+  const tradePlan =
+    priceAction?.tradePlan ||
+    null;
+
+  const conditionalTradePlan =
+    priceAction?.conditionalTradePlan ||
+    null;
+
+  const marketAgeDays =
+    evidenceIntelligenceAgeDays(
+      candidate?.marketAsOf
+    );
+
+  const technicalAgeDays =
+    evidenceIntelligenceAgeDays(
+      context?.asOf ||
+      priceAction?.asOf
+    );
+
+  const conflictText =
+    evidenceIntelligenceConflictText(
+      candidate
+    );
+
+  const hasFundamentalConflict =
+    /\b(conflict|mismatch|inconsistent|disagreement)\b/
+      .test(conflictText);
+
+  const marketMissing = [];
+  let marketCoverage = 0;
+
+  if (safeNumber(candidate?.price) !== null) {
+    marketCoverage += 70;
+  } else {
+    marketMissing.push('current price');
+  }
+
+  if (candidate?.marketAsOf) {
+    marketCoverage += 30;
+  } else {
+    marketMissing.push('market timestamp');
+  }
+
+  const marketStaleThresholdDays =
+    shortTerm ? 4 : 10;
+
+  const marketStale =
+    marketAgeDays !== null &&
+    marketAgeDays > marketStaleThresholdDays;
+
+  const marketDomain = {
+    required: true,
+    status: evidenceIntelligenceStatus({
+      coveragePct: marketCoverage,
+      stale: marketStale
+    }),
+    coveragePct:
+      decisionRound(
+        marketCoverage,
+        2
+      ),
+    missing: marketMissing,
+    stale: marketStale,
+    conflicting: false,
+    ageDays:
+      decisionRound(
+        marketAgeDays,
+        2
+      ),
+    note:
+      marketStale
+        ? 'Market evidence exists but is old for the current decision horizon.'
+        : marketCoverage >= 70
+          ? 'Current market price evidence is available.'
+          : 'Current market evidence is incomplete.'
+  };
+
+  const technicalMissing = [];
+  let technicalCoverage = 0;
+
+  if (context?.available) {
+    technicalCoverage += 15;
+  } else {
+    technicalMissing.push('price history');
+  }
+
+  if (
+    safeNumber(context?.validSessions) !== null &&
+    safeNumber(context?.validSessions) >=
+      Math.min(
+        DECISION_TRADER_MIN_VALID_SESSIONS,
+        80
+      )
+  ) {
+    technicalCoverage += 10;
+  } else {
+    technicalMissing.push('sufficient historical sessions');
+  }
+
+  if (priceAction?.available) {
+    technicalCoverage += 15;
+  } else {
+    technicalMissing.push('price-action structure');
+  }
+
+  if (safeNumber(technical?.rsi14) !== null) {
+    technicalCoverage += 10;
+  } else {
+    technicalMissing.push('RSI');
+  }
+
+  if (safeNumber(technical?.macdHistogram) !== null) {
+    technicalCoverage += 10;
+  } else {
+    technicalMissing.push('MACD');
+  }
+
+  if (safeNumber(technical?.volumeRatio20d) !== null) {
+    technicalCoverage += 10;
+  } else {
+    technicalMissing.push('volume confirmation');
+  }
+
+  if (safeNumber(priceAction?.atr14) !== null) {
+    technicalCoverage += 10;
+  } else {
+    technicalMissing.push('ATR');
+  }
+
+  if (safeNumber(priceAction?.support) !== null) {
+    technicalCoverage += 5;
+  } else {
+    technicalMissing.push('support');
+  }
+
+  if (safeNumber(priceAction?.resistance) !== null) {
+    technicalCoverage += 5;
+  } else {
+    technicalMissing.push('resistance');
+  }
+
+  if (
+    tradePlan?.complete === true ||
+    conditionalTradePlan?.complete === true
+  ) {
+    technicalCoverage += 10;
+  } else {
+    technicalMissing.push('complete trade plan');
+  }
+
+  const technicalStaleThresholdDays =
+    shortTerm ? 5 : 14;
+
+  const technicalStale =
+    technicalAgeDays !== null &&
+    technicalAgeDays > technicalStaleThresholdDays;
+
+  const technicalDomain = {
+    required: shortTerm,
+    status: evidenceIntelligenceStatus({
+      coveragePct: technicalCoverage,
+      stale: technicalStale
+    }),
+    coveragePct:
+      decisionRound(
+        technicalCoverage,
+        2
+      ),
+    missing:
+      uniqueTextValues(
+        technicalMissing
+      ),
+    stale: technicalStale,
+    conflicting: false,
+    ageDays:
+      decisionRound(
+        technicalAgeDays,
+        2
+      ),
+    note:
+      shortTerm
+        ? 'Technical evidence is decision-critical for the Trader brain.'
+        : 'Technical evidence supports long-term entry timing but does not define the investment thesis.'
+  };
+
+  const summaryCoverage =
+    safeNumber(
+      analyst?.coverage
+        ?.summaryCoveragePct ??
+      analyst?.coverage
+        ?.coreCoveragePct
+    ) ??
+    0;
+
+  const extendedCoverage =
+    safeNumber(
+      analyst?.coverage
+        ?.extendedCoveragePct
+    ) ??
+    0;
+
+  const fundamentalCoverage =
+    analyst
+      ? decisionClamp(
+          summaryCoverage * 0.75 +
+          extendedCoverage * 0.25
+        )
+      : 0;
+
+  const fundamentalMissing =
+    uniqueTextValues([
+      ...(
+        analyst?.coverage
+          ?.coreMetricsMissing ||
+        []
+      ),
+      ...(
+        analyst?.coverage
+          ?.extendedMetricsMissing ||
+        []
+      )
+    ]);
+
+  if (!analyst) {
+    fundamentalMissing.push(
+      'financial analyst evidence'
+    );
+  }
+
+  const fundamentalState =
+    String(
+      candidate?.fundamentalEvidenceState ||
+      ''
+    );
+
+  const fundamentalStale =
+    fundamentalState === 'CACHE_FALLBACK';
+
+  const fundamentalDomain = {
+    required: !shortTerm,
+    status: evidenceIntelligenceStatus({
+      coveragePct: fundamentalCoverage,
+      stale: fundamentalStale,
+      conflicting: hasFundamentalConflict
+    }),
+    coveragePct:
+      decisionRound(
+        fundamentalCoverage,
+        2
+      ),
+    summaryCoveragePct:
+      decisionRound(
+        summaryCoverage,
+        2
+      ),
+    extendedCoveragePct:
+      decisionRound(
+        extendedCoverage,
+        2
+      ),
+    missing:
+      uniqueTextValues(
+        fundamentalMissing
+      ),
+    stale: fundamentalStale,
+    conflicting:
+      hasFundamentalConflict,
+    evidenceState:
+      fundamentalState ||
+      null,
+    negativeEvidence:
+      analystGate?.state ===
+        'REJECT',
+    note:
+      shortTerm
+        ? 'Fundamentals are useful context but are not a mandatory Trader-brain input.'
+        : analystGate?.state === 'REJECT'
+          ? 'Financial evidence is sufficiently explicit to support a negative conclusion; negative evidence is not treated as missing evidence.'
+          : 'Financial evidence determines long-term thesis confidence. Missing fields reduce confidence rather than becoming negative facts.'
+  };
+
+  const liquidityMissing = [];
+  let liquidityCoverage = 0;
+
+  if (
+    safeNumber(
+      candidate?.averageVolume30d
+    ) !== null
+  ) {
+    liquidityCoverage += 50;
+  } else {
+    liquidityMissing.push(
+      '30-day average volume'
+    );
+  }
+
+  if (
+    safeNumber(
+      candidate?.risk?.liquidityScore
+    ) !== null
+  ) {
+    liquidityCoverage += 50;
+  } else {
+    liquidityMissing.push(
+      'liquidity score'
+    );
+  }
+
+  const liquidityDomain = {
+    required: shortTerm,
+    status: evidenceIntelligenceStatus({
+      coveragePct: liquidityCoverage
+    }),
+    coveragePct:
+      decisionRound(
+        liquidityCoverage,
+        2
+      ),
+    missing: liquidityMissing,
+    stale: false,
+    conflicting: false,
+    note:
+      shortTerm
+        ? 'Liquidity evidence is required for practical short-term execution and sizing.'
+        : 'Liquidity is a supporting long-term risk input unless it becomes extreme.'
+  };
+
+  const valuationKnown =
+    safeNumber(
+      candidate?.valuation?.score
+    ) !== null;
+
+  const riskKnown =
+    safeNumber(
+      candidate?.risk?.score
+    ) !== null;
+
+  const longTermContextCoverage =
+    (
+      valuationKnown ? 50 : 0
+    ) +
+    (
+      riskKnown ? 50 : 0
+    );
+
+  const longTermContextMissing = [];
+  if (!valuationKnown) {
+    longTermContextMissing.push(
+      'valuation context'
+    );
+  }
+  if (!riskKnown) {
+    longTermContextMissing.push(
+      'risk context'
+    );
+  }
+
+  const longTermContextDomain = {
+    required: !shortTerm,
+    status: evidenceIntelligenceStatus({
+      coveragePct:
+        longTermContextCoverage
+    }),
+    coveragePct:
+      decisionRound(
+        longTermContextCoverage,
+        2
+      ),
+    missing:
+      longTermContextMissing,
+    stale: false,
+    conflicting: false,
+    note:
+      'Valuation and risk context help distinguish a good company from a good long-term investment at the current price.'
+  };
+
+  const corporateEvidence =
+    Array.isArray(candidate?.announcements)
+      ? candidate.announcements
+      : Array.isArray(candidate?.events)
+        ? candidate.events
+        : Array.isArray(candidate?.corporateActions)
+          ? candidate.corporateActions
+          : null;
+
+  const corporateDomain = {
+    required: false,
+    status:
+      corporateEvidence
+        ? 'KNOWN'
+        : 'UNKNOWN',
+    coveragePct:
+      corporateEvidence
+        ? 100
+        : 0,
+    missing:
+      corporateEvidence
+        ? []
+        : ['current event / announcement context'],
+    stale: false,
+    conflicting: false,
+    note:
+      corporateEvidence
+        ? 'Current corporate/event context is available to the candidate.'
+        : 'Corporate/event context was not attached to this candidate. It remains unknown and is not automatically treated as negative evidence.'
+  };
+
+  const domains = {
+    market: marketDomain,
+    technical: technicalDomain,
+    fundamentals: fundamentalDomain,
+    liquidity: liquidityDomain,
+    longTermContext:
+      longTermContextDomain,
+    corporateEvents:
+      corporateDomain
+  };
+
+  const blockers = [];
+  const limitations = [];
+
+  if (
+    marketDomain.status === 'UNKNOWN' ||
+    marketDomain.status === 'STALE' ||
+    marketDomain.status === 'CONFLICTING'
+  ) {
+    blockers.push(
+      'Reliable current market evidence is not sufficient.'
+    );
+  }
+
+  let sufficiencyState = 'SUFFICIENT';
+  let sufficiencyLevel = 'DECISION_READY';
+
+  if (shortTerm) {
+    if (
+      technicalDomain.status === 'UNKNOWN' ||
+      technicalDomain.status === 'STALE' ||
+      technicalDomain.status === 'CONFLICTING' ||
+      technicalDomain.coveragePct < 60
+    ) {
+      blockers.push(
+        'Short-term technical evidence is not sufficient for a dependable Trader-brain conclusion.'
+      );
+    }
+
+    if (
+      liquidityDomain.status === 'UNKNOWN' ||
+      liquidityDomain.coveragePct < 50
+    ) {
+      blockers.push(
+        'Execution/liquidity evidence is incomplete for a short-term trade decision.'
+      );
+    }
+
+    if (
+      professional?.marketAction === 'BUY' &&
+      tradePlan?.complete !== true
+    ) {
+      blockers.push(
+        'An actionable short-term BUY requires a complete entry, stop and target plan.'
+      );
+    }
+
+    if (
+      fundamentalDomain.status === 'UNKNOWN' ||
+      fundamentalDomain.status === 'PARTIAL'
+    ) {
+      limitations.push(
+        'Fundamental evidence is incomplete, but it is not mandatory for the current short-term decision.'
+      );
+    }
+
+    if (corporateDomain.status === 'UNKNOWN') {
+      limitations.push(
+        'Current corporate-event context is not attached; this remains an explicit unknown rather than a negative score.'
+      );
+    }
+  } else {
+    if (
+      fundamentalDomain.status === 'UNKNOWN' ||
+      fundamentalDomain.status === 'CONFLICTING' ||
+      analystGate?.state === 'RESEARCHING' ||
+      analystGate?.validationTier === 'SECTOR_MODEL_REQUIRED'
+    ) {
+      blockers.push(
+        'Long-term financial evidence is not sufficient for a dependable high-conviction thesis.'
+      );
+    }
+
+    if (
+      longTermContextDomain.status === 'UNKNOWN' ||
+      longTermContextDomain.coveragePct < 100
+    ) {
+      blockers.push(
+        'Long-term valuation/risk context is incomplete.'
+      );
+    }
+
+    if (
+      fundamentalDomain.status === 'PARTIAL' ||
+      analystGate?.state === 'PARTIALLY_VALIDATED' ||
+      extendedCoverage < 67
+    ) {
+      limitations.push(
+        'Headline financial evidence may be usable, but extended statement validation is incomplete.'
+      );
+    }
+
+    if (
+      technicalDomain.status === 'UNKNOWN' ||
+      technicalDomain.status === 'PARTIAL'
+    ) {
+      limitations.push(
+        'Technical evidence is incomplete; long-term thesis quality can still be assessed, but entry-timing confidence is lower.'
+      );
+    }
+
+    if (corporateDomain.status === 'UNKNOWN') {
+      limitations.push(
+        'Current corporate-event context is not attached; it is treated as unknown, not negative.'
+      );
+    }
+  }
+
+  if (blockers.length) {
+    sufficiencyState = 'INSUFFICIENT';
+    sufficiencyLevel = 'RESEARCH_REQUIRED';
+  } else if (limitations.length) {
+    sufficiencyState = 'PARTIAL';
+    sufficiencyLevel = 'DECISION_WITH_LIMITATIONS';
+  }
+
+  // Evidence confidence is intentionally based on decision-relevant coverage.
+  // Optional unknowns reduce explanation confidence only when they matter to
+  // the selected horizon; they are never converted into negative evidence.
+  let confidenceScore;
+
+  if (shortTerm) {
+    confidenceScore =
+      marketDomain.coveragePct * 0.20 +
+      technicalDomain.coveragePct * 0.50 +
+      liquidityDomain.coveragePct * 0.25 +
+      (
+        corporateDomain.status === 'KNOWN'
+          ? 5
+          : 0
+      );
+  } else {
+    confidenceScore =
+      marketDomain.coveragePct * 0.10 +
+      fundamentalDomain.coveragePct * 0.50 +
+      longTermContextDomain.coveragePct * 0.25 +
+      technicalDomain.coveragePct * 0.10 +
+      (
+        corporateDomain.status === 'KNOWN'
+          ? 5
+          : 0
+      );
+  }
+
+  const staleCount =
+    Object.values(domains)
+      .filter(
+        domain =>
+          domain?.stale === true
+      )
+      .length;
+
+  const conflictCount =
+    Object.values(domains)
+      .filter(
+        domain =>
+          domain?.conflicting === true
+      )
+      .length;
+
+  confidenceScore -=
+    staleCount * 10 +
+    conflictCount * 20;
+
+  if (sufficiencyState === 'INSUFFICIENT') {
+    confidenceScore = Math.min(
+      confidenceScore,
+      49
+    );
+  }
+
+  confidenceScore =
+    decisionRound(
+      decisionClamp(
+        confidenceScore
+      ),
+      2
+    );
+
+  const confidenceLevel =
+    confidenceScore >= 82
+      ? 'HIGH'
+      : confidenceScore >= 65
+        ? 'MEDIUM'
+        : confidenceScore >= 45
+          ? 'LOW'
+          : 'UNRESOLVED';
+
+  return {
+    version:
+      EVIDENCE_INTELLIGENCE_VERSION,
+    mode: 'SHADOW_NON_BLOCKING',
+    horizon,
+    principle:
+      'UNKNOWN_IS_NOT_NEGATIVE',
+    liveDecisionInfluence: 'NONE',
+    domains,
+    decisionSufficiency: {
+      state:
+        sufficiencyState,
+      level:
+        sufficiencyLevel,
+      blockers:
+        uniqueTextValues(
+          blockers
+        ),
+      limitations:
+        uniqueTextValues(
+          limitations
+        )
+    },
+    confidence: {
+      level:
+        confidenceLevel,
+      score:
+        confidenceScore,
+      note:
+        'Confidence measures whether NOMAD has enough relevant evidence for this specific decision. It does not convert missing information into a negative company or setup score.'
+    },
+    currentDecisionReference: {
+      marketAction:
+        professional?.marketAction ||
+        null,
+      opportunityTier:
+        professional?.opportunityTier ||
+        null,
+      thesisStatus:
+        professional?.thesisStatus ||
+        null
+    },
+    regressionGuard: {
+      decisionChanged: false,
+      allocationChanged: false,
+      note:
+        'Shadow evidence intelligence is observational only in this build.'
+    }
+  };
+}
+
+
+/* =========================================================
    PROFESSIONAL INVESTOR / TRADER DECISION FRAMEWORK - BUILD 0.9.1
    Long-term and short-term are separate analytical frameworks.
 ========================================================= */
@@ -23401,6 +24168,14 @@ function decisionCanonicalCompanyState(
       evidence
     );
 
+  const evidenceIntelligence =
+    buildDecisionEvidenceIntelligence(
+      candidate,
+      analystGate,
+      evidence,
+      professional
+    );
+
   const researchState =
     professional.opportunityTier ===
       'EVIDENCE_RESEARCH'
@@ -23433,6 +24208,7 @@ function decisionCanonicalCompanyState(
     securityState:
       'ACTIVE_CANDIDATE',
     evidence,
+    evidenceIntelligence,
     analystGate,
     professional,
     researchState,
@@ -23536,6 +24312,8 @@ function decisionCenterSummary(
       canonical.analystGate,
     canonicalState:
       canonical,
+    evidenceIntelligence:
+      canonical.evidenceIntelligence || null,
     professional:
       canonical.professional || null,
     thesisStatus:
@@ -31338,6 +32116,14 @@ function runDecisionEngineSelfTests() {
     DECISION_RISK_POLICIES
       .balanced;
 
+  const riskConservative =
+    DECISION_RISK_POLICIES
+      .conservative;
+
+  const riskAggressive =
+    DECISION_RISK_POLICIES
+      .aggressive;
+
   const upContext = {
     available: true,
     price: 100,
@@ -32289,6 +33075,171 @@ function runDecisionEngineSelfTests() {
     shortTermProfessionalState.marketAction,
     'BUY',
     'confirmed short-term setup with acceptable reward-to-risk must be actionable'
+  );
+
+  assert.equal(
+    shortTermProfessionalState
+      .evidenceIntelligence
+      ?.mode,
+    'SHADOW_NON_BLOCKING',
+    'evidence intelligence must run in shadow mode only'
+  );
+
+  assert.equal(
+    shortTermProfessionalState
+      .evidenceIntelligence
+      ?.regressionGuard
+      ?.decisionChanged,
+    false,
+    'shadow evidence intelligence must never claim to change the live decision'
+  );
+
+  const shortTermWithoutFundamentals =
+    decisionCanonicalCompanyState({
+      ...longTermProfessionalCandidate,
+      horizon: 'short_term',
+      analystCore: null,
+      fundamentalEvidenceState:
+        'SECONDARY_NOT_REQUIRED',
+      price: 100,
+      marketAsOf:
+        new Date().toISOString(),
+      averageVolume30d: 500000,
+      risk: {
+        score: 72,
+        liquidityScore: 85
+      },
+      historicalContext: {
+        available: true,
+        contextSchemaVersion:
+          DECISION_HISTORICAL_CONTEXT_SCHEMA_VERSION,
+        asOf:
+          new Date().toISOString(),
+        validSessions: 120,
+        technical: {
+          rsi14: 58,
+          macdHistogram: 0.8,
+          volumeRatio20d: 1.4,
+          annualizedVolatility20dPct: 32
+        },
+        priceAction: {
+          available: true,
+          timingScore: 82,
+          timingState: 'GOOD',
+          setup: 'CONFIRMED_BREAKOUT',
+          atr14: 3.2,
+          support: 95,
+          resistance: 112,
+          tradePlan: {
+            complete: true,
+            state: 'DEFINED',
+            entryLow: 100,
+            entryHigh: 101,
+            entryReference: 100.5,
+            stop: 96,
+            target1: 111,
+            riskPerShare: 4.5,
+            rewardRisk: 2.33
+          }
+        }
+      }
+    });
+
+  assert.equal(
+    shortTermWithoutFundamentals.marketAction,
+    'BUY',
+    'missing optional fundamentals must not damage a valid short-term Trader BUY'
+  );
+
+  assert.equal(
+    shortTermWithoutFundamentals
+      .evidenceIntelligence
+      ?.domains
+      ?.fundamentals
+      ?.required,
+    false,
+    'fundamentals must be classified as optional for a short-term trade decision'
+  );
+
+  assert.notEqual(
+    shortTermWithoutFundamentals
+      .evidenceIntelligence
+      ?.decisionSufficiency
+      ?.state,
+    'INSUFFICIENT',
+    'missing optional fundamentals must not make otherwise sufficient Trader evidence insufficient'
+  );
+
+  const longTermMissingEvidenceShadow =
+    decisionCanonicalCompanyState({
+      ...longTermProfessionalCandidate,
+      analystCore: null,
+      marketAsOf:
+        new Date().toISOString()
+    });
+
+  assert.equal(
+    longTermMissingEvidenceShadow
+      .evidenceIntelligence
+      ?.domains
+      ?.fundamentals
+      ?.status,
+    'UNKNOWN',
+    'missing long-term financial evidence must be represented as UNKNOWN rather than weak/negative evidence'
+  );
+
+  assert.equal(
+    longTermMissingEvidenceShadow
+      .evidenceIntelligence
+      ?.decisionSufficiency
+      ?.state,
+    'INSUFFICIENT',
+    'missing mandatory long-term financial evidence must reduce decision sufficiency'
+  );
+
+  const longTermKnownNegativeShadow =
+    decisionCanonicalCompanyState({
+      ...longTermProfessionalCandidate,
+      marketAsOf:
+        new Date().toISOString(),
+      analystCore: {
+        ...longTermProfessionalCandidate.analystCore,
+        overallFinancialView: {
+          state: 'WEAK'
+        },
+        views: {
+          ...longTermProfessionalCandidate.analystCore.views,
+          cashFlowQuality: {
+            state: 'WEAK'
+          }
+        }
+      }
+    });
+
+  assert.equal(
+    longTermKnownNegativeShadow.marketAction,
+    'AVOID',
+    'explicit negative long-term evidence must keep the existing AVOID behavior'
+  );
+
+  assert.equal(
+    longTermKnownNegativeShadow
+      .evidenceIntelligence
+      ?.domains
+      ?.fundamentals
+      ?.negativeEvidence,
+    true,
+    'explicit negative evidence must be identified separately from missing evidence'
+  );
+
+  assert.notEqual(
+    longTermKnownNegativeShadow
+      .evidenceIntelligence
+      ?.domains
+      ?.fundamentals
+      ?.status,
+    'UNKNOWN',
+    'known negative evidence must not be mislabeled as missing evidence'
   );
 
   const shortTermAllocationCandidate = {
@@ -54692,6 +55643,8 @@ module.exports.decisionEngine = {
     buildDecisionOpportunityBoard,
   analystGate:
     decisionCenterAnalystGate,
+  evidenceIntelligence:
+    buildDecisionEvidenceIntelligence,
   canonicalState:
     decisionCanonicalCompanyState,
   profileSuitability:
