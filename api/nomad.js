@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.6.2';
+const VERSION = '0.9.6.3';
 
 
 const SUPABASE_URL =
@@ -28459,7 +28459,7 @@ async function recordDecisionRun(
 
 /* =========================================================
    ASK NOMAD - GROUNDED CONVERSATIONAL ORCHESTRATOR
-   Build 0.9.6.2
+   Build 0.9.6.3
    The chat layer never invents an investment conclusion. It routes a
    question through NOMAD's existing portfolio, Investor, Trader and
    allocation engines, then explains the structured result.
@@ -41748,10 +41748,39 @@ function portfolioViewClass(
 
 function portfolioSessionKey(result) {
   const raw = String(result?.asOf || '');
-  const date = raw && Number.isFinite(Date.parse(raw))
-    ? new Date(raw).toISOString().slice(0, 10)
-    : new Date().toISOString().slice(0, 10);
-  return 'nomadPortfolioLiveSeries:' + date;
+  const parsed = raw && Number.isFinite(Date.parse(raw))
+    ? new Date(raw)
+    : new Date();
+  return 'nomadPortfolioLiveSeries:' + nomadKarachiDateKey(parsed);
+}
+
+function portfolioPreviousCloseValue(result) {
+  const holdings = Array.isArray(result?.holdings) ? result.holdings : [];
+  if (!holdings.length) return null;
+
+  let total = 0;
+  let covered = 0;
+  for (const item of holdings) {
+    const quantity = Number(item?.quantity);
+    const currentPrice = Number(item?.currentPrice);
+    const dayChangePct = Number(item?.dayChangePct);
+    if (
+      !Number.isFinite(quantity) || quantity <= 0 ||
+      !Number.isFinite(currentPrice) || currentPrice <= 0 ||
+      !Number.isFinite(dayChangePct) || dayChangePct <= -99
+    ) {
+      continue;
+    }
+    const previousClose = currentPrice / (1 + dayChangePct / 100);
+    if (Number.isFinite(previousClose) && previousClose > 0) {
+      total += quantity * previousClose;
+      covered += 1;
+    }
+  }
+
+  return covered === holdings.length && total > 0
+    ? Math.round(total * 100) / 100
+    : null;
 }
 
 function recordPortfolioValueSnapshot(result) {
@@ -41765,18 +41794,36 @@ function recordPortfolioValueSnapshot(result) {
     if (!Array.isArray(series)) series = [];
   } catch { series = []; }
 
-  const timestamp = Number.isFinite(Date.parse(result?.asOf || ''))
+  const sourceTimestamp = Number.isFinite(Date.parse(result?.asOf || ''))
     ? Date.parse(result.asOf)
     : Date.now();
+  const today = nomadKarachiDateKey(new Date(sourceTimestamp));
+
+  // Seed today's line with an estimated previous-close portfolio value. This
+  // uses the same Official-PSX current prices/day changes already shown in the
+  // portfolio and gives the 1D chart a meaningful opening reference without
+  // depending on pyPSX candles.
+  if (!series.length) {
+    const previousCloseValue = portfolioPreviousCloseValue(result);
+    const sessionOpen = Date.parse(today + 'T09:30:00+05:00');
+    if (Number.isFinite(previousCloseValue) && Number.isFinite(sessionOpen)) {
+      series.push({ t: sessionOpen, v: previousCloseValue, kind: 'PREVIOUS_CLOSE' });
+    }
+  }
 
   const last = series[series.length - 1];
-  if (!last || Math.abs(timestamp - Number(last.t || 0)) >= 15000 || Math.abs(value - Number(last.v || value)) > 0.01) {
-    series.push({ t: timestamp, v: value });
+  if (
+    !last ||
+    Math.abs(sourceTimestamp - Number(last.t || 0)) >= 15000 ||
+    Math.abs(value - Number(last.v || value)) > 0.01
+  ) {
+    series.push({ t: sourceTimestamp, v: value, kind: 'LIVE' });
   }
 
   series = series
     .filter(point => Number.isFinite(Number(point?.t)) && Number.isFinite(Number(point?.v)))
-    .slice(-360);
+    .sort((a, b) => Number(a.t) - Number(b.t))
+    .slice(-720);
 
   try { localStorage.setItem(key, JSON.stringify(series)); } catch {}
   return series;
@@ -41829,31 +41876,47 @@ function portfolioLiveValueChart(series, summary) {
     '</div>';
 }
 
-function portfolioIntradayChartMarkup(result) {
-  const rows = Array.isArray(result?.data) ? result.data : [];
-  if (!result?.available || rows.length < 2) {
-    return '<div class="portfolioLiveChart"><div class="portfolioChartHead"><div><div class="eyebrow">PORTFOLIO PERFORMANCE</div><h2>Intraday value</h2></div><span class="portfolioChartRange active">1D</span></div><div class="portfolioChartEmpty">Intraday portfolio history is unavailable right now. NOMAD will keep trying the connected pyPSX candle feed.</div></div>';
+function portfolioOfficialLiveChartMarkup(result, series) {
+  const points = Array.isArray(series)
+    ? series.filter(point => Number.isFinite(Number(point?.t)) && Number.isFinite(Number(point?.v)))
+    : [];
+
+  const current = Number(result?.summary?.currentValue || 0);
+  const cost = Number(result?.summary?.investedCost || 0);
+  const holdings = Array.isArray(result?.holdings) ? result.holdings : [];
+  const asOf = result?.asOf || null;
+  const marketStatus = result?.marketStatus || null;
+
+  if (!points.length || !Number.isFinite(current) || current <= 0) {
+    return '<div class="portfolioLiveChart"><div class="portfolioChartHead"><div><div class="eyebrow">PORTFOLIO PERFORMANCE</div><h2>Intraday value</h2><div class="portfolioChartAsOf">Waiting for the first verified PSX portfolio snapshot...</div></div><span class="portfolioChartRange active">1D</span></div><div class="portfolioChartEmpty">NOMAD will build this chart from the same live prices used for your portfolio value.</div></div>';
   }
 
-  const values = rows.map(row => Number(row.value)).filter(Number.isFinite);
-  const current = Number(result.currentValue || values[values.length - 1] || 0);
-  const first = Number(values[0] || current || 0);
-  const changeValue = Number(result.changeValue ?? (current - first));
-  const changePct = Number(result.changePct ?? (first ? changeValue / first * 100 : 0));
-  const cost = Number(result.investedCost || 0);
-  let min = Math.min(...values);
-  let max = Math.max(...values);
-  if (min === max) { min *= .998; max *= 1.002; }
-  const pad = Math.max((max-min)*.10, Math.max(max,1)*.0008);
-  min -= pad; max += pad;
+  const values = points.map(point => Number(point.v)).filter(Number.isFinite);
+  const first = Number(values[0] || current);
+  const changeValue = current - first;
+  const changePct = first > 0 ? changeValue / first * 100 : 0;
 
-  const W=1000,H=250,L=96,R=18,T=18,B=30;
-  const uw=W-L-R, uh=H-T-B;
-  const x=i => L + (i/(rows.length-1))*uw;
-  const y=v => T + (1-((v-min)/(max-min)))*uh;
-  const poly = rows.map((row,i)=>x(i).toFixed(1)+','+y(Number(row.value)).toFixed(1)).join(' ');
-  const area = L+','+(T+uh)+' '+poly+' '+(W-R)+','+(T+uh);
-  const ticks=[max,(max+min)/2,min];
+  let min = Math.min(...values, current);
+  let max = Math.max(...values, current);
+  if (Number.isFinite(cost) && cost > 0) {
+    min = Math.min(min, cost);
+    max = Math.max(max, cost);
+  }
+  if (min === max) { min *= .998; max *= 1.002; }
+  const pad = Math.max((max - min) * .10, Math.max(max, 1) * .0008);
+  min -= pad;
+  max += pad;
+
+  const W = 1000, H = 250, L = 96, R = 18, T = 18, B = 30;
+  const uw = W - L - R, uh = H - T - B;
+  const firstT = Number(points[0].t);
+  const lastT = Number(points[points.length - 1].t);
+  const timeSpan = Math.max(1, lastT - firstT);
+  const x = t => L + ((Number(t) - firstT) / timeSpan) * uw;
+  const y = v => T + (1 - ((Number(v) - min) / (max - min))) * uh;
+  const poly = points.map(point => x(point.t).toFixed(1) + ',' + y(point.v).toFixed(1)).join(' ');
+  const area = L + ',' + (T + uh) + ' ' + poly + ' ' + (W - R) + ',' + (T + uh);
+  const ticks = [max, (max + min) / 2, min];
   const axisMoney = value => {
     const n = Number(value);
     if (!Number.isFinite(n)) return '';
@@ -41862,20 +41925,25 @@ function portfolioIntradayChartMarkup(result) {
     if (a >= 1e3) return 'PKR ' + formatNumber(n / 1e3, 1) + 'K';
     return 'PKR ' + formatNumber(n, 0);
   };
-  const startLabel = new Date(rows[0].timestamp).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
-  const endLabel = new Date(rows[rows.length-1].timestamp).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+
+  const startLabel = new Date(firstT).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+  const endLabel = new Date(lastT).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+  const ageText = asOf ? relativeTime(asOf) : 'just now';
+  const liveLabel = marketStatus?.known === true && marketStatus?.isOpen === false
+    ? 'Today · latest PSX snapshot'
+    : 'Today · Live';
 
   return '<div class="portfolioLiveChart portfolioBrokerChart">' +
-    '<div class="portfolioChartHead"><div><div class="eyebrow">PORTFOLIO PERFORMANCE</div><h2>Intraday value</h2><div class="portfolioChartAsOf">'+escapeHtml(result?.feedLabel || (result?.marketStatus?.isOpen ? 'Live session' : 'Latest completed session'))+(result?.asOf ? ' · '+escapeHtml(relativeTime(result.asOf)) : '')+'</div></div>' +
-    '<div class="portfolioChartValue"><strong>'+portfolioMoney(current)+'</strong><span class="'+percentClass(changePct)+'">'+(changeValue>0?'+':'')+portfolioMoney(changeValue)+' · '+(changePct>0?'+':'')+formatNumber(changePct,2)+'%</span></div></div>' +
-    '<div class="portfolioChartToolbar"><div class="portfolioChartToolbarLeft"><span class="portfolioChartRange active">1D</span><span class="portfolioCostBadge">Cost basis '+portfolioMoney(cost)+'</span></div><span class="portfolioChartSource">'+escapeHtml(result.holdingsCovered)+'/'+escapeHtml(result.holdingsTotal)+' holdings · '+escapeHtml(result?.feedState === 'LIVE' ? 'pyPSX intraday' : 'pyPSX reference')+'</span></div>' +
-    '<svg viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none" class="portfolioValueSvg portfolioBrokerSvg" aria-label="Intraday portfolio value chart">' +
-    ticks.map(v=>'<line x1="'+L+'" x2="'+(W-R)+'" y1="'+y(v).toFixed(1)+'" y2="'+y(v).toFixed(1)+'" class="portfolioChartGrid" />').join('') +
-    ticks.map(v=>'<text x="'+(L-12)+'" y="'+(y(v)+4).toFixed(1)+'" text-anchor="end" class="portfolioChartAxisText">'+escapeHtml(axisMoney(v))+'</text>').join('') +
-    '<polygon points="'+area+'" class="portfolioChartArea" />' +
-    '<polyline points="'+poly+'" class="portfolioChartLine" />' +
+    '<div class="portfolioChartHead"><div><div class="eyebrow">PORTFOLIO PERFORMANCE</div><h2>Intraday value</h2><div class="portfolioChartAsOf">' + escapeHtml(liveLabel) + ' · Updated ' + escapeHtml(ageText) + '</div></div>' +
+    '<div class="portfolioChartValue"><strong>' + portfolioMoney(current) + '</strong><span class="' + percentClass(changePct) + '">' + (changeValue > 0 ? '+' : '') + portfolioMoney(changeValue) + ' · ' + (changePct > 0 ? '+' : '') + formatNumber(changePct, 2) + '%</span></div></div>' +
+    '<div class="portfolioChartToolbar"><div class="portfolioChartToolbarLeft"><span class="portfolioChartRange active">1D</span><span class="portfolioCostBadge">Cost basis ' + portfolioMoney(cost) + '</span></div><span class="portfolioChartSource">' + escapeHtml(holdings.length) + '/' + escapeHtml(holdings.length) + ' holdings · Official PSX portfolio snapshots</span></div>' +
+    '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" class="portfolioValueSvg portfolioBrokerSvg" aria-label="Live portfolio value chart">' +
+    ticks.map(v => '<line x1="' + L + '" x2="' + (W - R) + '" y1="' + y(v).toFixed(1) + '" y2="' + y(v).toFixed(1) + '" class="portfolioChartGrid" />').join('') +
+    ticks.map(v => '<text x="' + (L - 12) + '" y="' + (y(v) + 4).toFixed(1) + '" text-anchor="end" class="portfolioChartAxisText">' + escapeHtml(axisMoney(v)) + '</text>').join('') +
+    '<polygon points="' + area + '" class="portfolioChartArea" />' +
+    '<polyline points="' + poly + '" class="portfolioChartLine" />' +
     '</svg>' +
-    '<div class="portfolioChartFoot"><span>'+escapeHtml(startLabel)+'</span><span>Cost basis '+portfolioMoney(cost)+'</span><span>'+escapeHtml(endLabel)+'</span></div>' +
+    '<div class="portfolioChartFoot"><span>' + escapeHtml(startLabel) + '</span><span>Cost basis ' + portfolioMoney(cost) + '</span><span>' + escapeHtml(endLabel) + '</span></div>' +
     '</div>';
 }
 
@@ -42098,12 +42166,9 @@ function renderPortfolioFull(
     '</strong></div>' +
     '</div>' +
     '<div id="portfolioLiveChartMount">' +
-    (
-      lastPortfolioIntradayChartResult
-        ? portfolioIntradayChartMarkup(
-            lastPortfolioIntradayChartResult
-          )
-        : '<div class="portfolioLiveChart"><div class="portfolioChartHead"><div><div class="eyebrow">PORTFOLIO PERFORMANCE</div><h2>Intraday value</h2></div><span class="portfolioChartRange active">1D</span></div><div class="portfolioChartEmpty">Loading intraday portfolio chart...</div></div>'
+    portfolioOfficialLiveChartMarkup(
+      result,
+      portfolioValueSeries
     ) +
     '</div>';
 
@@ -42426,7 +42491,6 @@ function renderPortfolioFull(
       previousTableScrollLeft;
   }
 
-  loadPortfolioLiveChart().catch(() => {});
 
   target
     .querySelectorAll(
@@ -54499,6 +54563,34 @@ openAppPage(
 );
 
 loadDecisionCenter();
+
+// Keep the 1D portfolio line building even when the user is on Ask NOMAD,
+// Research, Decision Center, or another page. This sampler uses the same
+// canonical Official-PSX portfolio endpoint as the visible portfolio values;
+// pyPSX is not involved in this chart.
+let portfolioLiveSamplerTimer = null;
+
+async function samplePortfolioLiveValue() {
+  if (document.visibilityState !== 'visible') return;
+  try {
+    const result = await api('portfolio');
+    recordPortfolioValueSnapshot(result);
+  } catch {}
+}
+
+portfolioLiveSamplerTimer = setInterval(
+  samplePortfolioLiveValue,
+  60000
+);
+
+document.addEventListener(
+  'visibilitychange',
+  () => {
+    if (document.visibilityState === 'visible') {
+      samplePortfolioLiveValue();
+    }
+  }
+);
 
 /* =========================================================
    HEALTH
