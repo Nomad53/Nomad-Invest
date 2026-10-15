@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.6.3';
+const VERSION = '0.9.6.4';
 
 
 const SUPABASE_URL =
@@ -41746,12 +41746,33 @@ function portfolioViewClass(
 }
 
 
+function portfolioKarachiDateKey(value = new Date()) {
+  try {
+    const parts = new Intl.DateTimeFormat(
+      'en-CA',
+      {
+        timeZone: 'Asia/Karachi',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit'
+      }
+    ).formatToParts(value);
+    const map = {};
+    parts.forEach(part => {
+      map[part.type] = part.value;
+    });
+    return map.year + '-' + map.month + '-' + map.day;
+  } catch {
+    return new Date(value).toISOString().slice(0, 10);
+  }
+}
+
 function portfolioSessionKey(result) {
   const raw = String(result?.asOf || '');
   const parsed = raw && Number.isFinite(Date.parse(raw))
     ? new Date(raw)
     : new Date();
-  return 'nomadPortfolioLiveSeries:' + nomadKarachiDateKey(parsed);
+  return 'nomadPortfolioLiveSeries:' + portfolioKarachiDateKey(parsed);
 }
 
 function portfolioPreviousCloseValue(result) {
@@ -41797,7 +41818,7 @@ function recordPortfolioValueSnapshot(result) {
   const sourceTimestamp = Number.isFinite(Date.parse(result?.asOf || ''))
     ? Date.parse(result.asOf)
     : Date.now();
-  const today = nomadKarachiDateKey(new Date(sourceTimestamp));
+  const today = portfolioKarachiDateKey(new Date(sourceTimestamp));
 
   // Seed today's line with an estimated previous-close portfolio value. This
   // uses the same Official-PSX current prices/day changes already shown in the
