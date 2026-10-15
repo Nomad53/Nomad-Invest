@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.7.3';
+const VERSION = '0.9.7.4';
 
 
 const SUPABASE_URL =
@@ -8138,13 +8138,17 @@ async function loadPSXMarket() {
       loadRawScreener(),
       loadSectorMap(),
       loadCompanyMap(),
-      getPyPSXMarketStatus()
+      decisionWithTimeout(
+        getPyPSXMarketStatus(),
+        1500,
+        'Secondary market-status check'
+      )
         .catch(
           () => ({
             known: false,
             isOpen: false,
             status: 'UNKNOWN',
-            statusText: 'Market status unavailable',
+            statusText: 'Secondary market status unavailable',
             holidayName: null
           })
         )
@@ -35214,7 +35218,11 @@ async function getIntelligenceFeed() {
   const safeMemoryRead =
     (path) =>
       memoryConfigured
-        ? supabaseRest(path).catch(() => [])
+        ? decisionWithTimeout(
+            supabaseRest(path),
+            2500,
+            'Optional intelligence-memory read'
+          ).catch(() => [])
         : Promise.resolve([]);
 
   const [
@@ -35234,7 +35242,11 @@ async function getIntelligenceFeed() {
       safeMemoryRead(
         'state_changes?select=id,symbol,change_category,field_name,old_value,new_value,percentage_change,significance,summary,detected_at&order=detected_at.desc&limit=80'
       ),
-      readPortfolioHoldings()
+      decisionWithTimeout(
+        readPortfolioHoldings(),
+        2500,
+        'Optional Home portfolio-count read'
+      )
         .catch(
           () => ({
             configured: false,
@@ -42398,22 +42410,56 @@ async function apiPost(
 
 
 
-// Bind the Decision Center CTA early and by delegation. If any later optional
-// page initialization fails, the core Analyze action still remains available.
-document.addEventListener(
-  'click',
-  event => {
-    const trigger =
-      event.target?.closest?.('#findBestOption');
+// Decision Center is a core action. Keep its click path independent from the
+// optional Home / Ask NOMAD / Portfolio initializers so one unrelated surface
+// can never disable the Analyze button.
+window.__nomadDecisionRequestSerial =
+  Number(window.__nomadDecisionRequestSerial || 0);
 
-    if (!trigger) {
-      return;
-    }
+function bindDecisionCenterCoreAction() {
+  const button = document.getElementById('findBestOption');
 
-    event.preventDefault();
-    runDecisionCenterAnalysis();
+  if (!button || button.dataset.nomadCoreBound === '1') {
+    return;
   }
-);
+
+  button.type = 'button';
+  button.disabled = false;
+  button.dataset.nomadCoreBound = '1';
+
+  button.addEventListener(
+    'click',
+    event => {
+      event.preventDefault();
+      event.stopPropagation();
+
+      Promise.resolve()
+        .then(() => runDecisionCenterAnalysis())
+        .catch(error => {
+          button.disabled = false;
+          button.dataset.running = '0';
+          button.textContent = 'Analyze PSX & build plan';
+
+          const target = document.getElementById('decisionResult');
+          if (target) {
+            target.innerHTML =
+              '<strong>Decision Center could not start.</strong><br>' +
+              '<span class="decisionMinor">' +
+              escapeHtml(error?.message || 'Unknown Decision Center error.') +
+              '</span>';
+          }
+        });
+    }
+  );
+}
+
+// The markup already exists when this application script runs. Bind now and
+// bind once more on DOMContentLoaded as a defensive fallback for any future
+// shell refactor.
+bindDecisionCenterCoreAction();
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', bindDecisionCenterCoreAction, { once: true });
+}
 
 /* =========================================================
    APP NAVIGATION + DECISION CENTER + LIVE PORTFOLIO - BUILD 0.9.0
@@ -42650,8 +42696,13 @@ function openAppPage(
   }
 
   if (page === 'home') {
-    // Home is a live market surface too. Refresh the lightweight intelligence
-    // feed plus portfolio mirror without requiring a browser reload.
+    // Load Home only when Home is actually visible. Older builds launched the
+    // relatively heavy intelligence-feed request on every app start, including
+    // while the user was trying to run Decision Center. That created avoidable
+    // contention and made both surfaces feel slow.
+    loadDecisionCenter()
+      .catch(() => {});
+
     homeRefreshTimer =
       setInterval(
         () => {
@@ -42659,10 +42710,11 @@ function openAppPage(
             document.visibilityState ===
             'visible'
           ) {
-            loadDecisionCenter();
+            loadDecisionCenter()
+              .catch(() => {});
           }
         },
-        20000
+        30000
       );
   }
 
@@ -55729,59 +55781,20 @@ if ($('decisionRisk') && $('strategyRisk')) {
     }
   );
 
-let decisionCenterRequestSerial = 0;
-
 async function runDecisionCenterAnalysis() {
   const button = $('findBestOption');
-  if (!button || button.disabled) {
+
+  if (!button) {
+    throw new Error('Decision Center Analyze button is unavailable.');
+  }
+
+  // A click must always produce immediate visible feedback. Do this before
+  // reading optional controls or touching any other application state.
+  if (button.dataset.running === '1') {
     return;
   }
 
-  const amount =
-    Number(
-      String(
-        $('decisionAmount')?.value ||
-        ''
-      ).replace(/,/g, '')
-    );
-
-  const context = {
-    amount:
-      Number.isFinite(amount) &&
-      amount > 0
-        ? amount
-        : 5000,
-    horizon:
-      $('decisionHorizon')?.value ||
-      'long_term',
-    risk:
-      $('decisionRisk')?.value ||
-      'balanced',
-    sector:
-      $('decisionSector')?.value ||
-      ''
-  };
-
-  if ($('strategyHorizon')) {
-    $('strategyHorizon').value = context.horizon;
-  }
-  if ($('strategyRisk')) {
-    $('strategyRisk').value = context.risk;
-  }
-
-  try {
-    localStorage.setItem(
-      'nomadDecisionContext',
-      JSON.stringify(context)
-    );
-  } catch {}
-
-  const requestSerial =
-    ++decisionCenterRequestSerial;
-
-  const originalText =
-    button.textContent;
-
+  button.dataset.running = '1';
   button.disabled = true;
   button.textContent = 'Analyzing PSX...';
 
@@ -55789,7 +55802,7 @@ async function runDecisionCenterAnalysis() {
     $('decisionResult').innerHTML =
       '<div class="decisionShadowBanner">SHADOW</div>' +
       '<strong>Analyzing PSX opportunities...</strong><br>' +
-      '<span class="decisionMinor">Running the locked Investor / Trader brain, evidence gates, suitability and whole-share allocation.</span>';
+      '<span class="decisionMinor">Step 1 of 3 · Loading the latest canonical market snapshot.</span>';
   }
 
   ['priorityOneList','priorityTwoList','researchRequiredList','avoidList']
@@ -55800,49 +55813,135 @@ async function runDecisionCenterAnalysis() {
       }
     });
 
-  try {
-    const result = await apiPost(
-      'decision-lab',
-      context
-    );
+  const requestSerial =
+    ++window.__nomadDecisionRequestSerial;
 
-    if (requestSerial !== decisionCenterRequestSerial) {
-      return;
+  let progressTimer = null;
+  let timeoutTimer = null;
+
+  try {
+    const amount =
+      Number(
+        String(
+          $('decisionAmount')?.value ||
+          ''
+        ).replace(/,/g, '')
+      );
+
+    const context = {
+      amount:
+        Number.isFinite(amount) &&
+        amount > 0
+          ? amount
+          : 5000,
+      horizon:
+        $('decisionHorizon')?.value ||
+        'long_term',
+      risk:
+        $('decisionRisk')?.value ||
+        'balanced',
+      sector:
+        $('decisionSector')?.value ||
+        ''
+    };
+
+    if ($('strategyHorizon')) {
+      $('strategyHorizon').value = context.horizon;
+    }
+    if ($('strategyRisk')) {
+      $('strategyRisk').value = context.risk;
     }
 
     try {
-      renderShadowDecision(result);
-    } catch (renderError) {
-      if ($('decisionResult')) {
-        $('decisionResult').innerHTML =
-          '<strong>Analysis completed, but the Decision Center renderer hit an error.</strong><br>' +
-          '<span class="decisionMinor">' +
-          escapeHtml(renderError?.message || 'Unknown rendering error.') +
-          '</span>';
+      localStorage.setItem(
+        'nomadDecisionContext',
+        JSON.stringify(context)
+      );
+    } catch {}
+
+    let progressStep = 0;
+    const progressMessages = [
+      'Step 2 of 3 · Ranking eligible PSX opportunities with the locked Investor / Trader brain.',
+      'Step 3 of 3 · Applying suitability, portfolio context and whole-share allocation.',
+      'Still working · Some historical evidence requests are taking longer than usual.'
+    ];
+
+    progressTimer = setInterval(() => {
+      if (
+        requestSerial !== window.__nomadDecisionRequestSerial ||
+        !$('decisionResult')
+      ) {
+        return;
       }
-      throw renderError;
+
+      const message =
+        progressMessages[
+          Math.min(progressStep, progressMessages.length - 1)
+        ];
+      progressStep += 1;
+
+      $('decisionResult').innerHTML =
+        '<div class="decisionShadowBanner">SHADOW</div>' +
+        '<strong>Analyzing PSX opportunities...</strong><br>' +
+        '<span class="decisionMinor">' +
+        escapeHtml(message) +
+        '</span>';
+    }, 5000);
+
+    const timeoutPromise =
+      new Promise((resolve, reject) => {
+        timeoutTimer = setTimeout(
+          () => reject(
+            new Error(
+              'The analysis took too long to complete. NOMAD stopped this request instead of leaving the Decision Center stuck. Please run it again.'
+            )
+          ),
+          120000
+        );
+      });
+
+    const result = await Promise.race([
+      apiPost(
+        'decision-lab',
+        context
+      ),
+      timeoutPromise
+    ]);
+
+    if (requestSerial !== window.__nomadDecisionRequestSerial) {
+      return;
     }
+
+    renderShadowDecision(result);
   } catch (error) {
-    if (requestSerial === decisionCenterRequestSerial && $('decisionResult')) {
+    if (
+      requestSerial === window.__nomadDecisionRequestSerial &&
+      $('decisionResult')
+    ) {
       $('decisionResult').innerHTML =
         '<strong>Decision engine unavailable.</strong><br>' +
-        escapeHtml(
-          error?.message ||
-          'The decision request failed.'
-        ) +
-        '<br><span class="decisionMinor">NOMAD did not substitute a guess. Your previous working model has not been changed.</span>';
+        '<span class="decisionMinor">' +
+        escapeHtml(error?.message || 'Unknown Decision Center error.') +
+        '</span>';
     }
   } finally {
-    if (requestSerial === decisionCenterRequestSerial) {
+    if (progressTimer) {
+      clearInterval(progressTimer);
+    }
+    if (timeoutTimer) {
+      clearTimeout(timeoutTimer);
+    }
+
+    if (requestSerial === window.__nomadDecisionRequestSerial) {
       button.disabled = false;
-      button.textContent = originalText;
+      button.dataset.running = '0';
+      button.textContent = 'Analyze PSX & build plan';
     }
   }
 }
 
-if ($('findBestOption')) {
-  $('findBestOption').type = 'button';
-}
+// Reconfirm the core binding after the rest of the page controls are wired.
+bindDecisionCenterCoreAction();
 
 if ($('homeRunScan')) {
   $('homeRunScan')
@@ -55994,8 +56093,6 @@ openAppPage(
     scrollToTop: false
   }
 );
-
-loadDecisionCenter();
 
 // Keep the 1D portfolio line building even when the user is on Ask NOMAD,
 // Research, Decision Center, or another page. This sampler uses the same
