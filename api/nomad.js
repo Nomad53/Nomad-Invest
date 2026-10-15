@@ -9,7 +9,11 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.7.4';
+const VERSION = '0.9.6.5';
+
+// Core production hardening: Ask NOMAD is intentionally disabled so the
+// conversational layer cannot interfere with the production decision path.
+const NOMAD_ASK_NOMAD_ENABLED = false;
 
 
 const SUPABASE_URL =
@@ -8138,17 +8142,13 @@ async function loadPSXMarket() {
       loadRawScreener(),
       loadSectorMap(),
       loadCompanyMap(),
-      decisionWithTimeout(
-        getPyPSXMarketStatus(),
-        1500,
-        'Secondary market-status check'
-      )
+      getPyPSXMarketStatus()
         .catch(
           () => ({
             known: false,
             isOpen: false,
             status: 'UNKNOWN',
-            statusText: 'Secondary market status unavailable',
+            statusText: 'Market status unavailable',
             holidayName: null
           })
         )
@@ -22344,773 +22344,6 @@ function decisionEvidenceProfile(
 
 
 /* =========================================================
-   EVIDENCE INTELLIGENCE LAYER - BUILD 0.9.7.0 (SHADOW ONLY)
-
-   PURPOSE
-   - Separate missing evidence from negative evidence.
-   - Judge whether the available evidence is sufficient for the specific
-     decision being asked (long-term investor vs short-term trader).
-   - Track known / partial / unknown / stale / conflicting evidence by domain.
-   - Produce an independent confidence view without changing the live brain.
-
-   SAFETY / REGRESSION RULE
-   - This layer is observational. It MUST NOT change marketAction,
-     opportunityTier, allocationPermission, profile suitability, position
-     sizing, trigger logic or any other live Investor / Trader output.
-   - Promotion into live decision logic requires a separate validated build.
-========================================================= */
-
-const EVIDENCE_INTELLIGENCE_VERSION = 'EIL-SHADOW-0.2';
-
-function evidenceIntelligenceAgeDays(value) {
-  const timestamp = Date.parse(String(value || ''));
-  if (!Number.isFinite(timestamp)) {
-    return null;
-  }
-  return Math.max(
-    0,
-    (Date.now() - timestamp) /
-      (24 * 60 * 60 * 1000)
-  );
-}
-
-function evidenceIntelligenceConflictText(candidate) {
-  const diagnostics =
-    candidate?.fundamentalEvidenceDiagnostics ||
-    null;
-
-  let text = '';
-  try {
-    text = diagnostics
-      ? JSON.stringify(diagnostics)
-      : '';
-  } catch {
-    text = String(diagnostics || '');
-  }
-
-  return text.toLowerCase();
-}
-
-function evidenceIntelligenceStatus({
-  coveragePct,
-  stale = false,
-  conflicting = false
-}) {
-  const coverage =
-    decisionClamp(
-      safeNumber(coveragePct) ?? 0
-    );
-
-  if (conflicting) {
-    return 'CONFLICTING';
-  }
-
-  if (coverage <= 0) {
-    return 'UNKNOWN';
-  }
-
-  if (stale) {
-    return 'STALE';
-  }
-
-  if (coverage < 70) {
-    return 'PARTIAL';
-  }
-
-  return 'KNOWN';
-}
-
-function buildDecisionEvidenceIntelligence(
-  candidate,
-  analystGate,
-  evidence,
-  professional
-) {
-  const horizon =
-    String(
-      candidate?.horizon ||
-      'long_term'
-    ) === 'short_term'
-      ? 'short_term'
-      : 'long_term';
-
-  const shortTerm =
-    horizon === 'short_term';
-
-  const analyst =
-    candidate?.analystCore ||
-    null;
-
-  const context =
-    candidate?.historicalContext ||
-    {};
-
-  const technical =
-    context?.technical ||
-    {};
-
-  const priceAction =
-    context?.priceAction ||
-    {};
-
-  const tradePlan =
-    priceAction?.tradePlan ||
-    null;
-
-  const conditionalTradePlan =
-    priceAction?.conditionalTradePlan ||
-    null;
-
-  const marketAgeDays =
-    evidenceIntelligenceAgeDays(
-      candidate?.marketAsOf
-    );
-
-  const technicalAgeDays =
-    evidenceIntelligenceAgeDays(
-      context?.asOf ||
-      priceAction?.asOf
-    );
-
-  const conflictText =
-    evidenceIntelligenceConflictText(
-      candidate
-    );
-
-  const hasFundamentalConflict =
-    /\b(conflict|mismatch|inconsistent|disagreement)\b/
-      .test(conflictText);
-
-  const marketMissing = [];
-  let marketCoverage = 0;
-
-  if (safeNumber(candidate?.price) !== null) {
-    marketCoverage += 70;
-  } else {
-    marketMissing.push('current price');
-  }
-
-  if (candidate?.marketAsOf) {
-    marketCoverage += 30;
-  } else {
-    marketMissing.push('market timestamp');
-  }
-
-  const marketStaleThresholdDays =
-    shortTerm ? 4 : 10;
-
-  const marketStale =
-    marketAgeDays !== null &&
-    marketAgeDays > marketStaleThresholdDays;
-
-  const marketDomain = {
-    required: true,
-    status: evidenceIntelligenceStatus({
-      coveragePct: marketCoverage,
-      stale: marketStale
-    }),
-    coveragePct:
-      decisionRound(
-        marketCoverage,
-        2
-      ),
-    missing: marketMissing,
-    stale: marketStale,
-    conflicting: false,
-    ageDays:
-      decisionRound(
-        marketAgeDays,
-        2
-      ),
-    note:
-      marketStale
-        ? 'Market evidence exists but is old for the current decision horizon.'
-        : marketCoverage >= 70
-          ? 'Current market price evidence is available.'
-          : 'Current market evidence is incomplete.'
-  };
-
-  const technicalMissing = [];
-  let technicalCoverage = 0;
-
-  if (context?.available) {
-    technicalCoverage += 15;
-  } else {
-    technicalMissing.push('price history');
-  }
-
-  if (
-    safeNumber(context?.validSessions) !== null &&
-    safeNumber(context?.validSessions) >=
-      Math.min(
-        DECISION_TRADER_MIN_VALID_SESSIONS,
-        80
-      )
-  ) {
-    technicalCoverage += 10;
-  } else {
-    technicalMissing.push('sufficient historical sessions');
-  }
-
-  if (priceAction?.available) {
-    technicalCoverage += 15;
-  } else {
-    technicalMissing.push('price-action structure');
-  }
-
-  if (safeNumber(technical?.rsi14) !== null) {
-    technicalCoverage += 10;
-  } else {
-    technicalMissing.push('RSI');
-  }
-
-  if (safeNumber(technical?.macdHistogram) !== null) {
-    technicalCoverage += 10;
-  } else {
-    technicalMissing.push('MACD');
-  }
-
-  if (safeNumber(technical?.volumeRatio20d) !== null) {
-    technicalCoverage += 10;
-  } else {
-    technicalMissing.push('volume confirmation');
-  }
-
-  if (safeNumber(priceAction?.atr14) !== null) {
-    technicalCoverage += 10;
-  } else {
-    technicalMissing.push('ATR');
-  }
-
-  if (safeNumber(priceAction?.support) !== null) {
-    technicalCoverage += 5;
-  } else {
-    technicalMissing.push('support');
-  }
-
-  if (safeNumber(priceAction?.resistance) !== null) {
-    technicalCoverage += 5;
-  } else {
-    technicalMissing.push('resistance');
-  }
-
-  if (
-    tradePlan?.complete === true ||
-    conditionalTradePlan?.complete === true
-  ) {
-    technicalCoverage += 10;
-  } else {
-    technicalMissing.push('complete trade plan');
-  }
-
-  const technicalStaleThresholdDays =
-    shortTerm ? 5 : 14;
-
-  const technicalStale =
-    technicalAgeDays !== null &&
-    technicalAgeDays > technicalStaleThresholdDays;
-
-  const technicalDomain = {
-    required: shortTerm,
-    status: evidenceIntelligenceStatus({
-      coveragePct: technicalCoverage,
-      stale: technicalStale
-    }),
-    coveragePct:
-      decisionRound(
-        technicalCoverage,
-        2
-      ),
-    missing:
-      uniqueTextValues(
-        technicalMissing
-      ),
-    stale: technicalStale,
-    conflicting: false,
-    ageDays:
-      decisionRound(
-        technicalAgeDays,
-        2
-      ),
-    note:
-      shortTerm
-        ? 'Technical evidence is decision-critical for the Trader brain.'
-        : 'Technical evidence supports long-term entry timing but does not define the investment thesis.'
-  };
-
-  const summaryCoverage =
-    safeNumber(
-      analyst?.coverage
-        ?.summaryCoveragePct ??
-      analyst?.coverage
-        ?.coreCoveragePct
-    ) ??
-    0;
-
-  const extendedCoverage =
-    safeNumber(
-      analyst?.coverage
-        ?.extendedCoveragePct
-    ) ??
-    0;
-
-  const fundamentalCoverage =
-    analyst
-      ? decisionClamp(
-          summaryCoverage * 0.75 +
-          extendedCoverage * 0.25
-        )
-      : 0;
-
-  const fundamentalMissing =
-    uniqueTextValues([
-      ...(
-        analyst?.coverage
-          ?.coreMetricsMissing ||
-        []
-      ),
-      ...(
-        analyst?.coverage
-          ?.extendedMetricsMissing ||
-        []
-      )
-    ]);
-
-  if (!analyst) {
-    fundamentalMissing.push(
-      'financial analyst evidence'
-    );
-  }
-
-  const fundamentalState =
-    String(
-      candidate?.fundamentalEvidenceState ||
-      ''
-    );
-
-  const fundamentalStale =
-    fundamentalState === 'CACHE_FALLBACK';
-
-  const fundamentalDomain = {
-    required: !shortTerm,
-    status: evidenceIntelligenceStatus({
-      coveragePct: fundamentalCoverage,
-      stale: fundamentalStale,
-      conflicting: hasFundamentalConflict
-    }),
-    coveragePct:
-      decisionRound(
-        fundamentalCoverage,
-        2
-      ),
-    summaryCoveragePct:
-      decisionRound(
-        summaryCoverage,
-        2
-      ),
-    extendedCoveragePct:
-      decisionRound(
-        extendedCoverage,
-        2
-      ),
-    missing:
-      uniqueTextValues(
-        fundamentalMissing
-      ),
-    stale: fundamentalStale,
-    conflicting:
-      hasFundamentalConflict,
-    evidenceState:
-      fundamentalState ||
-      null,
-    negativeEvidence:
-      analystGate?.state ===
-        'REJECT',
-    note:
-      shortTerm
-        ? 'Fundamentals are useful context but are not a mandatory Trader-brain input.'
-        : analystGate?.state === 'REJECT'
-          ? 'Financial evidence is sufficiently explicit to support a negative conclusion; negative evidence is not treated as missing evidence.'
-          : 'Financial evidence determines long-term thesis confidence. Missing fields reduce confidence rather than becoming negative facts.'
-  };
-
-  const liquidityMissing = [];
-  let liquidityCoverage = 0;
-
-  if (
-    safeNumber(
-      candidate?.averageVolume30d
-    ) !== null
-  ) {
-    liquidityCoverage += 50;
-  } else {
-    liquidityMissing.push(
-      '30-day average volume'
-    );
-  }
-
-  if (
-    safeNumber(
-      candidate?.risk?.liquidityScore
-    ) !== null
-  ) {
-    liquidityCoverage += 50;
-  } else {
-    liquidityMissing.push(
-      'liquidity score'
-    );
-  }
-
-  const liquidityDomain = {
-    required: shortTerm,
-    status: evidenceIntelligenceStatus({
-      coveragePct: liquidityCoverage
-    }),
-    coveragePct:
-      decisionRound(
-        liquidityCoverage,
-        2
-      ),
-    missing: liquidityMissing,
-    stale: false,
-    conflicting: false,
-    note:
-      shortTerm
-        ? 'Liquidity evidence is required for practical short-term execution and sizing.'
-        : 'Liquidity is a supporting long-term risk input unless it becomes extreme.'
-  };
-
-  const valuationKnown =
-    safeNumber(
-      candidate?.valuation?.score
-    ) !== null;
-
-  const riskKnown =
-    safeNumber(
-      candidate?.risk?.score
-    ) !== null;
-
-  const longTermContextCoverage =
-    (
-      valuationKnown ? 50 : 0
-    ) +
-    (
-      riskKnown ? 50 : 0
-    );
-
-  const longTermContextMissing = [];
-  if (!valuationKnown) {
-    longTermContextMissing.push(
-      'valuation context'
-    );
-  }
-  if (!riskKnown) {
-    longTermContextMissing.push(
-      'risk context'
-    );
-  }
-
-  const longTermContextDomain = {
-    required: !shortTerm,
-    status: evidenceIntelligenceStatus({
-      coveragePct:
-        longTermContextCoverage
-    }),
-    coveragePct:
-      decisionRound(
-        longTermContextCoverage,
-        2
-      ),
-    missing:
-      longTermContextMissing,
-    stale: false,
-    conflicting: false,
-    note:
-      'Valuation and risk context help distinguish a good company from a good long-term investment at the current price.'
-  };
-
-  const corporateEvidence =
-    Array.isArray(candidate?.announcements)
-      ? candidate.announcements
-      : Array.isArray(candidate?.events)
-        ? candidate.events
-        : Array.isArray(candidate?.corporateActions)
-          ? candidate.corporateActions
-          : null;
-
-  const corporateDomain = {
-    required: false,
-    status:
-      corporateEvidence
-        ? 'KNOWN'
-        : 'UNKNOWN',
-    coveragePct:
-      corporateEvidence
-        ? 100
-        : 0,
-    missing:
-      corporateEvidence
-        ? []
-        : ['current event / announcement context'],
-    stale: false,
-    conflicting: false,
-    note:
-      corporateEvidence
-        ? 'Current corporate/event context is available to the candidate.'
-        : 'Corporate/event context was not attached to this candidate. It remains unknown and is not automatically treated as negative evidence.'
-  };
-
-  const domains = {
-    market: marketDomain,
-    technical: technicalDomain,
-    fundamentals: fundamentalDomain,
-    liquidity: liquidityDomain,
-    longTermContext:
-      longTermContextDomain,
-    corporateEvents:
-      corporateDomain
-  };
-
-  const blockers = [];
-  const limitations = [];
-
-  if (
-    marketDomain.status === 'UNKNOWN' ||
-    marketDomain.status === 'STALE' ||
-    marketDomain.status === 'CONFLICTING'
-  ) {
-    blockers.push(
-      'Reliable current market evidence is not sufficient.'
-    );
-  }
-
-  let sufficiencyState = 'SUFFICIENT';
-  let sufficiencyLevel = 'DECISION_READY';
-
-  if (shortTerm) {
-    if (
-      technicalDomain.status === 'UNKNOWN' ||
-      technicalDomain.status === 'STALE' ||
-      technicalDomain.status === 'CONFLICTING' ||
-      technicalDomain.coveragePct < 60
-    ) {
-      blockers.push(
-        'Short-term technical evidence is not sufficient for a dependable Trader-brain conclusion.'
-      );
-    }
-
-    if (
-      liquidityDomain.status === 'UNKNOWN' ||
-      liquidityDomain.coveragePct < 50
-    ) {
-      blockers.push(
-        'Execution/liquidity evidence is incomplete for a short-term trade decision.'
-      );
-    }
-
-    if (
-      professional?.marketAction === 'BUY' &&
-      tradePlan?.complete !== true
-    ) {
-      blockers.push(
-        'An actionable short-term BUY requires a complete entry, stop and target plan.'
-      );
-    }
-
-    if (
-      fundamentalDomain.status === 'UNKNOWN' ||
-      fundamentalDomain.status === 'PARTIAL'
-    ) {
-      limitations.push(
-        'Fundamental evidence is incomplete, but it is not mandatory for the current short-term decision.'
-      );
-    }
-
-    if (corporateDomain.status === 'UNKNOWN') {
-      limitations.push(
-        'Current corporate-event context is not attached; this remains an explicit unknown rather than a negative score.'
-      );
-    }
-  } else {
-    if (
-      fundamentalDomain.status === 'UNKNOWN' ||
-      fundamentalDomain.status === 'CONFLICTING' ||
-      analystGate?.state === 'RESEARCHING' ||
-      analystGate?.validationTier === 'SECTOR_MODEL_REQUIRED'
-    ) {
-      blockers.push(
-        'Long-term financial evidence is not sufficient for a dependable high-conviction thesis.'
-      );
-    }
-
-    if (
-      longTermContextDomain.status === 'UNKNOWN' ||
-      longTermContextDomain.coveragePct < 100
-    ) {
-      blockers.push(
-        'Long-term valuation/risk context is incomplete.'
-      );
-    }
-
-    if (
-      fundamentalDomain.status === 'PARTIAL' ||
-      analystGate?.state === 'PARTIALLY_VALIDATED' ||
-      extendedCoverage < 67
-    ) {
-      limitations.push(
-        'Headline financial evidence may be usable, but extended statement validation is incomplete.'
-      );
-    }
-
-    if (
-      technicalDomain.status === 'UNKNOWN' ||
-      technicalDomain.status === 'PARTIAL'
-    ) {
-      limitations.push(
-        'Technical evidence is incomplete; long-term thesis quality can still be assessed, but entry-timing confidence is lower.'
-      );
-    }
-
-    if (corporateDomain.status === 'UNKNOWN') {
-      limitations.push(
-        'Current corporate-event context is not attached; it is treated as unknown, not negative.'
-      );
-    }
-  }
-
-  if (blockers.length) {
-    sufficiencyState = 'INSUFFICIENT';
-    sufficiencyLevel = 'RESEARCH_REQUIRED';
-  } else if (limitations.length) {
-    sufficiencyState = 'PARTIAL';
-    sufficiencyLevel = 'DECISION_WITH_LIMITATIONS';
-  }
-
-  // Evidence confidence is intentionally based on decision-relevant coverage.
-  // Optional unknowns reduce explanation confidence only when they matter to
-  // the selected horizon; they are never converted into negative evidence.
-  let confidenceScore;
-
-  if (shortTerm) {
-    confidenceScore =
-      marketDomain.coveragePct * 0.20 +
-      technicalDomain.coveragePct * 0.50 +
-      liquidityDomain.coveragePct * 0.25 +
-      (
-        corporateDomain.status === 'KNOWN'
-          ? 5
-          : 0
-      );
-  } else {
-    confidenceScore =
-      marketDomain.coveragePct * 0.10 +
-      fundamentalDomain.coveragePct * 0.50 +
-      longTermContextDomain.coveragePct * 0.25 +
-      technicalDomain.coveragePct * 0.10 +
-      (
-        corporateDomain.status === 'KNOWN'
-          ? 5
-          : 0
-      );
-  }
-
-  const staleCount =
-    Object.values(domains)
-      .filter(
-        domain =>
-          domain?.stale === true
-      )
-      .length;
-
-  const conflictCount =
-    Object.values(domains)
-      .filter(
-        domain =>
-          domain?.conflicting === true
-      )
-      .length;
-
-  confidenceScore -=
-    staleCount * 10 +
-    conflictCount * 20;
-
-  if (sufficiencyState === 'INSUFFICIENT') {
-    confidenceScore = Math.min(
-      confidenceScore,
-      49
-    );
-  }
-
-  confidenceScore =
-    decisionRound(
-      decisionClamp(
-        confidenceScore
-      ),
-      2
-    );
-
-  const confidenceLevel =
-    confidenceScore >= 82
-      ? 'HIGH'
-      : confidenceScore >= 65
-        ? 'MEDIUM'
-        : confidenceScore >= 45
-          ? 'LOW'
-          : 'UNRESOLVED';
-
-  return {
-    version:
-      EVIDENCE_INTELLIGENCE_VERSION,
-    mode: 'SHADOW_NON_BLOCKING',
-    horizon,
-    principle:
-      'UNKNOWN_IS_NOT_NEGATIVE',
-    liveDecisionInfluence: 'NONE',
-    domains,
-    decisionSufficiency: {
-      state:
-        sufficiencyState,
-      level:
-        sufficiencyLevel,
-      blockers:
-        uniqueTextValues(
-          blockers
-        ),
-      limitations:
-        uniqueTextValues(
-          limitations
-        )
-    },
-    confidence: {
-      level:
-        confidenceLevel,
-      score:
-        confidenceScore,
-      note:
-        'Confidence measures whether NOMAD has enough relevant evidence for this specific decision. It does not convert missing information into a negative company or setup score.'
-    },
-    currentDecisionReference: {
-      marketAction:
-        professional?.marketAction ||
-        null,
-      opportunityTier:
-        professional?.opportunityTier ||
-        null,
-      thesisStatus:
-        professional?.thesisStatus ||
-        null
-    },
-    regressionGuard: {
-      decisionChanged: false,
-      allocationChanged: false,
-      note:
-        'Shadow evidence intelligence is observational only in this build.'
-    }
-  };
-}
-
-
-/* =========================================================
    PROFESSIONAL INVESTOR / TRADER DECISION FRAMEWORK - BUILD 0.9.1
    Long-term and short-term are separate analytical frameworks.
 ========================================================= */
@@ -24134,105 +23367,6 @@ function professionalDecisionView(
     : professionalLongTermView(candidate, analystGate, evidence);
 }
 
-function safeDecisionEvidenceIntelligence(
-  candidate,
-  analystGate,
-  evidence,
-  professional
-) {
-  try {
-    return buildDecisionEvidenceIntelligence(
-      candidate,
-      analystGate,
-      evidence,
-      professional
-    );
-  } catch (error) {
-    return {
-      version: EVIDENCE_INTELLIGENCE_VERSION,
-      mode: 'SHADOW_NON_BLOCKING',
-      horizon:
-        String(candidate?.horizon || 'long_term') === 'short_term'
-          ? 'short_term'
-          : 'long_term',
-      principle: 'UNKNOWN_IS_NOT_NEGATIVE',
-      liveDecisionInfluence: 'NONE',
-      status: 'SHADOW_ERROR',
-      error:
-        error?.message ||
-        'Evidence shadow could not be calculated.',
-      domains: {},
-      decisionSufficiency: {
-        state: 'UNRESOLVED',
-        level: 'SHADOW_UNAVAILABLE',
-        blockers: [],
-        limitations: [
-          'Evidence Intelligence failed in shadow mode. The locked Investor/Trader decision remains authoritative.'
-        ]
-      },
-      confidence: {
-        level: 'UNRESOLVED',
-        score: 0,
-        note: 'Shadow evidence calculation failed and was isolated from the live decision.'
-      },
-      currentDecisionReference: {
-        marketAction: professional?.marketAction || null,
-        opportunityTier: professional?.opportunityTier || null,
-        thesisStatus: professional?.thesisStatus || null
-      },
-      regressionGuard: {
-        decisionChanged: false,
-        allocationChanged: false,
-        note: 'Shadow failure was isolated; live decision logic was not changed.'
-      }
-    };
-  }
-}
-
-function compactDecisionEvidenceIntelligence(shadow) {
-  if (!shadow) {
-    return null;
-  }
-
-  const compactDomains = {};
-  for (const [name, domain] of Object.entries(shadow.domains || {})) {
-    compactDomains[name] = {
-      required: domain?.required === true,
-      status: domain?.status || 'UNKNOWN',
-      coveragePct: safeNumber(domain?.coveragePct),
-      stale: domain?.stale === true,
-      conflicting: domain?.conflicting === true
-    };
-  }
-
-  return {
-    version: shadow.version || EVIDENCE_INTELLIGENCE_VERSION,
-    mode: shadow.mode || 'SHADOW_NON_BLOCKING',
-    status: shadow.status || 'OK',
-    liveDecisionInfluence: 'NONE',
-    horizon: shadow.horizon || null,
-    confidence: {
-      level: shadow?.confidence?.level || 'UNRESOLVED',
-      score: safeNumber(shadow?.confidence?.score)
-    },
-    decisionSufficiency: {
-      state: shadow?.decisionSufficiency?.state || 'UNRESOLVED',
-      level: shadow?.decisionSufficiency?.level || 'UNRESOLVED',
-      blockerCount: Array.isArray(shadow?.decisionSufficiency?.blockers)
-        ? shadow.decisionSufficiency.blockers.length
-        : 0,
-      limitationCount: Array.isArray(shadow?.decisionSufficiency?.limitations)
-        ? shadow.decisionSufficiency.limitations.length
-        : 0
-    },
-    domains: compactDomains,
-    regressionGuard: {
-      decisionChanged: false,
-      allocationChanged: false
-    }
-  };
-}
-
 function decisionCanonicalCompanyState(
   candidate
 ) {
@@ -24271,14 +23405,6 @@ function decisionCanonicalCompanyState(
       evidence
     );
 
-  const evidenceIntelligence =
-    safeDecisionEvidenceIntelligence(
-      candidate,
-      analystGate,
-      evidence,
-      professional
-    );
-
   const researchState =
     professional.opportunityTier ===
       'EVIDENCE_RESEARCH'
@@ -24307,7 +23433,7 @@ function decisionCanonicalCompanyState(
           ? 'WATCH is never allowed to receive new capital.'
           : 'The professional framework does not permit a new-money allocation.';
 
-  const canonicalState = {
+  return {
     securityState:
       'ACTIVE_CANDIDATE',
     evidence,
@@ -24329,24 +23455,6 @@ function decisionCanonicalCompanyState(
         allocationReason
     }
   };
-
-  // Evidence Intelligence is intentionally non-enumerable. Decision Center
-  // used to serialize the full shadow object on every candidate, inflating the
-  // decision-lab response and making the UI appear to hang. The shadow layer
-  // remains available to server-side validation without changing or bloating
-  // the locked Investor / Trader decision contract.
-  Object.defineProperty(
-    canonicalState,
-    'evidenceIntelligence',
-    {
-      value: evidenceIntelligence,
-      enumerable: false,
-      configurable: false,
-      writable: false
-    }
-  );
-
-  return canonicalState;
 }
 
 function decisionCenterCandidateView(
@@ -24432,10 +23540,6 @@ function decisionCenterSummary(
       canonical.analystGate,
     canonicalState:
       canonical,
-    evidenceShadow:
-      compactDecisionEvidenceIntelligence(
-        canonical.evidenceIntelligence
-      ),
     professional:
       canonical.professional || null,
     thesisStatus:
@@ -25110,7 +24214,9 @@ function decisionProfileSuitability(
 }
 
 function decisionMinimumMeaningfulPositionPkr(
-  newMoneyAmountPkr
+  newMoneyAmountPkr,
+  targetPositions =
+    DECISION_CENTER_MIN_TARGET_POSITIONS
 ) {
   const amount =
     Math.max(
@@ -25121,6 +24227,30 @@ function decisionMinimumMeaningfulPositionPkr(
     );
 
   if (amount <= 0) {
+    return 0;
+  }
+
+  const targetCount =
+    Math.max(
+      1,
+      Math.floor(
+        safeNumber(
+          targetPositions
+        ) ||
+        DECISION_CENTER_MIN_TARGET_POSITIONS
+      )
+    );
+
+  // Production hardening 0.9.6.5: the fixed PKR 1,000 floor is useful for
+  // normal portfolios, but it must never create a hidden minimum account size.
+  // If the whole budget is smaller than one legacy floor per target position,
+  // switch to whole-share sizing and let affordability + risk/portfolio caps
+  // determine the allocation. The analyst/evidence gates remain unchanged.
+  if (
+    amount <
+      DECISION_MIN_MEANINGFUL_POSITION_PKR *
+      targetCount
+  ) {
     return 0;
   }
 
@@ -27247,9 +26377,17 @@ function allocateDecisionCenterOpportunities(
       ? 1
       : dynamicCaps.sectorCapPct;
 
+  const smallCapitalWholeShareMode =
+    budgetPaisa > 0 &&
+    budgetPaisa <
+      DECISION_MIN_MEANINGFUL_POSITION_PKR *
+      Math.max(1, targetPositionCount) *
+      100;
+
   const minimumMeaningfulPositionPkr =
     decisionMinimumMeaningfulPositionPkr(
-      amount
+      amount,
+      targetPositionCount
     );
   const minimumMeaningfulPositionPaisa =
     Math.round(
@@ -27341,6 +26479,7 @@ function allocateDecisionCenterOpportunities(
           ? 'This plan is intentionally restricted to ' + sectorConstraint + '. Cross-sector diversification is disabled by user choice; stock-level evidence, risk and sizing gates remain active.'
           : null,
       minimumMeaningfulPositionPkr,
+      smallCapitalWholeShareMode,
       marketableLotPolicy:
         'PSX_REGULAR_ONE_SHARE',
       unfundedPriorityOne: [],
@@ -27348,8 +26487,22 @@ function allocateDecisionCenterOpportunities(
     };
   }
 
+  // With very small budgets, reserve candidates must not dilute each preferred
+  // position below whole-share affordability. Size from the preferred target
+  // set first; reserve candidates remain available only as fallback choices.
+  const strengthSizingCandidates =
+    smallCapitalWholeShareMode
+      ? candidates.slice(
+          0,
+          Math.max(
+            1,
+            targetPositionCount
+          )
+        )
+      : candidates;
+
   const strengthTotal =
-    candidates.reduce(
+    strengthSizingCandidates.reduce(
       (
         sum,
         candidate
@@ -28338,6 +27491,7 @@ function allocateDecisionCenterOpportunities(
         ? 'This plan is intentionally restricted to ' + sectorConstraint + '. Cross-sector diversification is disabled by user choice; stock-level evidence, risk and sizing gates remain active.'
         : null,
     minimumMeaningfulPositionPkr,
+    smallCapitalWholeShareMode,
     marketableLotPolicy:
       'PSX_REGULAR_ONE_SHARE',
     unfundedPriorityOne,
@@ -29359,7 +28513,7 @@ async function recordDecisionRun(
 
 /* =========================================================
    ASK NOMAD - GROUNDED CONVERSATIONAL ORCHESTRATOR
-   Build 0.9.7.3
+   Build 0.9.6.3
    The chat layer never invents an investment conclusion. It routes a
    question through NOMAD's existing portfolio, Investor, Trader and
    allocation engines, then explains the structured result.
@@ -29371,49 +28525,22 @@ function askNomadNormalizeText(value) {
 
 function askNomadExtractCapital(message) {
   const text = askNomadNormalizeText(message).toLowerCase().replace(/,/g, '');
-
-  function scaledAmount(rawAmount, rawUnit, allowSmall = true) {
-    let amount = Number(rawAmount);
-    if (!Number.isFinite(amount) || amount <= 0) return null;
-    const unit = String(rawUnit || '').toLowerCase();
+  const patterns = [
+    /(?:pkr|rs\.?|rupees?)\s*([0-9]+(?:\.[0-9]+)?)\s*(k|m|million|thousand|lakh|lac|crore)?/i,
+    /([0-9]+(?:\.[0-9]+)?)\s*(k|m|million|thousand|lakh|lac|crore)\b/i
+  ];
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (!match) continue;
+    let amount = Number(match[1]);
+    if (!Number.isFinite(amount) || amount <= 0) continue;
+    const unit = String(match[2] || '').toLowerCase();
     if (unit === 'k' || unit === 'thousand') amount *= 1000;
     else if (unit === 'm' || unit === 'million') amount *= 1000000;
     else if (unit === 'lakh' || unit === 'lac') amount *= 100000;
     else if (unit === 'crore') amount *= 10000000;
-    if (!allowSmall && amount < 100) return null;
     return amount;
   }
-
-  // Currency may appear before OR after the amount. The previous router only
-  // understood "PKR 1000", which caused natural questions such as
-  // "where should I invest 1000 PKR?" to fall through as unsupported.
-  const currencyPatterns = [
-    /(?:pkr|rs\.?|rupees?)\s*([0-9]+(?:\.[0-9]+)?)\s*(k|m|million|thousand|lakh|lac|crore)?/i,
-    /([0-9]+(?:\.[0-9]+)?)\s*(k|m|million|thousand|lakh|lac|crore)?\s*(?:pkr|rs\.?|rupees?)\b/i,
-    /([0-9]+(?:\.[0-9]+)?)\s*(k|m|million|thousand|lakh|lac|crore)\b/i
-  ];
-
-  for (const pattern of currencyPatterns) {
-    const match = text.match(pattern);
-    if (!match) continue;
-    const amount = scaledAmount(match[1], match[2], true);
-    if (amount !== null) return amount;
-  }
-
-  // Also understand natural money phrasing without a currency label, while
-  // deliberately refusing tiny ambiguous numbers such as "5 years".
-  const contextualPatterns = [
-    /\b(?:invest|deploy|allocate|budget|capital|spend|put in|put)\b[\s\S]{0,18}?([0-9]+(?:\.[0-9]+)?)(?:\s*(k|m|million|thousand|lakh|lac|crore))?/i,
-    /([0-9]+(?:\.[0-9]+)?)(?:\s*(k|m|million|thousand|lakh|lac|crore))?[\s\S]{0,18}\b(?:to invest|for investment|as capital|budget)\b/i
-  ];
-
-  for (const pattern of contextualPatterns) {
-    const match = text.match(pattern);
-    if (!match) continue;
-    const amount = scaledAmount(match[1], match[2], false);
-    if (amount !== null) return amount;
-  }
-
   return null;
 }
 
@@ -29451,51 +28578,15 @@ function askNomadInferHorizon(message, fallback) {
   return fallback === 'short_term' ? 'short_term' : 'long_term';
 }
 
-function askNomadLooksInvestmentRelated(message) {
+function askNomadClassifyIntent(message, symbols) {
   const text = askNomadNormalizeText(message).toLowerCase();
-  return /\b(invest|investment|investing|trade|trading|stock|stocks|share|shares|portfolio|holding|holdings|position|positions|market|psx|buy|sell|hold|add|reduce|exit|entry|stop|target|breakout|pullback|capital|cash|pkr|rupees?|long[ -]?term|short[ -]?term|dividend|valuation|risk|sector)\b/.test(text);
-}
-
-function askNomadClassifyIntent(message, symbols, explicitCapital = null) {
-  const text = askNomadNormalizeText(message).toLowerCase();
-  const hasCapital = safeNumber(explicitCapital) !== null && safeNumber(explicitCapital) > 0;
-  const portfolioMention = /\b(portfolio|my stocks?|my shares?|my holdings?|holdings?|my positions?|positions?|concentration|diversif(?:y|ied|ication))\b/.test(text);
-  const actionCue = /\b(sell|reduce|exit|buy|add|hold|rebalance|rotate|switch|steps?|action|do anything|what should i do|should i)\b/.test(text);
-  const allocationCue = /\b(invest|investment|deploy|allocate|allocation|put in|put money|use this money|use my money|new capital|new money|capital|budget|what should i buy|buy anything|where[^?.]{0,30}invest|how[^?.]{0,30}invest|something for long[ -]?term|something for short[ -]?term)\b/.test(text);
-
-  // Cash-raising is a distinct portfolio problem and must win before generic
-  // capital routing even when the same sentence contains a PKR amount.
   if (/\b(need|raise|withdraw|take out|free up|require)\b[\s\S]{0,45}\b(cash|money|pkr|rs\.?|rupees?)\b|\bcash within\b|\bneed cash\b|\braise cash\b/.test(text)) return 'LIQUIDITY_PLAN';
-
-  if (symbols.length >= 2 && /\b(compare|versus|vs\.?|better|choose between|prefer)\b/.test(text)) return 'COMPARE_STOCKS';
-
-  // A named stock remains a stock-analysis question even when an amount is
-  // mentioned (e.g. "should I put PKR 20,000 into PRL?"). The stock brain is
-  // authoritative; the chat layer can then explain affordability/context.
+  if (symbols.length >= 2 && /\b(compare|versus|vs\.?|better)\b/.test(text)) return 'COMPARE_STOCKS';
   if (symbols.length >= 1) return 'STOCK_ANALYSIS';
-
-  if (portfolioMention && actionCue) return 'PORTFOLIO_ACTIONS';
-  if (portfolioMention) return 'PORTFOLIO_REVIEW';
-
-  if (/\b(market|psx|index|breadth|gainers|losers|session|market today|market look|market doing)\b/.test(text)) return 'MARKET_OUTLOOK';
-
-  // Natural capital questions should not depend on one exact sentence shape.
-  // If a user gives us money and asks an investment/trading question, that is
-  // enough to run the Decision Center. This covers "I have 1000 PKR, long term",
-  // "where and how should I invest 1000 pkr", "what can I do with Rs 5000", etc.
-  if (hasCapital && (allocationCue || actionCue || /\b(long[ -]?term|short[ -]?term|years?|months?|what should i do|where|how)\b/.test(text) || askNomadLooksInvestmentRelated(text))) {
-    return 'CAPITAL_DECISION';
-  }
-
-  // An allocation question without an amount is still recognized correctly;
-  // the capital-decision handler will ask only for the missing amount.
-  if (allocationCue) return 'CAPITAL_DECISION';
-
-  // Open-ended investment discussion is valid Ask NOMAD input. It is not an
-  // "unsupported question"; route it to a grounded market-context response and
-  // ask for a missing stock/amount only if the requested action truly needs one.
-  if (askNomadLooksInvestmentRelated(text)) return 'GENERAL_INVESTMENT';
-
+  if (/\b(market|psx|index|breadth|gainers|losers|session)\b/.test(text) && !/\bportfolio|my stocks?|holdings?\b/.test(text)) return 'MARKET_OUTLOOK';
+  if (/\b(invest more|deploy|put in|allocate|new capital|new money|where should i invest|what should i buy|buy anything)\b/.test(text)) return 'CAPITAL_DECISION';
+  if (/\b(sell|reduce|exit|buy|add|hold|steps?|action|do anything|should i|rebalance|rotate)\b/.test(text) && /\b(portfolio|my stocks?|holdings?|anything|positions?)\b/.test(text)) return 'PORTFOLIO_ACTIONS';
+  if (/\b(portfolio|my stocks?|holdings?|how.*doing|how.*look|today|concentration|diversif|risk)\b/.test(text)) return 'PORTFOLIO_REVIEW';
   return 'GENERAL';
 }
 
@@ -29730,8 +28821,8 @@ async function runAskNomad(input) {
     symbols = contextSymbols;
   }
   const horizon = askNomadInferHorizon(message, String(input?.horizon || 'long_term'));
+  const intent = askNomadClassifyIntent(message, symbols);
   const explicitCapital = safeNumber(input?.capital) || askNomadExtractCapital(message);
-  const intent = askNomadClassifyIntent(message, symbols, explicitCapital);
   const basis = {
     marketSource: 'Official PSX Data Portal',
     marketAsOf: market?.marketWatchAsOf || market?.asOf || null,
@@ -29807,90 +28898,21 @@ async function runAskNomad(input) {
     }
     const decision = await runDecisionLab({amount:explicitCapital, horizon, risk:requestedRisk, sector:String(input?.sector || '')});
     basis.engines.push(horizon === 'short_term' ? 'Short-term Trader brain' : 'Long-term Investor brain', 'Decision Center allocator', 'Portfolio-fit engine');
-
-    const allocations = (decision?.allocations || []).map(a => ({
-      type:'allocation',
-      symbol:a.symbol,
-      shares:a.shares,
-      amountPkr:a.principalPkr,
-      marketAction:a.marketView || a.decisionCenterView || null,
-      personalAction:a.portfolioAction || null,
-      note:a.note || ''
-    }));
-
-    const rankedIdeas = [
-      ...(decision?.opportunityBoard?.priority1 || []),
-      ...(decision?.opportunityBoard?.priority2 || [])
-    ]
-      .filter(item => item?.symbol)
-      .slice(0, 3);
-
-    const rankedIdeaCards = rankedIdeas.map(item => ({
-      type:'strategy',
-      symbol:item.symbol,
-      price:safeNumber(item.price),
-      marketAction:item.decisionCenterView || item?.canonicalState?.marketAction || 'WATCH',
-      personalAction:'WAIT',
-      dayChangePct:null,
-      note:item.reason || item?.canonicalState?.reason || ''
-    }));
-
-    const noDeployment =
-      safeNumber(decision?.decision?.amountInvestedPkr) === null ||
-      safeNumber(decision?.decision?.amountInvestedPkr) <= 0;
-
-    const topIdea = rankedIdeas[0] || null;
-    const diagnostics = decision?.allocationDiagnostics || {};
-
-    const noDeploymentSummary = topIdea
-      ? 'NOMAD did find investable ideas. The highest-ranked current idea is ' + topIdea.symbol +
-        (safeNumber(topIdea.price) !== null ? ' around PKR ' + decisionRound(topIdea.price, 2) : '') +
-        ', but the allocator will not force your ' + askNomadMoney(explicitCapital) +
-        ' into a position that fails the current whole-share, meaningful-position, diversification or risk limits.'
-      : (decision?.decision?.headline || decision?.decision?.reason || 'No qualifying allocation is available right now.');
-
+    const allocations = (decision?.allocations || []).map(a => ({type:'allocation',symbol:a.symbol,shares:a.shares,amountPkr:a.principalPkr,marketAction:a.marketView || a.decisionCenterView || null,personalAction:a.portfolioAction || null,note:a.note || ''}));
     return {
       status:'OK', build:VERSION, intent, basis,
       answer:{
-        headline: decision?.decision?.action === 'INVEST'
-          ? 'NOMAD would deploy most of this capital.'
-          : decision?.decision?.action === 'PARTIAL_INVEST'
-            ? 'NOMAD would deploy only part of this capital.'
-            : noDeployment
-              ? 'NOMAD would keep ' + askNomadMoney(explicitCapital) + ' in cash today rather than force a weak fit.'
-              : 'NOMAD would keep part of this capital in cash.',
-        summary: noDeployment ? noDeploymentSummary : (decision?.decision?.headline || decision?.decision?.reason || 'Decision Center completed.'),
+        headline: decision?.decision?.action === 'INVEST' ? 'NOMAD would deploy most of this capital.' : decision?.decision?.action === 'PARTIAL_INVEST' ? 'NOMAD would deploy only part of this capital.' : 'NOMAD would keep this capital in cash for now.',
+        summary: decision?.decision?.headline || decision?.decision?.reason || 'Decision Center completed.',
         bullets:[
           'Capital evaluated: ' + askNomadMoney(explicitCapital),
           'Deploy now: ' + askNomadMoney(decision?.decision?.amountInvestedPkr),
-          horizon === 'short_term' && safeNumber(decision?.shortTermTriggerPlan?.reservedPkr) !== null
-            ? 'Reserved for valid triggers: ' + askNomadMoney(decision.shortTermTriggerPlan.reservedPkr)
-            : null,
-          'Cash remaining: ' + askNomadMoney(decision?.decision?.cashRemainingPkr),
-          noDeployment && rankedIdeas.length
-            ? 'Best current ideas: ' + rankedIdeas.map(item => item.symbol).join(', ') + '. NOMAD is showing them for context, not overriding the allocator with a forced BUY.'
-            : null,
-          noDeployment && safeNumber(diagnostics.minimumMeaningfulPositionPkr) !== null
-            ? 'Current minimum meaningful new-money position: ' + askNomadMoney(diagnostics.minimumMeaningfulPositionPkr) + '. Portfolio/risk caps still apply on top of this.'
-            : null,
-          noDeployment
-            ? 'This is a capital-fit decision, not a claim that the market has no good stocks.'
-            : null
+          horizon === 'short_term' && safeNumber(decision?.shortTermTriggerPlan?.reservedPkr) !== null ? 'Reserved for valid triggers: ' + askNomadMoney(decision.shortTermTriggerPlan.reservedPkr) : null,
+          'Cash remaining: ' + askNomadMoney(decision?.decision?.cashRemainingPkr)
         ].filter(Boolean)
       },
-      cards:allocations.length ? allocations : rankedIdeaCards,
-      decision:{
-        action:decision?.decision?.action,
-        amountInvestedPkr:decision?.decision?.amountInvestedPkr,
-        cashRemainingPkr:decision?.decision?.cashRemainingPkr,
-        reason:decision?.decision?.reason,
-        rankedIdeas:rankedIdeas.map(item => ({
-          symbol:item.symbol,
-          price:item.price,
-          marketAction:item.decisionCenterView || item?.canonicalState?.marketAction || null,
-          reason:item.reason || item?.canonicalState?.reason || null
-        }))
-      },
+      cards:allocations,
+      decision:{action:decision?.decision?.action, amountInvestedPkr:decision?.decision?.amountInvestedPkr, cashRemainingPkr:decision?.decision?.cashRemainingPkr, reason:decision?.decision?.reason},
       disclaimer:'Shadow decision intelligence only; no order is placed.'
     };
   }
@@ -29906,7 +28928,7 @@ async function runAskNomad(input) {
       return {status:'OK',build:VERSION,intent,basis,answer:{headline:a.symbol+' vs '+b.symbol,summary:'NOMAD ran the same '+(horizon==='short_term'?'Trader':'Investor')+' framework on both companies under your '+requestedRisk+' profile. The market view and your personal action remain separate.',bullets:[a.symbol+': Market '+a.marketAction+' · For you '+a.personalAction,b.symbol+': Market '+b.marketAction+' · For you '+b.personalAction]},cards,disclaimer:'No order is placed.'};
     }
     const c=cards[0];
-    return {status:'OK',build:VERSION,intent,basis,answer:{headline:c.symbol+': Market '+c.marketAction+' · For you '+c.personalAction,summary:c.personalReason || results[0]?.professional?.reason || 'Analysis completed.',bullets:[c.dayChangePct!==null?'Today: '+askNomadPct(c.dayChangePct)+' at '+askNomadMoney(c.price):null,c.setup?'Setup: '+c.setup:null,c.entryLow!==null?'Entry: '+c.entryLow+(c.entryHigh!==null?'–'+c.entryHigh:''):null,c.stop!==null?'Stop: '+c.stop:null,c.target!==null?'Target: '+c.target:null,c.rewardRisk!==null?'Reward/risk: '+decisionRound(c.rewardRisk,2)+':1':null,explicitCapital!==null&&safeNumber(c.price)>0?'Your '+askNomadMoney(explicitCapital)+' can buy up to '+Math.floor(explicitCapital/c.price).toLocaleString('en-US')+' whole shares before fees/charges at the current reference price.':null].filter(Boolean)},cards,disclaimer:'No order is placed.'};
+    return {status:'OK',build:VERSION,intent,basis,answer:{headline:c.symbol+': Market '+c.marketAction+' · For you '+c.personalAction,summary:c.personalReason || results[0]?.professional?.reason || 'Analysis completed.',bullets:[c.dayChangePct!==null?'Today: '+askNomadPct(c.dayChangePct)+' at '+askNomadMoney(c.price):null,c.setup?'Setup: '+c.setup:null,c.entryLow!==null?'Entry: '+c.entryLow+(c.entryHigh!==null?'–'+c.entryHigh:''):null,c.stop!==null?'Stop: '+c.stop:null,c.target!==null?'Target: '+c.target:null,c.rewardRisk!==null?'Reward/risk: '+decisionRound(c.rewardRisk,2)+':1':null].filter(Boolean)},cards,disclaimer:'No order is placed.'};
   }
 
   if (intent === 'PORTFOLIO_REVIEW' || intent === 'PORTFOLIO_ACTIONS') {
@@ -29929,28 +28951,9 @@ async function runAskNomad(input) {
     };
   }
 
-  if (intent === 'GENERAL_INVESTMENT') {
-    const summary = askNomadMarketSummary(market);
-    basis.engines.push('Market breadth engine');
-    const tone = summary.breadthPct === null ? 'mixed' : summary.breadthPct >= 58 ? 'constructive' : summary.breadthPct <= 42 ? 'weak' : 'mixed';
-    return {
-      status:'OK', build:VERSION, intent, basis,
-      answer:{
-        headline: horizon === 'short_term' ? 'I understand this as a trading question.' : 'I understand this as an investment question.',
-        summary:'The current PSX backdrop is '+tone+'. I can discuss the market without inventing inputs, but an exact stock recommendation or capital allocation needs the stock name or the amount you want NOMAD to evaluate.',
-        bullets:[
-          'Current breadth: '+summary.advancers+' advancing · '+summary.decliners+' declining · '+summary.unchanged+' unchanged.',
-          horizon === 'short_term' ? 'For an exact trade plan, name the stock or tell me the capital you want to deploy.' : 'For an exact long-term allocation, tell me the capital you want to deploy or name the stock you want assessed.'
-        ]
-      },
-      cards:[], marketSummary:summary,
-      disclaimer:'NOMAD used current market evidence and did not invent a stock, amount, or order.'
-    };
-  }
-
   return {
     status:'NEEDS_INPUT', build:VERSION, intent, basis,
-    answer:{headline:'Ask me anything about PSX investing or trading.',summary:'I could not safely map this message to an investment task. Rephrase it in your own words and I will route it through the relevant NOMAD engine; you do not need to use a predefined question.',bullets:[]},
+    answer:{headline:'I need a more specific investment question.',summary:'Ask about your portfolio, a PSX stock, the market, or a capital decision. I will route it through the relevant NOMAD engine rather than guess.',bullets:['Example: “How does my portfolio look today?”','Example: “Should I buy or sell anything?”','Example: “How does PRL look today?”','Example: “Where should I invest PKR 100,000?”']},
     cards:[]
   };
 }
@@ -31973,39 +30976,6 @@ async function runDecisionLab(
       probabilityClaim:
         'NONE — evidence strength is not a calibrated probability.'
     },
-    evidenceIntelligenceShadow: {
-      mode: 'SHADOW_NON_BLOCKING',
-      liveDecisionInfluence: 'NONE',
-      evaluatedCandidates: candidates.length,
-      sufficient: candidates.filter(
-        candidate =>
-          candidate?.canonicalState
-            ?.evidenceIntelligence
-            ?.decisionSufficiency
-            ?.state === 'SUFFICIENT'
-      ).length,
-      partial: candidates.filter(
-        candidate =>
-          candidate?.canonicalState
-            ?.evidenceIntelligence
-            ?.decisionSufficiency
-            ?.state === 'PARTIAL'
-      ).length,
-      insufficient: candidates.filter(
-        candidate =>
-          candidate?.canonicalState
-            ?.evidenceIntelligence
-            ?.decisionSufficiency
-            ?.state === 'INSUFFICIENT'
-      ).length,
-      shadowErrors: candidates.filter(
-        candidate =>
-          candidate?.canonicalState
-            ?.evidenceIntelligence
-            ?.status === 'SHADOW_ERROR'
-      ).length,
-      note: 'Evidence Intelligence is observational only and is excluded from live allocation decisions in this build.'
-    },
     allocations:
       allocation.allocations,
     shortTermTriggerPlan,
@@ -32120,7 +31090,6 @@ async function runDecisionLab(
       'Allocations are planning principals only. Brokerage, levies, taxes and execution slippage are not yet included.',
       'No order-execution capability exists. The user remains the final decision maker.',
       'Current scoring rules remain supporting evidence only; Priority 1 now also requires the Financial Analyst evidence gate.',
-      'Evidence Intelligence runs in compact shadow mode only. It cannot change Investor/Trader actions or allocation in this build.',
       'Opportunity ranking is independent of the entered budget. Portfolio construction targets at least three funded stocks and scales up to eight, but never forces a weak, unresolved, profile-unsuitable, unaffordable, or portfolio-incompatible name merely to hit the count.',
       'PSX regular-market equities use a one-share marketable lot; NOMAD therefore uses a minimum meaningful PKR position instead of outdated 20/50/100/500-share board-lot rules.',
       ...(
@@ -32419,13 +31388,13 @@ function runDecisionEngineSelfTests() {
     false
   );
 
-  const riskBalanced =
-    DECISION_RISK_POLICIES
-      .balanced;
-
   const riskConservative =
     DECISION_RISK_POLICIES
       .conservative;
+
+  const riskBalanced =
+    DECISION_RISK_POLICIES
+      .balanced;
 
   const riskAggressive =
     DECISION_RISK_POLICIES
@@ -32915,6 +31884,79 @@ function runDecisionEngineSelfTests() {
       riskBalanced
     );
 
+  // Production-hardening regression matrix. Small budgets must remain
+  // investable when at least one validated whole share fits, while all budgets
+  // must reconcile exactly and preserve whole-share sizing.
+  const hardeningBudgets =
+    [1000, 2500, 5000, 10000, 50000, 100000];
+
+  const hardeningRiskPolicies =
+    [
+      DECISION_RISK_POLICIES.conservative,
+      DECISION_RISK_POLICIES.balanced,
+      DECISION_RISK_POLICIES.aggressive
+    ];
+
+  for (
+    const hardeningRiskPolicy
+    of hardeningRiskPolicies
+  ) {
+    for (
+      const hardeningBudget
+      of hardeningBudgets
+    ) {
+      const hardeningAllocation =
+        allocateDecisionCenterOpportunities(
+          breadthBoard,
+          hardeningBudget,
+          hardeningRiskPolicy
+        );
+
+      assert.ok(
+        Math.abs(
+          hardeningAllocation.amountInvestedPkr +
+          hardeningAllocation.cashRemainingPkr -
+          hardeningBudget
+        ) <= 0.02,
+        'production allocation accounting must reconcile invested cash plus retained cash to the entered capital'
+      );
+
+      assert.ok(
+        hardeningAllocation.amountInvestedPkr >= 0 &&
+        hardeningAllocation.cashRemainingPkr >= 0 &&
+        hardeningAllocation.amountInvestedPkr <= hardeningBudget + 0.01,
+        'production allocation must never create negative cash or invest more than the entered capital'
+      );
+
+      assert.ok(
+        hardeningAllocation.allocations.every(
+          item =>
+            Number.isInteger(item.shares) &&
+            item.shares > 0
+        ),
+        'production allocation must always use positive whole shares'
+      );
+    }
+  }
+
+  const smallCapitalBroadAllocation =
+    allocateDecisionCenterOpportunities(
+      breadthBoard,
+      1000,
+      riskBalanced
+    );
+
+  assert.ok(
+    smallCapitalBroadAllocation.amountInvestedPkr > 0,
+    'PKR 1,000 must not be forced entirely to cash when validated affordable long-term opportunities exist'
+  );
+
+  assert.equal(
+    smallCapitalBroadAllocation.smallCapitalWholeShareMode,
+    true,
+    'PKR 1,000 should explicitly use small-capital whole-share sizing'
+  );
+
   assert.equal(
     decisionCenterTargetPositionCount(
       500000,
@@ -33384,191 +32426,6 @@ function runDecisionEngineSelfTests() {
     'confirmed short-term setup with acceptable reward-to-risk must be actionable'
   );
 
-  assert.equal(
-    shortTermProfessionalState
-      .evidenceIntelligence
-      ?.mode,
-    'SHADOW_NON_BLOCKING',
-    'evidence intelligence must run in shadow mode only'
-  );
-
-  assert.equal(
-    shortTermProfessionalState
-      .evidenceIntelligence
-      ?.regressionGuard
-      ?.decisionChanged,
-    false,
-    'shadow evidence intelligence must never claim to change the live decision'
-  );
-
-  assert.equal(
-    Object.prototype.propertyIsEnumerable.call(
-      shortTermProfessionalState,
-      'evidenceIntelligence'
-    ),
-    false,
-    'full evidence shadow must remain non-enumerable so Decision Center responses stay compact'
-  );
-
-  const compactEvidenceShadow =
-    compactDecisionEvidenceIntelligence(
-      shortTermProfessionalState.evidenceIntelligence
-    );
-
-  assert.ok(
-    compactEvidenceShadow &&
-    compactEvidenceShadow.liveDecisionInfluence === 'NONE',
-    'compact evidence shadow must remain observational only'
-  );
-
-  const shortTermWithoutFundamentals =
-    decisionCanonicalCompanyState({
-      ...longTermProfessionalCandidate,
-      horizon: 'short_term',
-      analystCore: null,
-      fundamentalEvidenceState:
-        'SECONDARY_NOT_REQUIRED',
-      price: 100,
-      marketAsOf:
-        new Date().toISOString(),
-      averageVolume30d: 500000,
-      risk: {
-        score: 72,
-        liquidityScore: 85
-      },
-      historicalContext: {
-        available: true,
-        contextSchemaVersion:
-          DECISION_HISTORICAL_CONTEXT_SCHEMA_VERSION,
-        asOf:
-          new Date().toISOString(),
-        validSessions: 120,
-        technical: {
-          rsi14: 58,
-          macdHistogram: 0.8,
-          volumeRatio20d: 1.4,
-          annualizedVolatility20dPct: 32
-        },
-        priceAction: {
-          available: true,
-          timingScore: 82,
-          timingState: 'GOOD',
-          setup: 'CONFIRMED_BREAKOUT',
-          atr14: 3.2,
-          support: 95,
-          resistance: 112,
-          tradePlan: {
-            complete: true,
-            state: 'DEFINED',
-            entryLow: 100,
-            entryHigh: 101,
-            entryReference: 100.5,
-            stop: 96,
-            target1: 111,
-            riskPerShare: 4.5,
-            rewardRisk: 2.33
-          }
-        }
-      }
-    });
-
-  assert.equal(
-    shortTermWithoutFundamentals.marketAction,
-    'BUY',
-    'missing optional fundamentals must not damage a valid short-term Trader BUY'
-  );
-
-  assert.equal(
-    shortTermWithoutFundamentals
-      .evidenceIntelligence
-      ?.domains
-      ?.fundamentals
-      ?.required,
-    false,
-    'fundamentals must be classified as optional for a short-term trade decision'
-  );
-
-  assert.notEqual(
-    shortTermWithoutFundamentals
-      .evidenceIntelligence
-      ?.decisionSufficiency
-      ?.state,
-    'INSUFFICIENT',
-    'missing optional fundamentals must not make otherwise sufficient Trader evidence insufficient'
-  );
-
-  const longTermMissingEvidenceShadow =
-    decisionCanonicalCompanyState({
-      ...longTermProfessionalCandidate,
-      analystCore: null,
-      marketAsOf:
-        new Date().toISOString()
-    });
-
-  assert.equal(
-    longTermMissingEvidenceShadow
-      .evidenceIntelligence
-      ?.domains
-      ?.fundamentals
-      ?.status,
-    'UNKNOWN',
-    'missing long-term financial evidence must be represented as UNKNOWN rather than weak/negative evidence'
-  );
-
-  assert.equal(
-    longTermMissingEvidenceShadow
-      .evidenceIntelligence
-      ?.decisionSufficiency
-      ?.state,
-    'INSUFFICIENT',
-    'missing mandatory long-term financial evidence must reduce decision sufficiency'
-  );
-
-  const longTermKnownNegativeShadow =
-    decisionCanonicalCompanyState({
-      ...longTermProfessionalCandidate,
-      marketAsOf:
-        new Date().toISOString(),
-      analystCore: {
-        ...longTermProfessionalCandidate.analystCore,
-        overallFinancialView: {
-          state: 'WEAK'
-        },
-        views: {
-          ...longTermProfessionalCandidate.analystCore.views,
-          cashFlowQuality: {
-            state: 'WEAK'
-          }
-        }
-      }
-    });
-
-  assert.equal(
-    longTermKnownNegativeShadow.marketAction,
-    'AVOID',
-    'explicit negative long-term evidence must keep the existing AVOID behavior'
-  );
-
-  assert.equal(
-    longTermKnownNegativeShadow
-      .evidenceIntelligence
-      ?.domains
-      ?.fundamentals
-      ?.negativeEvidence,
-    true,
-    'explicit negative evidence must be identified separately from missing evidence'
-  );
-
-  assert.notEqual(
-    longTermKnownNegativeShadow
-      .evidenceIntelligence
-      ?.domains
-      ?.fundamentals
-      ?.status,
-    'UNKNOWN',
-    'known negative evidence must not be mislabeled as missing evidence'
-  );
-
   const shortTermAllocationCandidate = {
     ...longTermProfessionalCandidate,
     symbol: 'TRADER1',
@@ -33639,6 +32496,45 @@ function runDecisionEngineSelfTests() {
       100000,
       riskBalanced
     );
+
+  for (
+    const hardeningRiskPolicy
+    of [
+      DECISION_RISK_POLICIES.conservative,
+      DECISION_RISK_POLICIES.balanced,
+      DECISION_RISK_POLICIES.aggressive
+    ]
+  ) {
+    for (
+      const hardeningBudget
+      of [1000, 2500, 5000, 10000, 50000, 100000]
+    ) {
+      const traderHardeningAllocation =
+        allocateDecisionCenterOpportunities(
+          shortTermBoard,
+          hardeningBudget,
+          hardeningRiskPolicy
+        );
+
+      assert.ok(
+        Math.abs(
+          traderHardeningAllocation.amountInvestedPkr +
+          traderHardeningAllocation.cashRemainingPkr -
+          hardeningBudget
+        ) <= 0.02,
+        'Trader allocation accounting must reconcile for every production hardening budget/profile pair'
+      );
+
+      assert.ok(
+        traderHardeningAllocation.allocations.every(
+          item =>
+            Number.isInteger(item.shares) &&
+            item.shares > 0
+        ),
+        'Trader production allocations must remain positive whole shares'
+      );
+    }
+  }
 
   assert.ok(
     !shortTermRiskSized.allocations.length ||
@@ -33914,9 +32810,15 @@ function runDecisionEngineSelfTests() {
   );
 
   assert.equal(
-    decisionMinimumMeaningfulPositionPkr(5000),
+    decisionMinimumMeaningfulPositionPkr(1000, 3),
+    0,
+    'a PKR 1k account must enter small-capital whole-share mode instead of being blocked by a hidden PKR 1k-per-position floor'
+  );
+
+  assert.equal(
+    decisionMinimumMeaningfulPositionPkr(5000, 3),
     1000,
-    'a PKR 5k account must avoid new positions smaller than the PKR 1k execution-practicality floor'
+    'a PKR 5k account must preserve the normal PKR 1k execution-practicality floor'
   );
 
   assert.equal(
@@ -34029,60 +32931,6 @@ function runDecisionEngineSelfTests() {
     longTermHighVolSuitability.state,
     'NOT_SUITABLE',
     'Long-term volatility profile gate must remain unchanged while the Trader brain uses stop-defined risk'
-  );
-
-  // Ask NOMAD natural-language routing regressions. Clear investment questions
-  // must not depend on one hard-coded phrase shape.
-  assert.equal(
-    askNomadExtractCapital('I have 1000 PKR and I want something for long term. What should I do?'),
-    1000,
-    'Ask NOMAD must understand amount-before-currency phrasing'
-  );
-
-  assert.equal(
-    askNomadExtractCapital('Where and how should I invest 1000 pkr?'),
-    1000,
-    'Ask NOMAD must extract capital from natural allocation questions'
-  );
-
-  assert.equal(
-    askNomadClassifyIntent(
-      'I have 1000 PKR and I want something for long term. What should I do?',
-      [],
-      1000
-    ),
-    'CAPITAL_DECISION',
-    'Ask NOMAD must route a natural long-term capital question to Decision Center'
-  );
-
-  assert.equal(
-    askNomadClassifyIntent(
-      'Where and how should I invest 1000 pkr?',
-      [],
-      1000
-    ),
-    'CAPITAL_DECISION',
-    'Ask NOMAD must not require the exact phrase "where should I invest"'
-  );
-
-  assert.equal(
-    askNomadClassifyIntent(
-      'How does my portfolio look today?',
-      [],
-      null
-    ),
-    'PORTFOLIO_REVIEW',
-    'Portfolio questions must remain portfolio questions after broadening Ask NOMAD routing'
-  );
-
-  assert.equal(
-    askNomadClassifyIntent(
-      'How does the PSX market look today?',
-      [],
-      null
-    ),
-    'MARKET_OUTLOOK',
-    'Market questions must remain market questions after broadening Ask NOMAD routing'
   );
 
   console.log(
@@ -35208,45 +34056,40 @@ function buildMarketPulseFromRows(
 }
 
 async function getIntelligenceFeed() {
-  // Home must remain useful even when scanner memory is unavailable or one
-  // Supabase intelligence table is temporarily slow. Live Official PSX facts
-  // and the portfolio are independent surfaces, so do not gate them behind
-  // continuous-memory configuration.
-  const memoryConfigured =
-    continuousMemoryConfigured();
-
-  const safeMemoryRead =
-    (path) =>
-      memoryConfigured
-        ? decisionWithTimeout(
-            supabaseRest(path),
-            2500,
-            'Optional intelligence-memory read'
-          ).catch(() => [])
-        : Promise.resolve([]);
+  if (!continuousMemoryConfigured()) {
+    return {
+      configured: false,
+      latestRun: null,
+      stateCoverage: 0,
+      historicalContextCoverage: 0,
+      coreUniverse:
+        PSX_UNIVERSE_MASTER.summary
+          .coreEquity,
+      attention: [],
+      marketPulse: null,
+      portfolioConfigured: false
+    };
+  }
 
   const [
     runs,
     states,
     changes,
     holdingsResult,
-    market
+    market,
+    marketStatus
   ] =
     await Promise.all([
-      safeMemoryRead(
+      supabaseRest(
         'intelligence_runs?select=id,run_type,status,started_at,completed_at,securities_processed,changes_detected,error_message,metadata&order=started_at.desc&limit=5'
       ),
-      safeMemoryRead(
+      supabaseRest(
         'security_state?select=symbol,market_price,market_change_pct,current_view,evaluated_at,market_state&eligibility=eq.RECOMMENDATION_ELIGIBLE'
       ),
-      safeMemoryRead(
+      supabaseRest(
         'state_changes?select=id,symbol,change_category,field_name,old_value,new_value,percentage_change,significance,summary,detected_at&order=detected_at.desc&limit=80'
       ),
-      decisionWithTimeout(
-        readPortfolioHoldings(),
-        2500,
-        'Optional Home portfolio-count read'
-      )
+      readPortfolioHoldings()
         .catch(
           () => ({
             configured: false,
@@ -35254,6 +34097,10 @@ async function getIntelligenceFeed() {
           })
         ),
       loadPSXMarket()
+        .catch(
+          () => null
+        ),
+      getPyPSXMarketStatus()
         .catch(
           () => null
         )
@@ -35441,8 +34288,9 @@ async function getIntelligenceFeed() {
     ) &&
     market.liveMarketRows.length
   ) {
-    // Home uses the same canonical Official PSX market facts as Explore PSX.
-    // It no longer depends on pyPSX status or scanner-memory availability.
+    // Market breadth and Top Movers are canonical Official PSX facts.
+    // The default scope is verified Main Board ordinary equities. Rights,
+    // legacy symbols and other special instruments never enter this pulse.
     const liveRows =
       market.liveMarketRows;
 
@@ -35473,18 +34321,15 @@ async function getIntelligenceFeed() {
         market.marketDataIntegrity ||
         null,
       marketStatus:
-        market.marketStatus ||
+        marketStatus ||
         null
     };
   }
 
   return {
-    configured:
-      memoryConfigured,
+    configured: true,
     scannerSecretConfigured:
-      memoryConfigured
-        ? scannerSecretConfigured()
-        : false,
+      scannerSecretConfigured(),
     latestRun:
       Array.isArray(runs) &&
       runs.length
@@ -36026,6 +34871,17 @@ async function handler(
       action ===
         'ask-nomad'
     ) {
+      if (!NOMAD_ASK_NOMAD_ENABLED) {
+        return sendJSON(
+          response,
+          {
+            message:
+              'Ask NOMAD is disabled in the 0.9.6.5 production-hardening build. Use Decision Center, Research and Portfolio for validated core intelligence.'
+          },
+          404
+        );
+      }
+
       const body =
         await readJsonRequestBody(
           request
@@ -40905,7 +39761,7 @@ button:not(.secondary):not(.miniButton):not(.chartModeButton):not(.navButton):no
 <button class="navButton active" data-nav="home"><span>⌂</span>Home</button>
 <button class="navButton" data-nav="portfolio"><span>▤</span>Portfolio</button>
 <button class="navButton" data-nav="decision"><span>◆</span>Decision Center</button>
-<button class="navButton askNomadNav" data-nav="ask"><span>✦</span>Ask NOMAD</button>
+<!-- Ask NOMAD intentionally disabled in core production-hardening build 0.9.6.5 -->
 <button class="navButton" data-nav="research"><span>⌕</span>Research</button>
 <button class="navButton" data-nav="explore"><span>↗</span>Explore PSX</button>
 <button class="navButton" data-nav="universe"><span>◎</span>Universe</button>
@@ -41103,7 +39959,7 @@ Checking connection...
 <div class="contextRow">
 <div style="grid-column:1/-1"><label>Industry / Sector</label><select id="decisionSector"><option value="">All industries</option></select></div>
 </div>
-<button id="findBestOption" type="button" class="primaryWide">Analyze PSX & build plan</button>
+<button id="findBestOption" class="primaryWide">Analyze PSX & build plan</button>
 <details class="setupHelp"><summary>How plan settings work</summary><div>Budget changes sizing, not opportunity ranking. Industry filters only constrain the search universe; evidence and risk gates remain unchanged.</div></details>
 </div>
 
@@ -42410,67 +41266,17 @@ async function apiPost(
 
 
 
-// Decision Center is a core action. Keep its click path independent from the
-// optional Home / Ask NOMAD / Portfolio initializers so one unrelated surface
-// can never disable the Analyze button.
-window.__nomadDecisionRequestSerial =
-  Number(window.__nomadDecisionRequestSerial || 0);
-
-function bindDecisionCenterCoreAction() {
-  const button = document.getElementById('findBestOption');
-
-  if (!button || button.dataset.nomadCoreBound === '1') {
-    return;
-  }
-
-  button.type = 'button';
-  button.disabled = false;
-  button.dataset.nomadCoreBound = '1';
-
-  button.addEventListener(
-    'click',
-    event => {
-      event.preventDefault();
-      event.stopPropagation();
-
-      Promise.resolve()
-        .then(() => runDecisionCenterAnalysis())
-        .catch(error => {
-          button.disabled = false;
-          button.dataset.running = '0';
-          button.textContent = 'Analyze PSX & build plan';
-
-          const target = document.getElementById('decisionResult');
-          if (target) {
-            target.innerHTML =
-              '<strong>Decision Center could not start.</strong><br>' +
-              '<span class="decisionMinor">' +
-              escapeHtml(error?.message || 'Unknown Decision Center error.') +
-              '</span>';
-          }
-        });
-    }
-  );
-}
-
-// The markup already exists when this application script runs. Bind now and
-// bind once more on DOMContentLoaded as a defensive fallback for any future
-// shell refactor.
-bindDecisionCenterCoreAction();
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', bindDecisionCenterCoreAction, { once: true });
-}
-
 /* =========================================================
    APP NAVIGATION + DECISION CENTER + LIVE PORTFOLIO - BUILD 0.9.0
 ========================================================= */
+
+const NOMAD_ASK_NOMAD_ENABLED = false;
 
 const NOMAD_APP_PAGES =
   new Set([
     'home',
     'portfolio',
     'decision',
-    'ask',
     'research',
     'explore',
     'universe',
@@ -42540,7 +41346,6 @@ const NOMAD_MOBILE_PAGE_LABELS = {
   home: 'Home',
   portfolio: 'Portfolio',
   decision: 'Decision Center',
-  ask: 'Ask NOMAD',
   research: 'Research',
   explore: 'Explore PSX',
   universe: 'Universe',
@@ -42696,13 +41501,8 @@ function openAppPage(
   }
 
   if (page === 'home') {
-    // Load Home only when Home is actually visible. Older builds launched the
-    // relatively heavy intelligence-feed request on every app start, including
-    // while the user was trying to run Decision Center. That created avoidable
-    // contention and made both surfaces feel slow.
-    loadDecisionCenter()
-      .catch(() => {});
-
+    // Home is a live market surface too. Refresh the lightweight intelligence
+    // feed plus portfolio mirror without requiring a browser reload.
     homeRefreshTimer =
       setInterval(
         () => {
@@ -42710,11 +41510,10 @@ function openAppPage(
             document.visibilityState ===
             'visible'
           ) {
-            loadDecisionCenter()
-              .catch(() => {});
+            loadDecisionCenter();
           }
         },
-        30000
+        20000
       );
   }
 
@@ -44395,12 +43194,6 @@ async function loadDecisionCenter() {
             ) +
             ' changes recorded';
       }
-    } else if ($('homeLastScan')) {
-      $('homeLastScan')
-        .textContent =
-          result.configured
-            ? 'No scan yet'
-            : 'Scanner unavailable';
     }
 
     renderAttentionFeed(
@@ -44489,54 +43282,17 @@ async function loadDecisionCenter() {
             : 'Secret not configured';
     }
   } catch (error) {
-    const message =
-      error?.message ||
-      'Home intelligence is temporarily unavailable.';
-
     if ($('attentionFeed')) {
       $('attentionFeed')
         .innerHTML =
           '<div class="terminalEmpty">' +
           escapeHtml(
-            message
+            error.message
           ) +
           '</div>';
     }
-
-    if ($('marketBreadth')) {
-      $('marketBreadth')
-        .innerHTML =
-          '<div class="terminalEmpty small">Market snapshot temporarily unavailable.</div>';
-    }
-
-    if ($('topGainers')) {
-      $('topGainers')
-        .innerHTML =
-          '<div class="terminalEmpty small">Latest movers temporarily unavailable.</div>';
-    }
-
-    if ($('topLosers')) {
-      $('topLosers')
-        .innerHTML =
-          '<div class="terminalEmpty small">Latest movers temporarily unavailable.</div>';
-    }
-
-    if ($('homeMarketState')) {
-      $('homeMarketState')
-        .textContent =
-          'Market snapshot unavailable';
-    }
-
-    if ($('homeLastScan')) {
-      $('homeLastScan')
-        .textContent =
-          'Unavailable';
-    }
   }
 
-  // Portfolio is an independent surface. It must still render even if the
-  // scanner/market intelligence request has a temporary problem. An empty
-  // portfolio is valid and should render as empty rather than as an error.
   await loadPortfolioViews();
 }
 
@@ -53154,16 +51910,7 @@ function askNomadRenderCard(card) {
   if (card?.target !== null && card?.target !== undefined) planParts.push('Target ' + formatNumber(card.target,2));
   const plan = planParts.join(' · ');
   const action = askNomadFriendlyAction(card.personalAction || card.marketAction || 'VIEW');
-  const priceLine = card?.price !== null && card?.price !== undefined
-    ? 'PKR ' + formatNumber(card.price, 2)
-    : null;
-  const metaLine = card.dayChangePct !== null && card.dayChangePct !== undefined
-    ? 'Today ' + askNomadEscape(formatPercent(card.dayChangePct)) + (priceLine ? ' · ' + askNomadEscape(priceLine) : '')
-    : (priceLine ? askNomadEscape(priceLine) : 'Current NOMAD view');
-  const note = card?.note
-    ? '<div class="miniMeta" style="margin-top:5px">' + askNomadEscape(card.note) + '</div>'
-    : '';
-  return '<div class="askNomadResultCard"><div class="askNomadResultCardHead"><strong>' + askNomadEscape(card.symbol) + '</strong><span class="askNomadAction">' + askNomadEscape(action) + '</span></div><div class="miniMeta">' + metaLine + '</div>' + (plan ? '<div class="miniMeta" style="margin-top:5px">' + askNomadEscape(plan) + '</div>' : '') + note + '</div>';
+  return '<div class="askNomadResultCard"><div class="askNomadResultCardHead"><strong>' + askNomadEscape(card.symbol) + '</strong><span class="askNomadAction">' + askNomadEscape(action) + '</span></div><div class="miniMeta">' + (card.dayChangePct !== null && card.dayChangePct !== undefined ? 'Today ' + askNomadEscape(formatPercent(card.dayChangePct)) : 'Current NOMAD view') + '</div>' + (plan ? '<div class="miniMeta" style="margin-top:5px">' + askNomadEscape(plan) + '</div>' : '') + '</div>';
 }
 
 function askNomadClearWelcome() {
@@ -53280,16 +52027,18 @@ async function submitAskNomad() {
   }
 }
 
-if ($('askNomadSend')) $('askNomadSend').onclick = () => submitAskNomad();
-if ($('askNomadNewChat')) $('askNomadNewChat').onclick = () => askNomadNewChat();
-if ($('askNomadInput')) {
-  $('askNomadInput').addEventListener('input', () => { askNomadAutoSize(); askNomadSaveSession(); });
-  $('askNomadInput').addEventListener('keydown', event => {
-    if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); submitAskNomad(); }
-  });
+if (NOMAD_ASK_NOMAD_ENABLED) {
+  if ($('askNomadSend')) $('askNomadSend').onclick = () => submitAskNomad();
+  if ($('askNomadNewChat')) $('askNomadNewChat').onclick = () => askNomadNewChat();
+  if ($('askNomadInput')) {
+    $('askNomadInput').addEventListener('input', () => { askNomadAutoSize(); askNomadSaveSession(); });
+    $('askNomadInput').addEventListener('keydown', event => {
+      if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); submitAskNomad(); }
+    });
+  }
+  if ($('askNomadMessages')) $('askNomadMessages').addEventListener('scroll', () => askNomadSaveSession(), {passive:true});
+  askNomadRestoreSession();
 }
-if ($('askNomadMessages')) $('askNomadMessages').addEventListener('scroll', () => askNomadSaveSession(), {passive:true});
-askNomadRestoreSession();
 
 if ($('refreshIntelligenceFeed')) {
   $('refreshIntelligenceFeed')
@@ -55294,14 +54043,21 @@ function renderShadowDecision(
         0,
         1
       ) +
-      '% per sector. Minimum meaningful new-money position: PKR ' +
-      formatNumber(
+      '% per sector. ' +
+      (
         result.allocationDiagnostics
-          .minimumMeaningfulPositionPkr ||
-        0,
-        0
+          .smallCapitalWholeShareMode
+          ? 'Small-capital whole-share mode is active: the fixed PKR 1,000 position floor is disabled, while whole-share affordability and all risk/portfolio caps remain active.'
+          : 'Minimum meaningful new-money position: PKR ' +
+            formatNumber(
+              result.allocationDiagnostics
+                .minimumMeaningfulPositionPkr ||
+              0,
+              0
+            ) +
+            '.'
       ) +
-      '.</div>';
+      '</div>';
 
     if (
       result?.allocationDiagnostics
@@ -55781,167 +54537,100 @@ if ($('decisionRisk') && $('strategyRisk')) {
     }
   );
 
-async function runDecisionCenterAnalysis() {
-  const button = $('findBestOption');
+if ($('findBestOption')) {
+  $('findBestOption')
+    .onclick =
+      async () => {
+        const button =
+          $('findBestOption');
 
-  if (!button) {
-    throw new Error('Decision Center Analyze button is unavailable.');
-  }
-
-  // A click must always produce immediate visible feedback. Do this before
-  // reading optional controls or touching any other application state.
-  if (button.dataset.running === '1') {
-    return;
-  }
-
-  button.dataset.running = '1';
-  button.disabled = true;
-  button.textContent = 'Analyzing PSX...';
-
-  if ($('decisionResult')) {
-    $('decisionResult').innerHTML =
-      '<div class="decisionShadowBanner">SHADOW</div>' +
-      '<strong>Analyzing PSX opportunities...</strong><br>' +
-      '<span class="decisionMinor">Step 1 of 3 · Loading the latest canonical market snapshot.</span>';
-  }
-
-  ['priorityOneList','priorityTwoList','researchRequiredList','avoidList']
-    .forEach(id => {
-      if ($(id)) {
-        $(id).innerHTML =
-          '<div class="terminalEmpty small">Analysis in progress...</div>';
-      }
-    });
-
-  const requestSerial =
-    ++window.__nomadDecisionRequestSerial;
-
-  let progressTimer = null;
-  let timeoutTimer = null;
-
-  try {
-    const amount =
-      Number(
-        String(
-          $('decisionAmount')?.value ||
-          ''
-        ).replace(/,/g, '')
-      );
-
-    const context = {
-      amount:
-        Number.isFinite(amount) &&
-        amount > 0
-          ? amount
-          : 5000,
-      horizon:
-        $('decisionHorizon')?.value ||
-        'long_term',
-      risk:
-        $('decisionRisk')?.value ||
-        'balanced',
-      sector:
-        $('decisionSector')?.value ||
-        ''
-    };
-
-    if ($('strategyHorizon')) {
-      $('strategyHorizon').value = context.horizon;
-    }
-    if ($('strategyRisk')) {
-      $('strategyRisk').value = context.risk;
-    }
-
-    try {
-      localStorage.setItem(
-        'nomadDecisionContext',
-        JSON.stringify(context)
-      );
-    } catch {}
-
-    let progressStep = 0;
-    const progressMessages = [
-      'Step 2 of 3 · Ranking eligible PSX opportunities with the locked Investor / Trader brain.',
-      'Step 3 of 3 · Applying suitability, portfolio context and whole-share allocation.',
-      'Still working · Some historical evidence requests are taking longer than usual.'
-    ];
-
-    progressTimer = setInterval(() => {
-      if (
-        requestSerial !== window.__nomadDecisionRequestSerial ||
-        !$('decisionResult')
-      ) {
-        return;
-      }
-
-      const message =
-        progressMessages[
-          Math.min(progressStep, progressMessages.length - 1)
-        ];
-      progressStep += 1;
-
-      $('decisionResult').innerHTML =
-        '<div class="decisionShadowBanner">SHADOW</div>' +
-        '<strong>Analyzing PSX opportunities...</strong><br>' +
-        '<span class="decisionMinor">' +
-        escapeHtml(message) +
-        '</span>';
-    }, 5000);
-
-    const timeoutPromise =
-      new Promise((resolve, reject) => {
-        timeoutTimer = setTimeout(
-          () => reject(
-            new Error(
-              'The analysis took too long to complete. NOMAD stopped this request instead of leaving the Decision Center stuck. Please run it again.'
+        const amount =
+          Number(
+            String(
+              $('decisionAmount')
+                .value ||
+              ''
+            ).replace(
+              /,/g,
+              ''
             )
-          ),
-          120000
+          );
+
+        const context = {
+          amount:
+            Number.isFinite(amount) &&
+            amount > 0
+              ? amount
+              : 5000,
+          horizon:
+            $('decisionHorizon')
+              .value,
+          risk:
+            $('decisionRisk')
+              .value,
+          sector:
+            $('decisionSector')
+              ?.value ||
+            ''
+        };
+
+        if ($('strategyHorizon')) {
+          $('strategyHorizon').value = context.horizon;
+        }
+        if ($('strategyRisk')) {
+          $('strategyRisk').value = context.risk;
+        }
+
+        localStorage.setItem(
+          'nomadDecisionContext',
+          JSON.stringify(
+            context
+          )
         );
-      });
 
-    const result = await Promise.race([
-      apiPost(
-        'decision-lab',
-        context
-      ),
-      timeoutPromise
-    ]);
+        const originalText =
+          button.textContent;
 
-    if (requestSerial !== window.__nomadDecisionRequestSerial) {
-      return;
-    }
+        button.disabled =
+          true;
 
-    renderShadowDecision(result);
-  } catch (error) {
-    if (
-      requestSerial === window.__nomadDecisionRequestSerial &&
-      $('decisionResult')
-    ) {
-      $('decisionResult').innerHTML =
-        '<strong>Decision engine unavailable.</strong><br>' +
-        '<span class="decisionMinor">' +
-        escapeHtml(error?.message || 'Unknown Decision Center error.') +
-        '</span>';
-    }
-  } finally {
-    if (progressTimer) {
-      clearInterval(progressTimer);
-    }
-    if (timeoutTimer) {
-      clearTimeout(timeoutTimer);
-    }
+        button.textContent =
+          'Analyzing PSX...';
 
-    if (requestSerial === window.__nomadDecisionRequestSerial) {
-      button.disabled = false;
-      button.dataset.running = '0';
-      button.textContent = 'Analyze PSX & build plan';
-    }
-  }
+        $('decisionResult')
+          .innerHTML =
+            '<div class="decisionShadowBanner">SHADOW</div>' +
+            '<strong>Analyzing PSX opportunities...</strong><br>' +
+            '<span class="decisionMinor">Checking evidence, suitability and allocation.</span>';
+
+        try {
+          const result =
+            await apiPost(
+              'decision-lab',
+              context
+            );
+
+          renderShadowDecision(
+            result
+          );
+        } catch (error) {
+          $('decisionResult')
+            .innerHTML =
+              '<strong>Decision engine unavailable.</strong><br>' +
+              escapeHtml(
+                error.message ||
+                'The decision request failed.'
+              ) +
+              '<br>NOMAD did not substitute a guess.';
+        } finally {
+          button.disabled =
+            false;
+
+          button.textContent =
+            originalText;
+        }
+      };
 }
-
-// Reconfirm the core binding after the rest of the page controls are wired.
-bindDecisionCenterCoreAction();
 
 if ($('homeRunScan')) {
   $('homeRunScan')
@@ -56094,6 +54783,8 @@ openAppPage(
   }
 );
 
+loadDecisionCenter();
+
 // Keep the 1D portfolio line building even when the user is on Ask NOMAD,
 // Research, Decision Center, or another page. This sampler uses the same
 // canonical Official-PSX portfolio endpoint as the visible portfolio values;
@@ -56201,12 +54892,6 @@ module.exports.decisionEngine = {
     buildDecisionOpportunityBoard,
   analystGate:
     decisionCenterAnalystGate,
-  evidenceIntelligence:
-    buildDecisionEvidenceIntelligence,
-  safeEvidenceIntelligence:
-    safeDecisionEvidenceIntelligence,
-  compactEvidenceIntelligence:
-    compactDecisionEvidenceIntelligence,
   canonicalState:
     decisionCanonicalCompanyState,
   profileSuitability:
