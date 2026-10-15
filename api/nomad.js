@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.6.0';
+const VERSION = '0.9.6.1';
 
 
 const SUPABASE_URL =
@@ -28379,7 +28379,7 @@ async function recordDecisionRun(
 
 /* =========================================================
    ASK NOMAD - GROUNDED CONVERSATIONAL ORCHESTRATOR
-   Build 0.9.6.0
+   Build 0.9.6.1
    The chat layer never invents an investment conclusion. It routes a
    question through NOMAD's existing portfolio, Investor, Trader and
    allocation engines, then explains the structured result.
@@ -28411,16 +28411,27 @@ function askNomadExtractCapital(message) {
 }
 
 function askNomadFindSymbols(message, market) {
-  const text = ' ' + askNomadNormalizeText(message).toUpperCase() + ' ';
+  const raw = askNomadNormalizeText(message);
+  const upper = ' ' + raw.toUpperCase() + ' ';
   const rows = Array.isArray(market?.stocks) ? market.stocks : [];
   const found = [];
+  const conceptWords = new Set([
+    'CASH','COST','BUY','SELL','HOLD','ADD','REDUCE','EXIT','WAIT','PASS','AVOID',
+    'MARKET','STOCK','STOCKS','PORTFOLIO','RISK','PRICE','VALUE','CAPITAL','TODAY',
+    'LONG','SHORT','TERM','BANK','POWER','OIL','GAS','TRADE','TRADING','INVEST','INVESTMENT'
+  ]);
   for (const row of rows) {
     const symbol = normalizeSymbol(row.symbol);
     if (!symbol || found.includes(symbol)) continue;
-    const symbolHit = new RegExp('(^|[^A-Z0-9])' + symbol.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '([^A-Z0-9]|$)').test(text);
+    const escaped = symbol.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const tokenRegex = new RegExp('(^|[^A-Z0-9])' + escaped + '([^A-Z0-9]|$)');
+    const tokenHit = tokenRegex.test(upper);
+    const explicitTickerHit = new RegExp('\\b(?:ticker|symbol|stock)\\s+' + escaped + '\\b', 'i').test(raw);
+    const exactUpperToken = new RegExp('(^|[^A-Z0-9])' + escaped + '([^A-Z0-9]|$)').test(' ' + raw + ' ') && raw.includes(symbol);
     const name = String(row.companyName || '').trim();
-    const nameHit = name.length >= 4 && text.includes(' ' + name.toUpperCase() + ' ');
-    if (symbolHit || nameHit) found.push(symbol);
+    const nameHit = name.length >= 4 && upper.includes(' ' + name.toUpperCase() + ' ');
+    const symbolAllowed = !conceptWords.has(symbol) || explicitTickerHit;
+    if ((symbolAllowed && tokenHit && (exactUpperToken || symbol.length <= 5)) || explicitTickerHit || nameHit) found.push(symbol);
     if (found.length >= 4) break;
   }
   return found;
@@ -28435,13 +28446,13 @@ function askNomadInferHorizon(message, fallback) {
 
 function askNomadClassifyIntent(message, symbols) {
   const text = askNomadNormalizeText(message).toLowerCase();
+  if (/\b(need|raise|withdraw|take out|free up|require)\b[\s\S]{0,45}\b(cash|money|pkr|rs\.?|rupees?)\b|\bcash within\b|\bneed cash\b|\braise cash\b/.test(text)) return 'LIQUIDITY_PLAN';
   if (symbols.length >= 2 && /\b(compare|versus|vs\.?|better)\b/.test(text)) return 'COMPARE_STOCKS';
   if (symbols.length >= 1) return 'STOCK_ANALYSIS';
   if (/\b(market|psx|index|breadth|gainers|losers|session)\b/.test(text) && !/\bportfolio|my stocks?|holdings?\b/.test(text)) return 'MARKET_OUTLOOK';
-  if (/\b(invest more|deploy|put in|allocate|capital|where should i invest|what should i buy|buy anything|new money)\b/.test(text)) return 'CAPITAL_DECISION';
-  if (/\b(sell|reduce|exit|buy|add|hold|steps?|action|do anything|should i)\b/.test(text) && /\b(portfolio|my stocks?|holdings?|anything)\b/.test(text)) return 'PORTFOLIO_ACTIONS';
-  if (/\b(portfolio|my stocks?|holdings?|how.*doing|how.*look|today)\b/.test(text)) return 'PORTFOLIO_REVIEW';
-  if (/\b(strategy|risk|concentration|diversif|long term|short term)\b/.test(text)) return 'PORTFOLIO_REVIEW';
+  if (/\b(invest more|deploy|put in|allocate|new capital|new money|where should i invest|what should i buy|buy anything)\b/.test(text)) return 'CAPITAL_DECISION';
+  if (/\b(sell|reduce|exit|buy|add|hold|steps?|action|do anything|should i|rebalance|rotate)\b/.test(text) && /\b(portfolio|my stocks?|holdings?|anything|positions?)\b/.test(text)) return 'PORTFOLIO_ACTIONS';
+  if (/\b(portfolio|my stocks?|holdings?|how.*doing|how.*look|today|concentration|diversif|risk)\b/.test(text)) return 'PORTFOLIO_REVIEW';
   return 'GENERAL';
 }
 
@@ -28517,6 +28528,65 @@ function askNomadStrategyCard(result) {
   };
 }
 
+
+function askNomadActionWeakness(action, marketAction) {
+  const a = String(action || '').toUpperCase();
+  const m = String(marketAction || '').toUpperCase();
+  let score = 0;
+  if (/SELL|EXIT|REDUCE|DO_NOT_ADD|PASS|AVOID/.test(a)) score += 5;
+  else if (/WAIT|NO_ACTION|HOLD/.test(a)) score += 2;
+  else if (/BUY|ADD|ACCUMULATE/.test(a)) score -= 4;
+  if (m === 'AVOID') score += 4;
+  else if (m === 'RESEARCHING' || m === 'WATCH') score += 1;
+  else if (m === 'BUY' || m === 'ACCUMULATE') score -= 3;
+  return score;
+}
+
+async function askNomadBuildLiquidityPlan(portfolio, cashNeed, risk) {
+  const holdings = Array.isArray(portfolio?.holdings) ? portfolio.holdings.filter(h => h?.symbol && safeNumber(h.currentValue) > 0) : [];
+  const [longResults, shortResults] = await Promise.all([
+    askNomadRunHoldingStrategies(portfolio, 'long_term', risk),
+    askNomadRunHoldingStrategies(portfolio, 'short_term', risk)
+  ]);
+  const longMap = new Map(longResults.filter(x => x?.status === 'OK').map(x => [normalizeSymbol(x?.identity?.symbol || x?.input?.symbol), askNomadStrategyCard(x)]));
+  const shortMap = new Map(shortResults.filter(x => x?.status === 'OK').map(x => [normalizeSymbol(x?.identity?.symbol || x?.input?.symbol), askNomadStrategyCard(x)]));
+  const ranked = holdings.map(h => {
+    const symbol = normalizeSymbol(h.symbol);
+    const l = longMap.get(symbol) || null;
+    const t = shortMap.get(symbol) || null;
+    const currentValue = safeNumber(h.currentValue) || 0;
+    const currentPrice = safeNumber(h.currentPrice) || 0;
+    const quantity = safeNumber(h.quantity) || 0;
+    const weakness = askNomadActionWeakness(l?.personalAction, l?.marketAction) * 2 + askNomadActionWeakness(t?.personalAction, t?.marketAction);
+    return {symbol, holding:h, long:l, short:t, currentValue, currentPrice, quantity, weakness};
+  }).sort((a,b) => b.weakness - a.weakness || b.currentValue - a.currentValue);
+
+  let remaining = Math.max(0, cashNeed || 0);
+  const reductions = [];
+  for (const item of ranked) {
+    if (remaining <= 0) break;
+    // Do not sell a holding that both locked brains currently want to add/buy simply to satisfy the cash target.
+    if (item.weakness < 1) continue;
+    if (!(item.currentPrice > 0) || !(item.quantity > 0)) continue;
+    const targetValue = Math.min(item.currentValue, remaining);
+    let shares = Math.min(item.quantity, Math.ceil(targetValue / item.currentPrice));
+    if (!(shares > 0)) continue;
+    const value = decisionRound(Math.min(item.currentValue, shares * item.currentPrice), 2);
+    reductions.push({
+      symbol:item.symbol,
+      shares:decisionRound(shares, 6),
+      amountPkr:value,
+      fullExit:shares >= item.quantity - 0.000001,
+      longAction:item.long?.personalAction || 'UNAVAILABLE',
+      shortAction:item.short?.personalAction || 'UNAVAILABLE',
+      reason:(item.long?.personalReason || item.short?.personalReason || 'This holding ranks weaker than the positions NOMAD is preserving under the current engines.')
+    });
+    remaining = Math.max(0, decisionRound(remaining - value, 2));
+  }
+  const preserved = ranked.filter(item => !reductions.some(r => r.symbol === item.symbol)).slice(0,4).map(item => ({symbol:item.symbol,longAction:item.long?.personalAction || 'UNAVAILABLE',shortAction:item.short?.personalAction || 'UNAVAILABLE'}));
+  return {cashNeed, reductions, remaining, preserved, longResults, shortResults};
+}
+
 async function runAskNomad(input) {
   const message = askNomadNormalizeText(input?.message);
   if (!message) bad('Ask NOMAD a question first.');
@@ -28549,6 +28619,37 @@ async function runAskNomad(input) {
     engines: []
   };
 
+  if (intent === 'LIQUIDITY_PLAN') {
+    if (!portfolio?.configured || !(portfolio?.holdings || []).length) {
+      return {status:'NEEDS_INPUT',build:VERSION,intent,basis,answer:{headline:'I need your portfolio before I can build this cash plan.',summary:'Add your holdings or transactions first. I will not guess what you own.',bullets:[]},needs:{portfolio:true},cards:[]};
+    }
+    const cashNeed = askNomadExtractCapital(message);
+    if (cashNeed === null || cashNeed <= 0) {
+      return {status:'NEEDS_INPUT',build:VERSION,intent,basis,answer:{headline:'How much cash do you need?',summary:'Include the PKR amount in your question so I can calculate which holdings, if any, should fund it.',bullets:[]},needs:{capital:true},cards:[]};
+    }
+    const plan = await askNomadBuildLiquidityPlan(portfolio, cashNeed, requestedRisk);
+    basis.horizon = 'mixed';
+    basis.engines.push('Portfolio intelligence','Long-term Investor brain','Short-term Trader brain','Portfolio suitability engine');
+    const raised = decisionRound(cashNeed - plan.remaining, 2);
+    const cards = plan.reductions.map(r => ({type:'allocation',symbol:r.symbol,shares:r.shares,amountPkr:r.amountPkr,personalAction:r.fullExit?'SELL':'REDUCE',note:r.reason}));
+    const keepText = plan.preserved.length ? plan.preserved.map(x => x.symbol).join(', ') : null;
+    return {
+      status:'OK',build:VERSION,intent,basis,
+      answer:{
+        headline: plan.remaining <= 1 ? 'Here is the cleanest way NOMAD found to raise '+askNomadMoney(cashNeed)+'.' : 'NOMAD would not force enough selling to raise the full '+askNomadMoney(cashNeed)+'.',
+        summary: plan.reductions.length ? 'I ranked your holdings using both the locked Investor and Trader brains, then used the weaker eligible positions first. Stronger holdings were preserved rather than simply selling your worst performer.' : 'None of your holdings currently passes a strong enough reduce/sell test for NOMAD to manufacture a liquidation plan.',
+        bullets:[
+          plan.reductions.length ? 'Raise now: '+askNomadMoney(raised) : null,
+          plan.remaining > 1 ? 'Still required: '+askNomadMoney(plan.remaining)+' — this needs a deliberate trade-off rather than a forced sale.' : 'Cash target covered without touching the stronger preserved positions.',
+          keepText ? 'Preserve first: '+keepText : null
+        ].filter(Boolean)
+      },
+      cards,
+      plan:{cashNeed,raised,remaining:plan.remaining,reductions:plan.reductions,preserved:plan.preserved},
+      disclaimer:'NOMAD used current portfolio and market evidence; no order is placed.'
+    };
+  }
+
   if (intent === 'MARKET_OUTLOOK') {
     const summary = askNomadMarketSummary(market);
     basis.engines.push('Market breadth engine');
@@ -28573,7 +28674,7 @@ async function runAskNomad(input) {
     if (explicitCapital === null || explicitCapital <= 0) {
       return {
         status:'NEEDS_INPUT', build:VERSION, intent, basis,
-        answer:{headline:'How much new capital should NOMAD evaluate?', summary:'I will not invent a capital amount. Enter the PKR amount in the Ask NOMAD capital field or include it in your question, then I can run the full Decision Center allocator against your current portfolio.', bullets:[]},
+        answer:{headline:'How much new capital should NOMAD evaluate?', summary:'I will not invent a capital amount. Include the PKR amount in your question, then I can run the full Decision Center allocator against your current portfolio.', bullets:[]},
         needs:{capital:true}, cards:[]
       };
     }
@@ -39224,60 +39325,52 @@ button:not(.secondary):not(.miniButton):not(.chartModeButton):not(.navButton):no
 }
 
 
-/* Ask NOMAD - grounded conversational intelligence */
+/* Ask NOMAD - simple outside, sophisticated inside */
 .askNomadNav { position:relative; }
 .askNomadNav::after { content:'AI'; margin-left:auto; font-size:9px; font-weight:900; letter-spacing:.08em; color:var(--yellow,#f1c40f); border:1px solid rgba(241,196,15,.35); padding:2px 5px; border-radius:999px; }
-.askNomadLayout { display:grid; grid-template-columns:minmax(0,1.6fr) minmax(260px,.65fr); gap:18px; align-items:start; }
-.askNomadChatCard { padding:0; overflow:hidden; min-height:650px; display:flex; flex-direction:column; }
-.askNomadMessages { flex:1; min-height:490px; max-height:66vh; overflow:auto; padding:22px; display:flex; flex-direction:column; gap:16px; }
+.askNomadTitleRow { margin-bottom:14px; }
+.askNomadTitleRow .muted { max-width:720px; }
+.askNomadShell { max-width:980px; margin:0 auto; }
+.askNomadChatCard { padding:0; overflow:hidden; min-height:690px; display:flex; flex-direction:column; border-color:rgba(255,255,255,.09); }
+.askNomadMessages { flex:1; min-height:560px; max-height:calc(100vh - 305px); overflow:auto; padding:26px 28px 18px; display:flex; flex-direction:column; gap:20px; scrollbar-width:thin; }
 .askNomadMessage { display:flex; gap:10px; align-items:flex-start; }
 .askNomadMessage.user { justify-content:flex-end; }
 .askNomadAvatar { width:30px; height:30px; border-radius:9px; background:#f3ca32; color:#111; display:grid; place-items:center; font-weight:900; flex:0 0 auto; }
-.askNomadBubble { max-width:82%; border:1px solid rgba(255,255,255,.10); background:rgba(255,255,255,.035); border-radius:14px; padding:13px 15px; line-height:1.55; }
-.askNomadMessage.user .askNomadBubble { background:rgba(243,202,50,.12); border-color:rgba(243,202,50,.26); }
-.askNomadBubble strong { display:block; color:#fff; margin-bottom:5px; }
-.askNomadBubble span { display:block; color:var(--muted); }
-.askNomadBullets { margin:9px 0 0; padding-left:18px; color:#d9dee7; }
-.askNomadBullets li { margin:4px 0; }
-.askNomadBasis { display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; }
-.askNomadBasis span { display:inline-flex; width:auto; padding:4px 7px; border-radius:999px; border:1px solid rgba(255,255,255,.10); color:#aeb8c8; font-size:11px; }
-.askNomadCards { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; margin-top:12px; }
-.askNomadResultCard { border:1px solid rgba(255,255,255,.09); border-radius:10px; padding:10px; background:rgba(0,0,0,.16); }
-.askNomadResultCardHead { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:7px; }
+.askNomadBubble { max-width:78%; border:1px solid rgba(255,255,255,.09); background:rgba(255,255,255,.035); border-radius:15px; padding:15px 17px; line-height:1.55; }
+.askNomadMessage.user .askNomadBubble { background:rgba(243,202,50,.10); border-color:rgba(243,202,50,.24); }
+.askNomadBubble strong { display:block; color:#fff; margin-bottom:7px; font-size:15px; line-height:1.35; }
+.askNomadBubble > span { display:block; color:#d6dde8; }
+.askNomadBullets { margin:11px 0 0; padding-left:18px; color:#d9dee7; }
+.askNomadBullets li { margin:5px 0; }
+.askNomadCards { display:grid; grid-template-columns:1fr; gap:8px; margin-top:13px; }
+.askNomadResultCard { border:1px solid rgba(255,255,255,.09); border-radius:11px; padding:11px 12px; background:rgba(0,0,0,.14); }
+.askNomadResultCardHead { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:5px; }
 .askNomadResultCardHead strong { margin:0; font-size:14px; }
 .askNomadResultCard .miniMeta { color:var(--muted); font-size:11px; line-height:1.45; }
-.askNomadAction { font-size:10px; font-weight:900; letter-spacing:.05em; color:#111; background:#f3ca32; border-radius:999px; padding:4px 7px; white-space:nowrap; }
-.askNomadComposer { border-top:1px solid rgba(255,255,255,.09); padding:14px; background:rgba(0,0,0,.18); }
-.askNomadComposer textarea { width:100%; resize:none; border-radius:10px; min-height:74px; }
-.askNomadComposerFoot { margin-top:10px; display:flex; align-items:center; gap:10px; }
-.askNomadContextControls { display:flex; gap:8px; flex:1; min-width:0; }
-.askNomadContextControls select { min-width:115px; }
-.askNomadCapital { display:flex; align-items:center; border:1px solid rgba(255,255,255,.12); border-radius:8px; overflow:hidden; min-width:170px; }
-.askNomadCapital span { padding:0 8px; color:var(--muted); font-size:11px; font-weight:800; }
-.askNomadCapital input { border:0 !important; background:transparent !important; min-width:0; width:100%; }
-.askNomadSend { width:auto; min-width:130px; padding:11px 15px; }
-.askNomadSideRail { display:grid; gap:14px; }
-.askNomadGroundingSteps { display:grid; gap:8px; margin:14px 0; }
-.askNomadGroundingSteps div { display:flex; gap:9px; align-items:center; color:#d9dee7; font-size:13px; }
-.askNomadGroundingSteps b { width:24px; height:24px; border-radius:7px; display:grid; place-items:center; background:rgba(243,202,50,.14); color:#f3ca32; }
-.askNomadQuickPrompts { display:grid; gap:8px; margin-top:10px; }
-.askNomadQuickPrompts button { text-align:left; background:rgba(255,255,255,.035); border:1px solid rgba(255,255,255,.09); color:#e8edf5; border-radius:9px; padding:10px 11px; }
-.askNomadQuickPrompts button:hover { border-color:rgba(243,202,50,.42); }
-.askNomadTyping { color:var(--muted); font-size:12px; padding:3px 0; }
-@media (max-width: 980px) {
-  .askNomadLayout { grid-template-columns:1fr; }
-  .askNomadSideRail { grid-template-columns:1fr 1fr; }
-  .askNomadMessages { max-height:none; min-height:430px; }
-}
+.askNomadAction { font-size:10px; font-weight:900; letter-spacing:.04em; color:#111; background:#f3ca32; border-radius:999px; padding:4px 8px; white-space:nowrap; }
+.askNomadEvidence { margin-top:11px; border-top:1px solid rgba(255,255,255,.07); padding-top:9px; }
+.askNomadEvidence summary { cursor:pointer; color:#8ebfe6; font-size:11px; user-select:none; }
+.askNomadBasis { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+.askNomadBasis span { display:inline-flex; width:auto; padding:3px 7px; border-radius:999px; border:1px solid rgba(255,255,255,.09); color:#9eabba; font-size:10px; }
+.askNomadComposer { border-top:1px solid rgba(255,255,255,.08); padding:13px 14px; background:#0d1928; }
+.askNomadComposerBox { display:flex; align-items:flex-end; gap:10px; border:1px solid rgba(255,255,255,.12); background:#0a1523; border-radius:14px; padding:9px 9px 9px 14px; }
+.askNomadComposerBox:focus-within { border-color:rgba(243,202,50,.45); box-shadow:0 0 0 2px rgba(243,202,50,.05); }
+.askNomadComposer textarea { flex:1; width:100%; resize:none; border:0 !important; outline:0 !important; box-shadow:none !important; background:transparent !important; color:#eef3f8 !important; min-height:42px; max-height:130px; padding:9px 0 !important; line-height:1.45; font-size:14px; }
+.askNomadComposer textarea::placeholder { color:#728096; }
+.askNomadSend { width:42px; height:42px; min-width:42px; border:0; border-radius:11px; display:grid; place-items:center; padding:0; background:#f3ca32; color:#111; font-size:18px; font-weight:900; cursor:pointer; }
+.askNomadSend:disabled { opacity:.55; cursor:wait; }
+.askNomadHint { margin:7px 3px 0; color:#758398; font-size:10px; }
+.askNomadTyping { color:var(--muted); font-size:12px; padding:2px 40px; }
+.askNomadWelcome { max-width:560px; margin:auto; text-align:center; padding:45px 20px; color:#b5c0cf; }
+.askNomadWelcome .askNomadAvatar { margin:0 auto 13px; }
+.askNomadWelcome strong { display:block; color:#fff; font-size:19px; margin-bottom:6px; }
 @media (max-width: 680px) {
-  .askNomadSideRail { grid-template-columns:1fr; }
-  .askNomadComposerFoot, .askNomadContextControls { flex-direction:column; align-items:stretch; }
-  .askNomadSend { width:100%; }
-  .askNomadCapital { min-width:0; }
-  .askNomadCards { grid-template-columns:1fr; }
-  .askNomadBubble { max-width:92%; }
+  .askNomadShell { max-width:none; }
+  .askNomadChatCard { min-height:calc(100vh - 170px); }
+  .askNomadMessages { min-height:430px; max-height:none; padding:18px 14px; }
+  .askNomadBubble { max-width:90%; }
+  .askNomadTitleRow .muted { display:none; }
 }
-
 </style>
 
 </head>
@@ -39462,52 +39555,25 @@ Checking connection...
 <div>
 <div class="eyebrow">CONVERSATIONAL INTELLIGENCE</div>
 <h1>Ask NOMAD</h1>
-<p class="muted">Ask naturally. NOMAD routes the question through its actual market, portfolio, Investor, Trader or allocation engines before answering.</p>
+<p class="muted">Ask about your portfolio, a PSX stock, the market or what you should do next.</p>
 </div>
-<div class="decisionModeBadge">GROUNDED · NO GUESSING</div>
 </div>
 
-<div class="askNomadLayout">
+<div class="askNomadShell">
 <div class="terminalCard askNomadChatCard">
 <div id="askNomadMessages" class="askNomadMessages">
-<div class="askNomadMessage assistant">
+<div class="askNomadWelcome">
 <div class="askNomadAvatar">N</div>
-<div class="askNomadBubble"><strong>Ask me about your portfolio, a stock, the market or what to do with new capital.</strong><span>I will run NOMAD's intelligence first. If a required input is missing, I will ask instead of inventing it.</span></div>
+<strong>What would you like to know?</strong>
+<span>Ask naturally. NOMAD will run the relevant intelligence before answering.</span>
 </div>
 </div>
 <div class="askNomadComposer">
-<textarea id="askNomadInput" rows="3" placeholder="Example: Should I buy or sell anything today?"></textarea>
-<div class="askNomadComposerFoot">
-<div class="askNomadContextControls">
-<select id="askNomadHorizon" aria-label="Horizon"><option value="long_term">Long-term</option><option value="short_term">Short-term</option></select>
-<select id="askNomadRisk" aria-label="Risk"><option value="balanced">Balanced</option><option value="conservative">Conservative</option><option value="aggressive">Aggressive</option></select>
-<div class="askNomadCapital"><span>PKR</span><input id="askNomadCapital" inputmode="numeric" placeholder="Capital (optional)"></div>
+<div class="askNomadComposerBox">
+<textarea id="askNomadInput" rows="1" placeholder="Ask anything about your portfolio, a stock, or the market…"></textarea>
+<button id="askNomadSend" class="askNomadSend" type="button" aria-label="Send question" title="Send">➜</button>
 </div>
-<button id="askNomadSend" class="primaryWide askNomadSend">Ask NOMAD</button>
-</div>
-</div>
-</div>
-
-<div class="askNomadSideRail">
-<div class="terminalCard askNomadGroundingCard">
-<div class="eyebrow">HOW ANSWERS ARE BUILT</div>
-<h2>Brain first, chat second</h2>
-<div class="askNomadGroundingSteps">
-<div><b>1</b><span>Understand your question</span></div>
-<div><b>2</b><span>Load current PSX + portfolio context</span></div>
-<div><b>3</b><span>Run the relevant NOMAD engine</span></div>
-<div><b>4</b><span>Explain the structured result</span></div>
-</div>
-<div class="sourceNote">Ask NOMAD cannot override a locked Investor/Trader decision. If evidence is missing or stale, it must say so.</div>
-</div>
-<div class="terminalCard askNomadQuickCard">
-<div class="eyebrow">QUICK QUESTIONS</div>
-<div class="askNomadQuickPrompts">
-<button data-ask-prompt="How does my portfolio look today?">Portfolio today</button>
-<button data-ask-prompt="Should I buy or sell anything today?">Buy / sell check</button>
-<button data-ask-prompt="How does the market look today?">Market today</button>
-<button data-ask-prompt="Should I invest more?">Invest more?</button>
-</div>
+<div class="askNomadHint">Press Enter to send · Shift + Enter for a new line</div>
 </div>
 </div>
 </div>
@@ -51373,33 +51439,59 @@ function askNomadEscape(value) {
   return escapeHtml(String(value ?? ''));
 }
 
+function askNomadFriendlyAction(value) {
+  const raw = String(value || '').toUpperCase();
+  const map = {
+    'DO_NOT_ADD':'DO NOT ADD','NO_ACTION_YET':'WAIT','ADD_CANDIDATE':'CONSIDER ADDING',
+    'READY_UNFUNDED':'WAIT','READY · UNFUNDED':'WAIT','ACCUMULATE':'ADD GRADUALLY'
+  };
+  return map[raw] || raw.replace(/_/g,' ');
+}
+
 function askNomadRenderCard(card) {
   if (!card) return '';
   if (card.type === 'allocation') {
-    return '<div class="askNomadResultCard"><div class="askNomadResultCardHead"><strong>' + askNomadEscape(card.symbol) + '</strong><span class="askNomadAction">' + askNomadEscape(card.personalAction || 'ALLOCATE') + '</span></div><div class="miniMeta">' + askNomadEscape(formatCompactPKR(card.amountPkr)) + ' · ' + askNomadEscape(card.shares) + ' shares</div></div>';
+    const action = askNomadFriendlyAction(card.personalAction || 'ALLOCATE');
+    const note = card.note ? '<div class="miniMeta" style="margin-top:5px">' + askNomadEscape(card.note) + '</div>' : '';
+    return '<div class="askNomadResultCard"><div class="askNomadResultCardHead"><strong>' + askNomadEscape(card.symbol) + '</strong><span class="askNomadAction">' + askNomadEscape(action) + '</span></div><div class="miniMeta">' + askNomadEscape(formatCompactPKR(card.amountPkr)) + (card.shares ? ' · ' + askNomadEscape(card.shares) + ' shares' : '') + '</div>' + note + '</div>';
   }
   const entry = card.entryLow !== null && card.entryLow !== undefined ? 'Entry ' + formatNumber(card.entryLow,2) + (card.entryHigh !== null && card.entryHigh !== undefined ? '–' + formatNumber(card.entryHigh,2) : '') : '';
   const plan = [entry, card.stop !== null && card.stop !== undefined ? 'Stop ' + formatNumber(card.stop,2) : '', card.target !== null && card.target !== undefined ? 'Target ' + formatNumber(card.target,2) : '', card.rewardRisk !== null && card.rewardRisk !== undefined ? 'R:R ' + formatNumber(card.rewardRisk,2) + ':1' : ''].filter(Boolean).join(' · ');
-  return '<div class="askNomadResultCard"><div class="askNomadResultCardHead"><strong>' + askNomadEscape(card.symbol) + '</strong><span class="askNomadAction">' + askNomadEscape(card.personalAction || card.marketAction || 'VIEW') + '</span></div><div class="miniMeta">Market ' + askNomadEscape(card.marketAction || 'N/A') + (card.dayChangePct !== null && card.dayChangePct !== undefined ? ' · Today ' + askNomadEscape(formatPercent(card.dayChangePct)) : '') + '</div>' + (plan ? '<div class="miniMeta" style="margin-top:5px">' + askNomadEscape(plan) + '</div>' : '') + '</div>';
+  const action = askNomadFriendlyAction(card.personalAction || card.marketAction || 'VIEW');
+  return '<div class="askNomadResultCard"><div class="askNomadResultCardHead"><strong>' + askNomadEscape(card.symbol) + '</strong><span class="askNomadAction">' + askNomadEscape(action) + '</span></div><div class="miniMeta">' + (card.dayChangePct !== null && card.dayChangePct !== undefined ? 'Today ' + askNomadEscape(formatPercent(card.dayChangePct)) : 'Current NOMAD view') + '</div>' + (plan ? '<div class="miniMeta" style="margin-top:5px">' + askNomadEscape(plan) + '</div>' : '') + '</div>';
+}
+
+function askNomadClearWelcome() {
+  const welcome = document.querySelector('.askNomadWelcome');
+  if (welcome) welcome.remove();
 }
 
 function askNomadAppendMessage(role, payload) {
   const target = $('askNomadMessages');
   if (!target) return;
+  askNomadClearWelcome();
   const row = document.createElement('div');
   row.className = 'askNomadMessage ' + role;
   if (role === 'user') {
     row.innerHTML = '<div class="askNomadBubble"><span>' + askNomadEscape(payload) + '</span></div>';
   } else {
     const answer = payload?.answer || {};
-    const bullets = Array.isArray(answer.bullets) && answer.bullets.length ? '<ul class="askNomadBullets">' + answer.bullets.map(item => '<li>' + askNomadEscape(item) + '</li>').join('') + '</ul>' : '';
-    const cards = Array.isArray(payload?.cards) && payload.cards.length ? '<div class="askNomadCards">' + payload.cards.slice(0,8).map(askNomadRenderCard).join('') + '</div>' : '';
+    const bullets = Array.isArray(answer.bullets) && answer.bullets.length ? '<ul class="askNomadBullets">' + answer.bullets.slice(0,4).map(item => '<li>' + askNomadEscape(item) + '</li>').join('') + '</ul>' : '';
+    const cards = Array.isArray(payload?.cards) && payload.cards.length ? '<div class="askNomadCards">' + payload.cards.slice(0,6).map(askNomadRenderCard).join('') + '</div>' : '';
     const engines = Array.isArray(payload?.basis?.engines) ? payload.basis.engines : [];
-    const basis = '<div class="askNomadBasis"><span>Official PSX</span><span>' + askNomadEscape(payload?.basis?.horizon === 'short_term' ? 'Short-term' : 'Long-term') + '</span><span>' + askNomadEscape(payload?.basis?.risk || 'balanced') + '</span>' + engines.map(e => '<span>' + askNomadEscape(e) + '</span>').join('') + '</div>';
+    const contextTags = ['Official PSX'].concat(engines);
+    const basis = contextTags.length ? '<details class="askNomadEvidence"><summary>Why this recommendation?</summary><div class="askNomadBasis">' + contextTags.map(e => '<span>' + askNomadEscape(e) + '</span>').join('') + '</div></details>' : '';
     row.innerHTML = '<div class="askNomadAvatar">N</div><div class="askNomadBubble"><strong>' + askNomadEscape(answer.headline || 'NOMAD response') + '</strong><span>' + askNomadEscape(answer.summary || '') + '</span>' + bullets + cards + basis + '</div>';
   }
   target.appendChild(row);
   target.scrollTop = target.scrollHeight;
+}
+
+function askNomadAutoSize() {
+  const input = $('askNomadInput');
+  if (!input) return;
+  input.style.height = 'auto';
+  input.style.height = Math.min(input.scrollHeight, 130) + 'px';
 }
 
 async function submitAskNomad(promptOverride) {
@@ -51407,23 +51499,18 @@ async function submitAskNomad(promptOverride) {
   const message = String(promptOverride || input?.value || '').trim();
   if (!message) return;
   askNomadAppendMessage('user', message);
-  if (input) input.value = '';
+  if (input) { input.value = ''; askNomadAutoSize(); }
   const button = $('askNomadSend');
-  if (button) { button.disabled = true; button.textContent = 'Running intelligence...'; }
+  if (button) { button.disabled = true; button.textContent = '…'; }
   const target = $('askNomadMessages');
   const typing = document.createElement('div');
   typing.className = 'askNomadTyping';
-  typing.textContent = 'NOMAD is loading current context and running the relevant engine...';
+  typing.textContent = 'NOMAD is checking the current evidence…';
   target?.appendChild(typing);
-  target.scrollTop = target.scrollHeight;
+  if (target) target.scrollTop = target.scrollHeight;
   try {
-    const capitalRaw = $('askNomadCapital')?.value || '';
-    const capital = finiteNumber(String(capitalRaw).replace(/,/g,''));
     const result = await apiPost('ask-nomad', {
       message,
-      horizon: $('askNomadHorizon')?.value || 'long_term',
-      risk: $('askNomadRisk')?.value || 'balanced',
-      capital: capital && capital > 0 ? capital : null,
       contextSymbols: askNomadContextSymbols
     });
     typing.remove();
@@ -51434,19 +51521,19 @@ async function submitAskNomad(promptOverride) {
     askNomadAppendMessage('assistant', result);
   } catch (error) {
     typing.remove();
-    askNomadAppendMessage('assistant', {answer:{headline:'I could not complete the analysis.',summary:error?.message || 'Ask NOMAD failed before a validated answer could be produced.',bullets:['No investment conclusion was generated.']},basis:{horizon:$('askNomadHorizon')?.value,risk:$('askNomadRisk')?.value,engines:[]},cards:[]});
+    askNomadAppendMessage('assistant', {answer:{headline:'I could not complete that analysis.',summary:error?.message || 'NOMAD could not produce a validated answer, so no investment conclusion was generated.',bullets:[]},basis:{engines:[]},cards:[]});
   } finally {
-    if (button) { button.disabled = false; button.textContent = 'Ask NOMAD'; }
+    if (button) { button.disabled = false; button.textContent = '➜'; }
   }
 }
 
 if ($('askNomadSend')) $('askNomadSend').onclick = () => submitAskNomad();
-if ($('askNomadInput')) $('askNomadInput').addEventListener('keydown', event => {
-  if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); submitAskNomad(); }
-});
-document.querySelectorAll('[data-ask-prompt]').forEach(button => {
-  button.onclick = () => submitAskNomad(button.dataset.askPrompt || '');
-});
+if ($('askNomadInput')) {
+  $('askNomadInput').addEventListener('input', askNomadAutoSize);
+  $('askNomadInput').addEventListener('keydown', event => {
+    if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); submitAskNomad(); }
+  });
+}
 
 if ($('refreshIntelligenceFeed')) {
   $('refreshIntelligenceFeed')
