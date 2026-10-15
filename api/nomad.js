@@ -9,12 +9,12 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.6.6';
+const VERSION = '0.9.6.7';
 
 // Core production hardening: Ask NOMAD remains intentionally disabled so the
 // conversational layer cannot interfere with the production decision path.
-// 0.9.6.6 adds Trader plan-integrity guards only; Investor/Trader scoring and
-// portfolio construction remain otherwise frozen.
+// 0.9.6.7 adds a read-only execution-price layer and Trader plan-integrity
+// guards. Investor/Trader scoring, ranking and portfolio construction stay frozen.
 const NOMAD_ASK_NOMAD_ENABLED = false;
 
 
@@ -23096,16 +23096,24 @@ function decisionTraderPlanAgeDays(candidate) {
   return Math.max(0, (Date.now() - timestamp) / (24 * 60 * 60 * 1000));
 }
 
-// Production integrity 0.9.6.6: one canonical execution plan is exposed for
-// each Trader view. A market BUY always uses the active trade plan; a WATCH
-// setup may expose the conditional plan. This prevents the UI from showing a
-// different stop/target than the allocator is actually using.
-function decisionTraderCanonicalPlan(professional) {
-  const currentPlan = professional?.tradePlan || null;
-  const conditionalPlan = professional?.conditionalTradePlan || null;
-  const marketAction = String(professional?.marketAction || '').toUpperCase();
+// Production integrity 0.9.6.7: choose one server-side Trader plan for every
+// execution surface. The browser receives the chosen plan as data and never
+// calls this server helper directly.
+function decisionTraderCanonicalPlan(
+  professional,
+  execution = null
+) {
+  const currentPlan =
+    professional?.tradePlan ||
+    null;
+  const conditionalPlan =
+    professional?.conditionalTradePlan ||
+    null;
 
-  if (marketAction === 'BUY' && currentPlan?.complete === true) {
+  if (
+    execution?.actionableNow === true &&
+    currentPlan?.complete === true
+  ) {
     return {
       kind: 'ACTIVE',
       source: 'TRADE_PLAN',
@@ -23113,7 +23121,39 @@ function decisionTraderCanonicalPlan(professional) {
     };
   }
 
-  if (marketAction === 'WATCH' && conditionalPlan?.complete === true) {
+  if (
+    execution?.reservationEligible === true &&
+    execution?.actionableNow !== true &&
+    conditionalPlan?.complete === true
+  ) {
+    return {
+      kind: 'CONDITIONAL',
+      source: 'CONDITIONAL_TRADE_PLAN',
+      plan: conditionalPlan
+    };
+  }
+
+  const marketAction =
+    String(
+      professional?.marketAction ||
+      ''
+    ).toUpperCase();
+
+  if (
+    marketAction === 'BUY' &&
+    currentPlan?.complete === true
+  ) {
+    return {
+      kind: 'ACTIVE',
+      source: 'TRADE_PLAN',
+      plan: currentPlan
+    };
+  }
+
+  if (
+    marketAction === 'WATCH' &&
+    conditionalPlan?.complete === true
+  ) {
     return {
       kind: 'CONDITIONAL',
       source: 'CONDITIONAL_TRADE_PLAN',
@@ -23129,7 +23169,9 @@ function decisionTraderCanonicalPlan(professional) {
     };
   }
 
-  if (conditionalPlan?.complete === true) {
+  if (
+    conditionalPlan?.complete === true
+  ) {
     return {
       kind: 'CONDITIONAL',
       source: 'CONDITIONAL_TRADE_PLAN',
@@ -23144,28 +23186,601 @@ function decisionTraderCanonicalPlan(professional) {
   };
 }
 
-function decisionTraderPlanPriceState(currentPrice, plan) {
-  const current = safeNumber(currentPrice);
-  const stop = safeNumber(plan?.stop);
-  const target = safeNumber(plan?.target1);
+function decisionTraderPlanPriceState(
+  currentPrice,
+  plan
+) {
+  const current =
+    safeNumber(currentPrice);
+  const stop =
+    safeNumber(plan?.stop);
+  const target =
+    safeNumber(plan?.target1);
 
   if (plan?.complete !== true) {
-    return { state: 'INCOMPLETE', current, stop, target };
+    return {
+      state: 'INCOMPLETE',
+      current,
+      stop,
+      target
+    };
   }
 
   if (current === null) {
-    return { state: 'UNKNOWN', current, stop, target };
+    return {
+      state: 'UNKNOWN',
+      current,
+      stop,
+      target
+    };
   }
 
-  if (stop !== null && current <= stop) {
-    return { state: 'INVALIDATED', current, stop, target };
+  if (
+    stop !== null &&
+    current <= stop
+  ) {
+    return {
+      state: 'INVALIDATED',
+      current,
+      stop,
+      target
+    };
   }
 
-  if (target !== null && current >= target) {
-    return { state: 'TARGET_REACHED', current, stop, target };
+  if (
+    target !== null &&
+    current >= target
+  ) {
+    return {
+      state: 'TARGET_REACHED',
+      current,
+      stop,
+      target
+    };
   }
 
-  return { state: 'OPEN', current, stop, target };
+  return {
+    state: 'OPEN',
+    current,
+    stop,
+    target
+  };
+}
+
+function decisionExecutionGuidance(
+  candidate,
+  riskPolicy
+) {
+  const canonical =
+    candidate?.canonicalState ||
+    decisionCanonicalCompanyState(
+      candidate
+    );
+
+  const professional =
+    canonical?.professional ||
+    {};
+
+  const currentPrice =
+    safeNumber(candidate?.price);
+
+  const profileSuitability =
+    candidate?.profileSuitability ||
+    decisionProfileSuitability(
+      candidate,
+      riskPolicy
+    );
+
+  const shortTerm =
+    professional?.framework ===
+      'SHORT_TERM_TRADER';
+
+  if (currentPrice === null) {
+    return {
+      horizon:
+        shortTerm
+          ? 'short_term'
+          : 'long_term',
+      status: 'WAIT_FOR_PRICE',
+      action: 'WAIT',
+      orderType: null,
+      referencePrice: null,
+      limitPrice: null,
+      maxAcceptablePrice: null,
+      reason:
+        'A current market price is required before NOMAD can define an execution price.'
+    };
+  }
+
+  if (
+    profileSuitability?.state !==
+      'SUITABLE'
+  ) {
+    return {
+      horizon:
+        shortTerm
+          ? 'short_term'
+          : 'long_term',
+      status: 'PROFILE_BLOCKED',
+      action: 'NO_BUY',
+      orderType: null,
+      referencePrice:
+        decisionRound(
+          currentPrice,
+          2
+        ),
+      limitPrice: null,
+      maxAcceptablePrice: null,
+      reason:
+        (profileSuitability?.issues || [])
+          .join(' ') ||
+        'The opportunity does not fit the selected risk profile.'
+    };
+  }
+
+  if (shortTerm) {
+    const execution =
+      candidate?.shortTermExecution ||
+      shortTermProfileExecutionDecision(
+        candidate,
+        riskPolicy
+      );
+
+    const selection =
+      decisionTraderCanonicalPlan(
+        professional,
+        execution
+      );
+
+    const plan =
+      selection.plan;
+
+    if (!plan?.complete) {
+      return {
+        horizon: 'short_term',
+        status: 'WAIT_FOR_CONFIRMATION',
+        action: 'WAIT',
+        orderType: null,
+        referencePrice:
+          decisionRound(
+            currentPrice,
+            2
+          ),
+        limitPrice: null,
+        maxAcceptablePrice: null,
+        planKind:
+          selection.kind,
+        reason:
+          'NOMAD does not have one complete entry, stop and target plan yet.'
+      };
+    }
+
+    const entryLow =
+      safeNumber(
+        plan.entryLow ??
+        plan.entryReference
+      );
+    const entryHigh =
+      safeNumber(
+        plan.entryHigh ??
+        plan.entryReference
+      );
+    const stop =
+      safeNumber(plan.stop);
+    const target =
+      safeNumber(plan.target1);
+    const policy =
+      decisionTraderProfilePolicy(
+        riskPolicy
+      );
+    const family =
+      decisionTraderSetupFamily(
+        professional.setup
+      );
+    const trigger =
+      shortTermTriggerSnapshot(
+        professional.setup,
+        currentPrice,
+        entryLow,
+        entryHigh,
+        stop,
+        riskPolicy
+      );
+    const priceState =
+      decisionTraderPlanPriceState(
+        currentPrice,
+        plan
+      );
+
+    if (
+      priceState.state ===
+        'INVALIDATED'
+    ) {
+      return {
+        horizon: 'short_term',
+        status: 'INVALIDATED',
+        action: 'NO_BUY',
+        orderType: null,
+        referencePrice:
+          decisionRound(currentPrice, 2),
+        limitPrice: null,
+        maxAcceptablePrice: null,
+        entryLow,
+        entryHigh,
+        stop,
+        target,
+        rewardRisk:
+          safeNumber(plan.rewardRisk),
+        planKind:
+          selection.kind,
+        reason:
+          'The current price has broken the plan invalidation/stop level. Re-analyze before considering a new entry.'
+      };
+    }
+
+    if (
+      priceState.state ===
+        'TARGET_REACHED'
+    ) {
+      return {
+        horizon: 'short_term',
+        status: 'DO_NOT_CHASE',
+        action: 'NO_BUY',
+        orderType: null,
+        referencePrice:
+          decisionRound(currentPrice, 2),
+        limitPrice: null,
+        maxAcceptablePrice:
+          target !== null
+            ? decisionRound(target, 2)
+            : null,
+        entryLow,
+        entryHigh,
+        stop,
+        target,
+        rewardRisk:
+          safeNumber(plan.rewardRisk),
+        planKind:
+          selection.kind,
+        reason:
+          'Price has already reached or exceeded the plan target. NOMAD will not open a fresh long trade here.'
+      };
+    }
+
+    let structuralMax =
+      entryHigh;
+
+    if (
+      structuralMax !== null &&
+      (
+        family === 'BREAKOUT' ||
+        family === 'CONTINUATION'
+      )
+    ) {
+      structuralMax *=
+        1 +
+        policy.maxChasePct /
+        100;
+    }
+
+    const minimumRewardRisk =
+      safeNumber(
+        policy.minRewardRisk
+      ) ||
+      1.5;
+
+    let rewardRiskMax = null;
+
+    if (
+      target !== null &&
+      stop !== null &&
+      target > stop
+    ) {
+      rewardRiskMax =
+        (
+          target +
+          minimumRewardRisk *
+          stop
+        ) /
+        (
+          1 +
+          minimumRewardRisk
+        );
+    }
+
+    let maxAcceptablePrice =
+      structuralMax;
+
+    if (
+      rewardRiskMax !== null &&
+      (
+        maxAcceptablePrice === null ||
+        rewardRiskMax <
+          maxAcceptablePrice
+      )
+    ) {
+      maxAcceptablePrice =
+        rewardRiskMax;
+    }
+
+    if (
+      target !== null &&
+      (
+        maxAcceptablePrice === null ||
+        target < maxAcceptablePrice
+      )
+    ) {
+      maxAcceptablePrice =
+        target;
+    }
+
+    maxAcceptablePrice =
+      maxAcceptablePrice !== null
+        ? decisionRound(
+            maxAcceptablePrice,
+            2
+          )
+        : null;
+
+    if (
+      maxAcceptablePrice !== null &&
+      currentPrice >
+        maxAcceptablePrice
+    ) {
+      return {
+        horizon: 'short_term',
+        status: 'DO_NOT_CHASE',
+        action: 'NO_BUY',
+        orderType: null,
+        referencePrice:
+          decisionRound(currentPrice, 2),
+        limitPrice: null,
+        maxAcceptablePrice,
+        entryLow,
+        entryHigh,
+        stop,
+        target,
+        rewardRisk:
+          safeNumber(plan.rewardRisk),
+        planKind:
+          selection.kind,
+        triggerStatus:
+          trigger.status,
+        reason:
+          "Current price is above the maximum entry that preserves this setup and the selected profile\'s reward-to-risk. Do not chase; re-analyze."
+      };
+    }
+
+    if (
+      execution?.actionableNow === true &&
+      [
+        'TRIGGERED',
+        'NEAR_TRIGGER'
+      ].includes(
+        trigger.status
+      )
+    ) {
+      return {
+        horizon: 'short_term',
+        status: 'BUY_NOW',
+        action:
+          execution.action ===
+            'BUY_SMALL'
+            ? 'BUY_SMALL'
+            : 'BUY',
+        orderType: 'LIMIT',
+        referencePrice:
+          decisionRound(currentPrice, 2),
+        limitPrice:
+          maxAcceptablePrice,
+        maxAcceptablePrice,
+        entryLow,
+        entryHigh,
+        stop,
+        target,
+        rewardRisk:
+          safeNumber(plan.rewardRisk),
+        planKind:
+          selection.kind,
+        triggerStatus:
+          trigger.status,
+        reason:
+          execution.action ===
+            'BUY_SMALL'
+            ? "The selected profile permits only a smaller early entry. Use a limit order and do not pay above NOMAD\'s maximum acceptable entry."
+            : "The entry conditions currently pass. Use a limit order and do not pay above NOMAD\'s maximum acceptable entry."
+      };
+    }
+
+    const waitStatus =
+      family === 'PULLBACK' ||
+      family === 'SUPPORT_BOUNCE'
+        ? 'WAIT_FOR_ENTRY'
+        : 'WAIT_FOR_CONFIRMATION';
+
+    return {
+      horizon: 'short_term',
+      status:
+        trigger.status ===
+          'ABOVE_ENTRY_ZONE'
+          ? 'DO_NOT_CHASE'
+          : trigger.status ===
+              'INVALIDATED'
+            ? 'INVALIDATED'
+            : waitStatus,
+      action: 'WAIT',
+      orderType: null,
+      referencePrice:
+        decisionRound(currentPrice, 2),
+      limitPrice: null,
+      maxAcceptablePrice,
+      entryLow,
+      entryHigh,
+      stop,
+      target,
+      rewardRisk:
+        safeNumber(plan.rewardRisk),
+      planKind:
+        selection.kind,
+      triggerStatus:
+        trigger.status,
+      reason:
+        trigger.status ===
+          'ABOVE_ENTRY_ZONE'
+          ? 'Price is beyond the planned entry range. Do not chase; wait for a new valid setup.'
+          : family === 'PULLBACK' ||
+              family === 'SUPPORT_BOUNCE'
+            ? 'The stock remains interesting, but NOMAD is waiting for price to return to the planned entry area.'
+            : 'The stock remains interesting, but NOMAD is waiting for the planned trigger/confirmation before placing a buy.'
+    };
+  }
+
+  const marketAction =
+    String(
+      canonical?.marketAction ||
+      'WATCH'
+    ).toUpperCase();
+
+  if (
+    marketAction !== 'BUY' &&
+    marketAction !== 'ACCUMULATE'
+  ) {
+    return {
+      horizon: 'long_term',
+      status:
+        marketAction === 'AVOID'
+          ? 'NO_BUY'
+          : 'WAIT_FOR_ENTRY',
+      action: 'WAIT',
+      orderType: null,
+      referencePrice:
+        decisionRound(currentPrice, 2),
+      limitPrice: null,
+      maxAcceptablePrice: null,
+      reason:
+        marketAction === 'AVOID'
+          ? 'The current long-term thesis does not permit a new buy.'
+          : 'The company may remain interesting, but current price/timing does not justify new capital yet.'
+    };
+  }
+
+  const priceAction =
+    candidate?.historicalContext
+      ?.priceAction ||
+    {};
+  const technical =
+    candidate?.historicalContext
+      ?.technical ||
+    {};
+
+  const atrPct =
+    safeNumber(priceAction?.atrPct) ??
+    (
+      safeNumber(priceAction?.atr14) !== null &&
+      currentPrice > 0
+        ? safeNumber(priceAction?.atr14) /
+          currentPrice *
+          100
+        : null
+    );
+
+  const annualizedVolatility =
+    safeNumber(
+      technical
+        ?.annualizedVolatility20dPct
+    );
+
+  const dailyVolatilityPct =
+    atrPct !== null
+      ? atrPct
+      : annualizedVolatility !== null
+        ? annualizedVolatility /
+          Math.sqrt(252)
+        : 1;
+
+  const baseTolerancePct =
+    decisionClamp(
+      dailyVolatilityPct *
+      0.35,
+      0.20,
+      1.25
+    );
+
+  const timingState =
+    String(
+      professional?.timingState ||
+      'FAIR'
+    ).toUpperCase();
+  const extensionState =
+    String(
+      professional?.entryExtensionRisk ||
+      'LOW'
+    ).toUpperCase();
+
+  const timingFactor =
+    timingState === 'GOOD'
+      ? 1
+      : timingState === 'FAIR'
+        ? 0.65
+        : 0.25;
+
+  const extensionFactor =
+    extensionState === 'LOW'
+      ? 1
+      : extensionState === 'MODERATE'
+        ? 0.60
+        : extensionState === 'HIGH'
+          ? 0.20
+          : 0;
+
+  const actionFactor =
+    marketAction === 'BUY'
+      ? 1
+      : 0.75;
+
+  const maxChasePct =
+    decisionRound(
+      baseTolerancePct *
+      timingFactor *
+      extensionFactor *
+      actionFactor,
+      2
+    );
+
+  const maxAcceptablePrice =
+    decisionRound(
+      currentPrice *
+      (
+        1 +
+        maxChasePct /
+        100
+      ),
+      2
+    );
+
+  return {
+    horizon: 'long_term',
+    status:
+      marketAction === 'BUY'
+        ? 'BUY_NOW'
+        : 'STAGED_BUY',
+    action:
+      marketAction,
+    orderType: 'LIMIT',
+    referencePrice:
+      decisionRound(currentPrice, 2),
+    limitPrice:
+      maxAcceptablePrice,
+    maxAcceptablePrice,
+    maxChasePct,
+    reason:
+      extensionState === 'HIGH' ||
+      extensionState === 'EXTREME'
+        ? 'Long-term thesis remains actionable, but price-extension risk is elevated. Accumulate only at the current reference area; do not chase a higher opening price.'
+        : marketAction === 'BUY'
+          ? 'The long-term thesis and timing currently pass. Use a limit order so an opening gap cannot silently turn the approved price into a more expensive trade.'
+          : 'NOMAD prefers staged accumulation. Use a limit order and re-analyze if price trades above the maximum acceptable entry.'
+  };
 }
 
 function professionalShortTermView(
@@ -23236,8 +23851,9 @@ function professionalShortTermView(
       tradePlan
     );
 
-  const activeTargetStillAhead =
-    activePlanPriceState.state !== 'TARGET_REACHED';
+  const activePlanOpen =
+    activePlanPriceState.state === 'OPEN' ||
+    activePlanPriceState.state === 'UNKNOWN';
 
   // 0.9.5.0: short-term ranking is deliberately execution-first. Long-term
   // valuation/fundamental weights do not leak into the Trader brain.
@@ -23334,7 +23950,7 @@ function professionalShortTermView(
     technicalEvidenceScore >= 65 &&
     definedTradePlan &&
     rewardRisk >= 1.40 &&
-    activeTargetStillAhead;
+    activePlanOpen;
 
   if (actionableSetup) {
     return {
@@ -23365,6 +23981,36 @@ function professionalShortTermView(
 
   if (
     activePlanPriceState.state ===
+      'INVALIDATED'
+  ) {
+    return {
+      framework: 'SHORT_TERM_TRADER',
+      thesisStatus: 'INVALIDATED_SETUP',
+      timingScore,
+      timingState:
+        priceAction.timingState,
+      setup,
+      setupFamily,
+      rewardRisk,
+      riskScore,
+      riskState:
+        professionalRiskState(
+          riskScore
+        ),
+      rankingScore,
+      technicalEvidence:
+        traderEvidence,
+      tradePlan,
+      conditionalTradePlan,
+      marketAction: 'WATCH',
+      opportunityTier: 'PRIORITY_2',
+      reason:
+        'The active short-term plan is invalidated at the current price. NOMAD requires a fresh setup before a new long entry.'
+    };
+  }
+
+  if (
+    activePlanPriceState.state ===
       'TARGET_REACHED'
   ) {
     return {
@@ -23389,7 +24035,7 @@ function professionalShortTermView(
       marketAction: 'WATCH',
       opportunityTier: 'PRIORITY_2',
       reason:
-        'The current price has reached or exceeded the active plan target. NOMAD will not issue a fresh BUY above its own target; wait for a new or conditional setup.'
+        'The current price has reached or exceeded the active target. NOMAD will not issue a fresh BUY above its own target; wait for a new setup.'
     };
   }
 
@@ -23634,6 +24280,17 @@ function decisionCenterSummary(
       candidate
     );
 
+  const canonicalPlanSelection =
+    canonical.professional
+      ?.framework ===
+        'SHORT_TERM_TRADER'
+      ? decisionTraderCanonicalPlan(
+          canonical.professional,
+          candidate?.shortTermExecution ||
+          null
+        )
+      : null;
+
   return {
     rank,
     symbol:
@@ -23665,6 +24322,20 @@ function decisionCenterSummary(
       null,
     shortTermExecution:
       candidate.shortTermExecution ||
+      null,
+    executionPlan:
+      canonicalPlanSelection
+        ? {
+            kind:
+              canonicalPlanSelection.kind,
+            source:
+              canonicalPlanSelection.source,
+            plan:
+              canonicalPlanSelection.plan
+          }
+        : null,
+    executionGuidance:
+      candidate.executionGuidance ||
       null,
     opportunityRankScore:
       candidate.opportunityRankScore,
@@ -24972,9 +25643,9 @@ function shortTermProfileExecutionDecision(
       currentPlan
     );
 
-  const currentTargetStillAhead =
-    currentPlanPriceState.state !==
-      'TARGET_REACHED';
+  const currentPlanOpen =
+    currentPlanPriceState.state === 'OPEN' ||
+    currentPlanPriceState.state === 'UNKNOWN';
 
   const conditionalStopRiskPct =
     safeNumber(
@@ -25046,7 +25717,7 @@ function shortTermProfileExecutionDecision(
     currentRewardRisk !== null &&
     currentRewardRisk >=
       policy.minRewardRisk &&
-    currentTargetStillAhead &&
+    currentPlanOpen &&
     (
       currentStopRiskPct === null ||
       currentStopRiskPct <=
@@ -25101,7 +25772,7 @@ function shortTermProfileExecutionDecision(
     currentPlan?.complete === true &&
     currentRewardRisk !== null &&
     currentRewardRisk >= 1.25 &&
-    currentTargetStillAhead &&
+    currentPlanOpen &&
     timingScore >=
       policy.minTimingScore &&
     evidenceScore >=
@@ -27031,20 +27702,28 @@ function allocateDecisionCenterOpportunities(
       existingStockValuePaisa +
       spent;
 
-    const canonicalTraderPlanSelection =
+    const traderPlanSelection =
       shortTermCandidate
         ? decisionTraderCanonicalPlan(
             candidate.canonicalState
               ?.professional ||
             candidate.professional ||
-            {}
+            {},
+            candidate.shortTermExecution ||
+            null
           )
         : null;
 
-    const canonicalTraderPlan =
-      canonicalTraderPlanSelection
-        ?.plan ||
+    const traderPlan =
+      traderPlanSelection?.plan ||
       null;
+
+    const executionGuidance =
+      candidate.executionGuidance ||
+      decisionExecutionGuidance(
+        candidate,
+        riskPolicy
+      );
 
     allocations.push({
       symbol:
@@ -27075,33 +27754,32 @@ function allocateDecisionCenterOpportunities(
         shortTermCandidate
           ? {
               source:
-                canonicalTraderPlanSelection
-                  ?.source ||
-                'TRADE_PLAN',
+                traderPlanSelection?.source ||
+                null,
+              kind:
+                traderPlanSelection?.kind ||
+                null,
               setup:
                 candidate.canonicalState
                   ?.professional
                   ?.setup ||
                 null,
               entryLow:
-                canonicalTraderPlan
-                  ?.entryLow ??
+                traderPlan?.entryLow ??
+                traderPlan?.entryReference ??
                 null,
               entryHigh:
-                canonicalTraderPlan
-                  ?.entryHigh ??
+                traderPlan?.entryHigh ??
+                traderPlan?.entryReference ??
                 null,
               stop:
-                canonicalTraderPlan
-                  ?.stop ??
+                traderPlan?.stop ??
                 null,
               target1:
-                canonicalTraderPlan
-                  ?.target1 ??
+                traderPlan?.target1 ??
                 null,
               rewardRisk:
-                canonicalTraderPlan
-                  ?.rewardRisk ??
+                traderPlan?.rewardRisk ??
                 null,
               riskPerShare:
                 traderRiskPerShare,
@@ -27113,6 +27791,7 @@ function allocateDecisionCenterOpportunities(
                 )
             }
           : null,
+      executionGuidance,
       principalPkr:
         decisionRound(
           spent /
@@ -29382,6 +30061,20 @@ async function runSingleStockStrategy(
   candidate.profileSuitability =
     profileSuitability;
 
+  candidate.shortTermExecution =
+    horizon === 'short_term'
+      ? shortTermProfileExecutionDecision(
+          candidate,
+          riskPolicy
+        )
+      : null;
+
+  candidate.executionGuidance =
+    decisionExecutionGuidance(
+      candidate,
+      riskPolicy
+    );
+
   const suitabilityIssues =
     profileSuitability.issues;
 
@@ -29503,7 +30196,8 @@ async function runSingleStockStrategy(
     horizon === 'short_term'
       ? decisionTraderCanonicalPlan(
           canonical.professional ||
-          {}
+          {},
+          candidate.shortTermExecution
         )
       : null;
 
@@ -29601,6 +30295,9 @@ async function runSingleStockStrategy(
       profile:
         risk
     },
+    execution:
+      candidate.executionGuidance ||
+      null,
     evidence:
       canonical.evidence,
     financial: {
@@ -30608,6 +31305,12 @@ async function runDecisionLab(
                   riskPolicy
                 )
               : null;
+
+          candidate.executionGuidance =
+            decisionExecutionGuidance(
+              candidate,
+              riskPolicy
+            );
 
           return candidate;
         }
@@ -32575,40 +33278,46 @@ function runDecisionEngineSelfTests() {
     'confirmed short-term setup with acceptable reward-to-risk must be actionable'
   );
 
-  const canonicalDisplayedPlan =
-    decisionTraderCanonicalPlan({
-      marketAction: 'BUY',
-      tradePlan: {
-        complete: true,
-        entryLow: 50,
-        entryHigh: 51,
-        stop: 46,
-        target1: 61.53,
-        rewardRisk: 2.1
+  const canonicalActivePlanTest =
+    decisionTraderCanonicalPlan(
+      {
+        marketAction: 'BUY',
+        tradePlan: {
+          complete: true,
+          entryLow: 50,
+          entryHigh: 51,
+          stop: 46,
+          target1: 61.53,
+          rewardRisk: 2.1
+        },
+        conditionalTradePlan: {
+          complete: true,
+          entryLow: 46.90,
+          entryHigh: 46.93,
+          stop: 46.04,
+          target1: 48.49,
+          rewardRisk: 1.81
+        }
       },
-      conditionalTradePlan: {
-        complete: true,
-        entryLow: 46.90,
-        entryHigh: 46.93,
-        stop: 46.04,
-        target1: 48.49,
-        rewardRisk: 1.81
+      {
+        actionableNow: true,
+        action: 'BUY'
       }
-    });
+    );
 
   assert.equal(
-    canonicalDisplayedPlan.source,
+    canonicalActivePlanTest.source,
     'TRADE_PLAN',
-    'a Trader market BUY must expose the same active plan used for execution rather than a different conditional plan'
+    'an actionable Trader BUY must expose the active plan, not a different conditional plan'
   );
 
   assert.equal(
-    canonicalDisplayedPlan.plan.target1,
+    canonicalActivePlanTest.plan.target1,
     61.53,
-    'the canonical Trader plan target must match the active allocation target'
+    'the plan shown for an actionable Trader BUY must match the active plan target'
   );
 
-  const targetPassedTraderCandidate = {
+  const targetReachedCandidate = {
     ...longTermProfessionalCandidate,
     horizon: 'short_term',
     price: 113,
@@ -32637,6 +33346,7 @@ function runDecisionEngineSelfTests() {
         timingState: 'GOOD',
         setup: 'CONFIRMED_BREAKOUT',
         atr14: 3.2,
+        atrPct: 2.83,
         support: 95,
         resistance: 112,
         structure: { bias: 'BULLISH' },
@@ -32666,34 +33376,86 @@ function runDecisionEngineSelfTests() {
     }
   };
 
-  targetPassedTraderCandidate.canonicalState =
+  targetReachedCandidate.canonicalState =
     decisionCanonicalCompanyState(
-      targetPassedTraderCandidate
+      targetReachedCandidate
     );
-
-  targetPassedTraderCandidate.profileSuitability =
+  targetReachedCandidate.profileSuitability =
     decisionProfileSuitability(
-      targetPassedTraderCandidate,
+      targetReachedCandidate,
+      riskAggressive
+    );
+  targetReachedCandidate.shortTermExecution =
+    shortTermProfileExecutionDecision(
+      targetReachedCandidate,
+      riskAggressive
+    );
+  targetReachedCandidate.executionGuidance =
+    decisionExecutionGuidance(
+      targetReachedCandidate,
       riskAggressive
     );
 
   assert.notEqual(
-    targetPassedTraderCandidate.canonicalState.marketAction,
+    targetReachedCandidate.canonicalState.marketAction,
     'BUY',
-    'Trader brain must never issue a fresh BUY when the current price has already reached or exceeded the active target'
+    'Trader brain must not issue a fresh BUY once its active target has already been reached'
   );
-
-  const targetPassedAggressiveExecution =
-    shortTermProfileExecutionDecision(
-      targetPassedTraderCandidate,
-      riskAggressive
-    );
 
   assert.equal(
-    targetPassedAggressiveExecution.actionableNow,
-    false,
-    'Aggressive execution must not resurrect a BUY after the active target has already been reached'
+    targetReachedCandidate.executionGuidance.status,
+    'DO_NOT_CHASE',
+    'execution layer must explicitly block a new buy after the target has been reached'
   );
+
+  const longTermExecutionCandidate = {
+    ...longTermProfessionalCandidate,
+    horizon: 'long_term',
+    price: 100,
+    historicalContext: {
+      ...(longTermProfessionalCandidate.historicalContext || {}),
+      technical: {
+        ...(longTermProfessionalCandidate.historicalContext?.technical || {}),
+        annualizedVolatility20dPct: 28
+      },
+      priceAction: {
+        ...(longTermProfessionalCandidate.historicalContext?.priceAction || {}),
+        atr14: 2.5,
+        atrPct: 2.5
+      }
+    }
+  };
+  longTermExecutionCandidate.canonicalState =
+    decisionCanonicalCompanyState(
+      longTermExecutionCandidate
+    );
+  longTermExecutionCandidate.profileSuitability =
+    decisionProfileSuitability(
+      longTermExecutionCandidate,
+      riskBalanced
+    );
+  const longTermExecutionTest =
+    decisionExecutionGuidance(
+      longTermExecutionCandidate,
+      riskBalanced
+    );
+
+  if (
+    ['BUY', 'ACCUMULATE'].includes(
+      longTermExecutionCandidate.canonicalState.marketAction
+    ) &&
+    longTermExecutionCandidate.profileSuitability.state === 'SUITABLE'
+  ) {
+    assert.equal(
+      longTermExecutionTest.orderType,
+      'LIMIT',
+      'an actionable long-term new-money decision must expose a limit-order execution ceiling'
+    );
+    assert.ok(
+      safeNumber(longTermExecutionTest.maxAcceptablePrice) >= 100,
+      'the long-term execution ceiling must be at or above the approved reference price'
+    );
+  }
 
   const shortTermAllocationCandidate = {
     ...longTermProfessionalCandidate,
@@ -32815,12 +33577,17 @@ function runDecisionEngineSelfTests() {
     assert.equal(
       shortTermRiskSized.allocations[0].traderPlan.target1,
       shortTermAllocationCandidate.canonicalState.professional.tradePlan.target1,
-      'the allocator must carry the exact same canonical Trader target shown for the active market plan'
+      'allocated short-term target must match the canonical active plan shown to the user'
     );
     assert.equal(
       shortTermRiskSized.allocations[0].traderPlan.stop,
       shortTermAllocationCandidate.canonicalState.professional.tradePlan.stop,
-      'the allocator must carry the exact same canonical Trader stop shown for the active market plan'
+      'allocated short-term stop must match the canonical active plan shown to the user'
+    );
+    assert.equal(
+      shortTermRiskSized.allocations[0].executionGuidance.orderType,
+      'LIMIT',
+      'an actionable short-term allocation must include a LIMIT execution instruction'
     );
   }
 
@@ -37419,6 +38186,47 @@ tbody tr:hover {
   margin-top: 2px;
   color: #e8f0f8;
   font-size: 12px;
+}
+
+.executionGuideLine {
+  margin-top:8px;
+  padding:8px 10px;
+  border:1px solid var(--line);
+  border-radius:8px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
+  font-size:12px;
+}
+.executionGuideLine strong { color:var(--yellow); }
+.executionGuideLine.buy_now strong,
+.executionGuideLine.staged_buy strong { color:var(--green); }
+.executionGuideLine.do_not_chase strong,
+.executionGuideLine.invalidated strong,
+.executionGuideLine.no_buy strong,
+.executionGuideLine.profile_blocked strong { color:var(--red); }
+.strategyExecutionBox {
+  margin:12px 0;
+  padding:12px;
+  border:1px solid rgba(250,204,21,.35);
+  border-radius:10px;
+  background:rgba(250,204,21,.04);
+  display:grid;
+  grid-template-columns:repeat(4,minmax(0,1fr));
+  gap:8px;
+}
+.strategyExecutionBox > div {
+  padding:8px;
+  border:1px solid var(--line);
+  border-radius:8px;
+}
+.strategyExecutionBox span { display:block; font-size:10px; color:var(--muted); text-transform:uppercase; }
+.strategyExecutionBox strong { display:block; margin-top:3px; }
+.strategyExecutionBox p { grid-column:1/-1; margin:0; color:var(--muted); }
+@media (max-width: 760px) {
+  .strategyExecutionBox { grid-template-columns:1fr 1fr; }
+  .executionGuideLine { align-items:flex-start; flex-direction:column; }
 }
 
 .decisionAllocationRow,
@@ -52524,7 +53332,15 @@ function decisionActionLabel(
     READY_UNFUNDED: 'READY · UNFUNDED',
     PASS: 'PASS',
     WAIT: 'WAIT',
-    TRIGGER_PLAN: 'TRIGGER PLAN'
+    TRIGGER_PLAN: 'TRIGGER PLAN',
+    WAIT_FOR_ENTRY: 'WAIT FOR ENTRY',
+    WAIT_FOR_CONFIRMATION: 'WAIT FOR CONFIRMATION',
+    DO_NOT_CHASE: 'DO NOT CHASE',
+    INVALIDATED: 'INVALIDATED',
+    STAGED_BUY: 'STAGED BUY',
+    PROFILE_BLOCKED: 'PROFILE BLOCKED',
+    WAIT_FOR_PRICE: 'WAIT FOR PRICE',
+    NO_BUY: 'NO BUY'
   };
 
   return labels[action] ||
@@ -52589,18 +53405,18 @@ function renderOpportunityList(
         const isShortTerm =
           professional.framework ===
             'SHORT_TERM_TRADER';
-        const canonicalPlanSelection =
-          isShortTerm
-            ? decisionTraderCanonicalPlan(
-                professional
-              )
-            : null;
         const plan =
-          canonicalPlanSelection
-            ?.plan ||
+          item?.executionPlan?.plan ||
+          professional.conditionalTradePlan ||
           null;
+        const planKind =
+          item?.executionPlan?.kind ||
+          'CONDITIONAL';
         const execution =
           item.shortTermExecution ||
+          null;
+        const executionGuidance =
+          item.executionGuidance ||
           null;
 
         const marketAction =
@@ -52625,7 +53441,7 @@ function renderOpportunityList(
             ? (
                 '<div class="tradeQuickLine">' +
                 '<span class="tradeMetric trigger"><small>' +
-                (canonicalPlanSelection?.kind === 'ACTIVE' ? 'Entry' : 'Trigger') +
+                (planKind === 'ACTIVE' ? 'Entry' : 'Trigger') +
                 '</small><strong>PKR ' +
                 formatNumber(plan.entryLow, 2) +
                 '–' +
@@ -52680,6 +53496,45 @@ function renderOpportunityList(
                   '</strong></div>'
                 )
               : '';
+
+        const executionLine =
+          executionGuidance
+            ? (
+                '<div class="executionGuideLine ' +
+                escapeHtml(
+                  String(
+                    executionGuidance.status ||
+                    'WAIT'
+                  ).toLowerCase()
+                ) +
+                '"><strong>' +
+                escapeHtml(
+                  decisionActionLabel(
+                    executionGuidance.status ||
+                    'WAIT'
+                  )
+                ) +
+                '</strong>' +
+                (
+                  executionGuidance.orderType === 'LIMIT' &&
+                  executionGuidance.maxAcceptablePrice !== null &&
+                  executionGuidance.maxAcceptablePrice !== undefined
+                    ? '<span>LIMIT ≤ PKR ' +
+                      formatNumber(
+                        executionGuidance.maxAcceptablePrice,
+                        2
+                      ) +
+                      '</span>'
+                    : '<span>' +
+                      escapeHtml(
+                        executionGuidance.reason ||
+                        ''
+                      ) +
+                      '</span>'
+                ) +
+                '</div>'
+              )
+            : '';
 
         const compactReason =
           String(item.reason || '')
@@ -52756,6 +53611,7 @@ function renderOpportunityList(
           '</span></div>' +
           quickTradeLine +
           triggerFundingLine +
+          executionLine +
           (
             compactReason
               ? '<div class="opportunityReason compact">' +
@@ -52939,6 +53795,8 @@ function renderStockStrategy(
     result?.evidence || {};
   const suitability =
     result?.riskSuitability || {};
+  const execution =
+    result?.execution || null;
   const isShortTerm =
     result?.input?.horizon ===
       'short_term';
@@ -53099,6 +53957,50 @@ function renderStockStrategy(
             ) + '%'
           : 'None'
       ) +
+      '</div>';
+  }
+
+  if (execution) {
+    html +=
+      '<div class="strategyExecutionBox">' +
+      '<div><span>Execution</span><strong>' +
+      escapeHtml(
+        decisionActionLabel(
+          execution.status ||
+          'WAIT'
+        )
+      ) +
+      '</strong></div>' +
+      '<div><span>Order type</span><strong>' +
+      escapeHtml(
+        execution.orderType ||
+        'NO ORDER'
+      ) +
+      '</strong></div>' +
+      '<div><span>Reference price</span><strong>PKR ' +
+      formatNumber(
+        execution.referencePrice,
+        2
+      ) +
+      '</strong></div>' +
+      '<div><span>Maximum buy price</span><strong>' +
+      (
+        execution.maxAcceptablePrice !== null &&
+        execution.maxAcceptablePrice !== undefined
+          ? 'PKR ' +
+            formatNumber(
+              execution.maxAcceptablePrice,
+              2
+            )
+          : '—'
+      ) +
+      '</strong></div>' +
+      '<p>' +
+      escapeHtml(
+        execution.reason ||
+        ''
+      ) +
+      '</p>' +
       '</div>';
   }
 
@@ -54478,6 +55380,28 @@ function renderShadowDecision(
               : ''
           ) +
           (
+            item.executionGuidance
+              ? ' · ' +
+                escapeHtml(
+                  decisionActionLabel(
+                    item.executionGuidance.status ||
+                    'WAIT'
+                  )
+                ) +
+                (
+                  item.executionGuidance.orderType === 'LIMIT' &&
+                  item.executionGuidance.maxAcceptablePrice !== null &&
+                  item.executionGuidance.maxAcceptablePrice !== undefined
+                    ? ' · LIMIT ≤ PKR ' +
+                      formatNumber(
+                        item.executionGuidance.maxAcceptablePrice,
+                        2
+                      )
+                    : ''
+                )
+              : ''
+          ) +
+          (
             item.traderPlan
               ? ' · setup ' +
                 escapeHtml(
@@ -54650,7 +55574,7 @@ function renderShadowDecision(
           )
     ) +
     '</div>' +
-    '<div class="decisionMetaLine">Execution costs and forward-return scenarios are not included yet. This remains shadow research, not a trade instruction.</div>';
+    '<div class="decisionMetaLine">Execution guidance now uses LIMIT ceilings and no-chase/invalidation guards. Brokerage, taxes and exchange charges are not included yet; confirm the final order cost before execution. This remains shadow decision intelligence.</div>';
 
   target.innerHTML =
     html;
