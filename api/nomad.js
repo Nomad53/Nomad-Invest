@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.7.0';
+const VERSION = '0.9.7.1';
 
 
 const SUPABASE_URL =
@@ -29249,22 +29249,49 @@ function askNomadNormalizeText(value) {
 
 function askNomadExtractCapital(message) {
   const text = askNomadNormalizeText(message).toLowerCase().replace(/,/g, '');
-  const patterns = [
-    /(?:pkr|rs\.?|rupees?)\s*([0-9]+(?:\.[0-9]+)?)\s*(k|m|million|thousand|lakh|lac|crore)?/i,
-    /([0-9]+(?:\.[0-9]+)?)\s*(k|m|million|thousand|lakh|lac|crore)\b/i
-  ];
-  for (const pattern of patterns) {
-    const match = text.match(pattern);
-    if (!match) continue;
-    let amount = Number(match[1]);
-    if (!Number.isFinite(amount) || amount <= 0) continue;
-    const unit = String(match[2] || '').toLowerCase();
+
+  function scaledAmount(rawAmount, rawUnit, allowSmall = true) {
+    let amount = Number(rawAmount);
+    if (!Number.isFinite(amount) || amount <= 0) return null;
+    const unit = String(rawUnit || '').toLowerCase();
     if (unit === 'k' || unit === 'thousand') amount *= 1000;
     else if (unit === 'm' || unit === 'million') amount *= 1000000;
     else if (unit === 'lakh' || unit === 'lac') amount *= 100000;
     else if (unit === 'crore') amount *= 10000000;
+    if (!allowSmall && amount < 100) return null;
     return amount;
   }
+
+  // Currency may appear before OR after the amount. The previous router only
+  // understood "PKR 1000", which caused natural questions such as
+  // "where should I invest 1000 PKR?" to fall through as unsupported.
+  const currencyPatterns = [
+    /(?:pkr|rs\.?|rupees?)\s*([0-9]+(?:\.[0-9]+)?)\s*(k|m|million|thousand|lakh|lac|crore)?/i,
+    /([0-9]+(?:\.[0-9]+)?)\s*(k|m|million|thousand|lakh|lac|crore)?\s*(?:pkr|rs\.?|rupees?)\b/i,
+    /([0-9]+(?:\.[0-9]+)?)\s*(k|m|million|thousand|lakh|lac|crore)\b/i
+  ];
+
+  for (const pattern of currencyPatterns) {
+    const match = text.match(pattern);
+    if (!match) continue;
+    const amount = scaledAmount(match[1], match[2], true);
+    if (amount !== null) return amount;
+  }
+
+  // Also understand natural money phrasing without a currency label, while
+  // deliberately refusing tiny ambiguous numbers such as "5 years".
+  const contextualPatterns = [
+    /\b(?:invest|deploy|allocate|budget|capital|spend|put in|put)\b[\s\S]{0,18}?([0-9]+(?:\.[0-9]+)?)(?:\s*(k|m|million|thousand|lakh|lac|crore))?/i,
+    /([0-9]+(?:\.[0-9]+)?)(?:\s*(k|m|million|thousand|lakh|lac|crore))?[\s\S]{0,18}\b(?:to invest|for investment|as capital|budget)\b/i
+  ];
+
+  for (const pattern of contextualPatterns) {
+    const match = text.match(pattern);
+    if (!match) continue;
+    const amount = scaledAmount(match[1], match[2], false);
+    if (amount !== null) return amount;
+  }
+
   return null;
 }
 
@@ -29302,15 +29329,51 @@ function askNomadInferHorizon(message, fallback) {
   return fallback === 'short_term' ? 'short_term' : 'long_term';
 }
 
-function askNomadClassifyIntent(message, symbols) {
+function askNomadLooksInvestmentRelated(message) {
   const text = askNomadNormalizeText(message).toLowerCase();
+  return /\b(invest|investment|investing|trade|trading|stock|stocks|share|shares|portfolio|holding|holdings|position|positions|market|psx|buy|sell|hold|add|reduce|exit|entry|stop|target|breakout|pullback|capital|cash|pkr|rupees?|long[ -]?term|short[ -]?term|dividend|valuation|risk|sector)\b/.test(text);
+}
+
+function askNomadClassifyIntent(message, symbols, explicitCapital = null) {
+  const text = askNomadNormalizeText(message).toLowerCase();
+  const hasCapital = safeNumber(explicitCapital) !== null && safeNumber(explicitCapital) > 0;
+  const portfolioMention = /\b(portfolio|my stocks?|my shares?|my holdings?|holdings?|my positions?|positions?|concentration|diversif(?:y|ied|ication))\b/.test(text);
+  const actionCue = /\b(sell|reduce|exit|buy|add|hold|rebalance|rotate|switch|steps?|action|do anything|what should i do|should i)\b/.test(text);
+  const allocationCue = /\b(invest|investment|deploy|allocate|allocation|put in|put money|use this money|use my money|new capital|new money|capital|budget|what should i buy|buy anything|where[^?.]{0,30}invest|how[^?.]{0,30}invest|something for long[ -]?term|something for short[ -]?term)\b/.test(text);
+
+  // Cash-raising is a distinct portfolio problem and must win before generic
+  // capital routing even when the same sentence contains a PKR amount.
   if (/\b(need|raise|withdraw|take out|free up|require)\b[\s\S]{0,45}\b(cash|money|pkr|rs\.?|rupees?)\b|\bcash within\b|\bneed cash\b|\braise cash\b/.test(text)) return 'LIQUIDITY_PLAN';
-  if (symbols.length >= 2 && /\b(compare|versus|vs\.?|better)\b/.test(text)) return 'COMPARE_STOCKS';
+
+  if (symbols.length >= 2 && /\b(compare|versus|vs\.?|better|choose between|prefer)\b/.test(text)) return 'COMPARE_STOCKS';
+
+  // A named stock remains a stock-analysis question even when an amount is
+  // mentioned (e.g. "should I put PKR 20,000 into PRL?"). The stock brain is
+  // authoritative; the chat layer can then explain affordability/context.
   if (symbols.length >= 1) return 'STOCK_ANALYSIS';
-  if (/\b(market|psx|index|breadth|gainers|losers|session)\b/.test(text) && !/\bportfolio|my stocks?|holdings?\b/.test(text)) return 'MARKET_OUTLOOK';
-  if (/\b(invest more|deploy|put in|allocate|new capital|new money|where should i invest|what should i buy|buy anything)\b/.test(text)) return 'CAPITAL_DECISION';
-  if (/\b(sell|reduce|exit|buy|add|hold|steps?|action|do anything|should i|rebalance|rotate)\b/.test(text) && /\b(portfolio|my stocks?|holdings?|anything|positions?)\b/.test(text)) return 'PORTFOLIO_ACTIONS';
-  if (/\b(portfolio|my stocks?|holdings?|how.*doing|how.*look|today|concentration|diversif|risk)\b/.test(text)) return 'PORTFOLIO_REVIEW';
+
+  if (portfolioMention && actionCue) return 'PORTFOLIO_ACTIONS';
+  if (portfolioMention) return 'PORTFOLIO_REVIEW';
+
+  if (/\b(market|psx|index|breadth|gainers|losers|session|market today|market look|market doing)\b/.test(text)) return 'MARKET_OUTLOOK';
+
+  // Natural capital questions should not depend on one exact sentence shape.
+  // If a user gives us money and asks an investment/trading question, that is
+  // enough to run the Decision Center. This covers "I have 1000 PKR, long term",
+  // "where and how should I invest 1000 pkr", "what can I do with Rs 5000", etc.
+  if (hasCapital && (allocationCue || actionCue || /\b(long[ -]?term|short[ -]?term|years?|months?|what should i do|where|how)\b/.test(text) || askNomadLooksInvestmentRelated(text))) {
+    return 'CAPITAL_DECISION';
+  }
+
+  // An allocation question without an amount is still recognized correctly;
+  // the capital-decision handler will ask only for the missing amount.
+  if (allocationCue) return 'CAPITAL_DECISION';
+
+  // Open-ended investment discussion is valid Ask NOMAD input. It is not an
+  // "unsupported question"; route it to a grounded market-context response and
+  // ask for a missing stock/amount only if the requested action truly needs one.
+  if (askNomadLooksInvestmentRelated(text)) return 'GENERAL_INVESTMENT';
+
   return 'GENERAL';
 }
 
@@ -29545,8 +29608,8 @@ async function runAskNomad(input) {
     symbols = contextSymbols;
   }
   const horizon = askNomadInferHorizon(message, String(input?.horizon || 'long_term'));
-  const intent = askNomadClassifyIntent(message, symbols);
   const explicitCapital = safeNumber(input?.capital) || askNomadExtractCapital(message);
+  const intent = askNomadClassifyIntent(message, symbols, explicitCapital);
   const basis = {
     marketSource: 'Official PSX Data Portal',
     marketAsOf: market?.marketWatchAsOf || market?.asOf || null,
@@ -29652,7 +29715,7 @@ async function runAskNomad(input) {
       return {status:'OK',build:VERSION,intent,basis,answer:{headline:a.symbol+' vs '+b.symbol,summary:'NOMAD ran the same '+(horizon==='short_term'?'Trader':'Investor')+' framework on both companies under your '+requestedRisk+' profile. The market view and your personal action remain separate.',bullets:[a.symbol+': Market '+a.marketAction+' · For you '+a.personalAction,b.symbol+': Market '+b.marketAction+' · For you '+b.personalAction]},cards,disclaimer:'No order is placed.'};
     }
     const c=cards[0];
-    return {status:'OK',build:VERSION,intent,basis,answer:{headline:c.symbol+': Market '+c.marketAction+' · For you '+c.personalAction,summary:c.personalReason || results[0]?.professional?.reason || 'Analysis completed.',bullets:[c.dayChangePct!==null?'Today: '+askNomadPct(c.dayChangePct)+' at '+askNomadMoney(c.price):null,c.setup?'Setup: '+c.setup:null,c.entryLow!==null?'Entry: '+c.entryLow+(c.entryHigh!==null?'–'+c.entryHigh:''):null,c.stop!==null?'Stop: '+c.stop:null,c.target!==null?'Target: '+c.target:null,c.rewardRisk!==null?'Reward/risk: '+decisionRound(c.rewardRisk,2)+':1':null].filter(Boolean)},cards,disclaimer:'No order is placed.'};
+    return {status:'OK',build:VERSION,intent,basis,answer:{headline:c.symbol+': Market '+c.marketAction+' · For you '+c.personalAction,summary:c.personalReason || results[0]?.professional?.reason || 'Analysis completed.',bullets:[c.dayChangePct!==null?'Today: '+askNomadPct(c.dayChangePct)+' at '+askNomadMoney(c.price):null,c.setup?'Setup: '+c.setup:null,c.entryLow!==null?'Entry: '+c.entryLow+(c.entryHigh!==null?'–'+c.entryHigh:''):null,c.stop!==null?'Stop: '+c.stop:null,c.target!==null?'Target: '+c.target:null,c.rewardRisk!==null?'Reward/risk: '+decisionRound(c.rewardRisk,2)+':1':null,explicitCapital!==null&&safeNumber(c.price)>0?'Your '+askNomadMoney(explicitCapital)+' can buy up to '+Math.floor(explicitCapital/c.price).toLocaleString('en-US')+' whole shares before fees/charges at the current reference price.':null].filter(Boolean)},cards,disclaimer:'No order is placed.'};
   }
 
   if (intent === 'PORTFOLIO_REVIEW' || intent === 'PORTFOLIO_ACTIONS') {
@@ -29675,9 +29738,28 @@ async function runAskNomad(input) {
     };
   }
 
+  if (intent === 'GENERAL_INVESTMENT') {
+    const summary = askNomadMarketSummary(market);
+    basis.engines.push('Market breadth engine');
+    const tone = summary.breadthPct === null ? 'mixed' : summary.breadthPct >= 58 ? 'constructive' : summary.breadthPct <= 42 ? 'weak' : 'mixed';
+    return {
+      status:'OK', build:VERSION, intent, basis,
+      answer:{
+        headline: horizon === 'short_term' ? 'I understand this as a trading question.' : 'I understand this as an investment question.',
+        summary:'The current PSX backdrop is '+tone+'. I can discuss the market without inventing inputs, but an exact stock recommendation or capital allocation needs the stock name or the amount you want NOMAD to evaluate.',
+        bullets:[
+          'Current breadth: '+summary.advancers+' advancing · '+summary.decliners+' declining · '+summary.unchanged+' unchanged.',
+          horizon === 'short_term' ? 'For an exact trade plan, name the stock or tell me the capital you want to deploy.' : 'For an exact long-term allocation, tell me the capital you want to deploy or name the stock you want assessed.'
+        ]
+      },
+      cards:[], marketSummary:summary,
+      disclaimer:'NOMAD used current market evidence and did not invent a stock, amount, or order.'
+    };
+  }
+
   return {
     status:'NEEDS_INPUT', build:VERSION, intent, basis,
-    answer:{headline:'I need a more specific investment question.',summary:'Ask about your portfolio, a PSX stock, the market, or a capital decision. I will route it through the relevant NOMAD engine rather than guess.',bullets:['Example: “How does my portfolio look today?”','Example: “Should I buy or sell anything?”','Example: “How does PRL look today?”','Example: “Where should I invest PKR 100,000?”']},
+    answer:{headline:'Ask me anything about PSX investing or trading.',summary:'I could not safely map this message to an investment task. Rephrase it in your own words and I will route it through the relevant NOMAD engine; you do not need to use a predefined question.',bullets:[]},
     cards:[]
   };
 }
@@ -33702,6 +33784,60 @@ function runDecisionEngineSelfTests() {
     longTermHighVolSuitability.state,
     'NOT_SUITABLE',
     'Long-term volatility profile gate must remain unchanged while the Trader brain uses stop-defined risk'
+  );
+
+  // Ask NOMAD natural-language routing regressions. Clear investment questions
+  // must not depend on one hard-coded phrase shape.
+  assert.equal(
+    askNomadExtractCapital('I have 1000 PKR and I want something for long term. What should I do?'),
+    1000,
+    'Ask NOMAD must understand amount-before-currency phrasing'
+  );
+
+  assert.equal(
+    askNomadExtractCapital('Where and how should I invest 1000 pkr?'),
+    1000,
+    'Ask NOMAD must extract capital from natural allocation questions'
+  );
+
+  assert.equal(
+    askNomadClassifyIntent(
+      'I have 1000 PKR and I want something for long term. What should I do?',
+      [],
+      1000
+    ),
+    'CAPITAL_DECISION',
+    'Ask NOMAD must route a natural long-term capital question to Decision Center'
+  );
+
+  assert.equal(
+    askNomadClassifyIntent(
+      'Where and how should I invest 1000 pkr?',
+      [],
+      1000
+    ),
+    'CAPITAL_DECISION',
+    'Ask NOMAD must not require the exact phrase "where should I invest"'
+  );
+
+  assert.equal(
+    askNomadClassifyIntent(
+      'How does my portfolio look today?',
+      [],
+      null
+    ),
+    'PORTFOLIO_REVIEW',
+    'Portfolio questions must remain portfolio questions after broadening Ask NOMAD routing'
+  );
+
+  assert.equal(
+    askNomadClassifyIntent(
+      'How does the PSX market look today?',
+      [],
+      null
+    ),
+    'MARKET_OUTLOOK',
+    'Market questions must remain market questions after broadening Ask NOMAD routing'
   );
 
   console.log(
