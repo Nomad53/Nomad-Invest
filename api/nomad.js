@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.6.9';
+const VERSION = '0.9.6.10';
 
 // Core production hardening: Ask NOMAD remains intentionally disabled so the
 // conversational layer cannot interfere with the production decision path.
@@ -20,6 +20,9 @@ const VERSION = '0.9.6.9';
 // 0.9.6.9 fixes the Portfolio chart headline performance metric so transaction
 // additions are never presented as investment gains. The chart now reports
 // unrealized P&L versus open cost basis while leaving the live value series intact.
+// 0.9.6.10 is an execution-clarity UI patch only. Actionable recommendations now
+// present the MAX BUY PRICE as a prominent hard ceiling in both opportunity cards
+// and allocation rows so a broker order is less likely to exceed NOMAD's plan.
 const NOMAD_ASK_NOMAD_ENABLED = false;
 
 
@@ -38345,6 +38348,93 @@ tbody tr:hover {
 .executionGuideLine.invalidated strong,
 .executionGuideLine.no_buy strong,
 .executionGuideLine.profile_blocked strong { color:var(--red); }
+.executionGuideLine.executionActionable {
+  border-color:rgba(244,197,66,.48);
+  background:rgba(244,197,66,.045);
+  align-items:stretch;
+}
+.executionGuideAction {
+  display:flex;
+  flex-direction:column;
+  justify-content:center;
+  min-width:108px;
+}
+.executionGuideAction span {
+  margin-top:2px;
+  color:#7f93aa;
+  font-size:9px;
+  font-weight:700;
+  letter-spacing:.06em;
+  text-transform:uppercase;
+}
+.executionLimitBox {
+  margin-left:auto;
+  min-width:190px;
+  padding:7px 9px;
+  border:1px solid rgba(244,197,66,.38);
+  border-radius:7px;
+  background:#0a1421;
+  text-align:right;
+}
+.executionLimitBox > span {
+  display:block;
+  color:#f4c542;
+  font-size:9px;
+  font-weight:800;
+  letter-spacing:.08em;
+  text-transform:uppercase;
+}
+.executionLimitBox > strong {
+  display:block;
+  margin-top:1px;
+  color:#f6f9fc !important;
+  font-size:17px;
+  line-height:1.15;
+}
+.executionLimitBox > em {
+  display:block;
+  margin-top:3px;
+  color:#ff8e8e;
+  font-size:9px;
+  font-style:normal;
+  font-weight:700;
+}
+.allocationActionStack {
+  display:flex;
+  flex-direction:column;
+  align-items:flex-end;
+  gap:5px;
+}
+.allocationMaxBuy {
+  min-width:116px;
+  padding:6px 8px;
+  border:1px solid rgba(244,197,66,.40);
+  border-radius:6px;
+  background:rgba(244,197,66,.045);
+  text-align:right;
+}
+.allocationMaxBuy span {
+  display:block;
+  color:#f4c542;
+  font-size:8px;
+  font-weight:800;
+  letter-spacing:.06em;
+  text-transform:uppercase;
+}
+.allocationMaxBuy strong {
+  display:block;
+  margin-top:1px;
+  color:#f4f8fc;
+  font-size:13px;
+}
+.allocationMaxBuy em {
+  display:block;
+  margin-top:1px;
+  color:#ff8e8e;
+  font-size:8px;
+  font-style:normal;
+  font-weight:700;
+}
 .strategyExecutionBox {
   margin:12px 0;
   padding:12px;
@@ -38366,6 +38456,8 @@ tbody tr:hover {
 @media (max-width: 760px) {
   .strategyExecutionBox { grid-template-columns:1fr 1fr; }
   .executionGuideLine { align-items:flex-start; flex-direction:column; }
+  .executionLimitBox { width:100%; min-width:0; margin-left:0; text-align:left; }
+  .allocationActionStack { align-items:flex-start; }
 }
 
 .decisionAllocationRow,
@@ -53649,39 +53741,54 @@ function renderOpportunityList(
         const executionLine =
           executionGuidance
             ? (
-                '<div class="executionGuideLine ' +
-                escapeHtml(
-                  String(
-                    executionGuidance.status ||
-                    'WAIT'
-                  ).toLowerCase()
-                ) +
-                '"><strong>' +
-                escapeHtml(
-                  decisionActionLabel(
-                    executionGuidance.status ||
-                    'WAIT'
-                  )
-                ) +
-                '</strong>' +
-                (
-                  executionGuidance.orderType === 'LIMIT' &&
-                  executionGuidance.maxAcceptablePrice !== null &&
-                  executionGuidance.maxAcceptablePrice !== undefined
-                    ? '<span>LIMIT ≤ PKR ' +
+                executionGuidance.orderType === 'LIMIT' &&
+                executionGuidance.maxAcceptablePrice !== null &&
+                executionGuidance.maxAcceptablePrice !== undefined
+                  ? (
+                      '<div class="executionGuideLine executionActionable ' +
+                      escapeHtml(
+                        String(
+                          executionGuidance.status ||
+                          'WAIT'
+                        ).toLowerCase()
+                      ) +
+                      '"><div class="executionGuideAction"><strong>' +
+                      escapeHtml(
+                        decisionActionLabel(
+                          executionGuidance.status ||
+                          'WAIT'
+                        )
+                      ) +
+                      '</strong><span>LIMIT ORDER</span></div>' +
+                      '<div class="executionLimitBox"><span>MAX BUY PRICE</span><strong>PKR ' +
                       formatNumber(
                         executionGuidance.maxAcceptablePrice,
                         2
                       ) +
-                      '</span>'
-                    : '<span>' +
+                      '</strong><em>Do not place an order above this price</em></div></div>'
+                    )
+                  : (
+                      '<div class="executionGuideLine ' +
+                      escapeHtml(
+                        String(
+                          executionGuidance.status ||
+                          'WAIT'
+                        ).toLowerCase()
+                      ) +
+                      '"><strong>' +
+                      escapeHtml(
+                        decisionActionLabel(
+                          executionGuidance.status ||
+                          'WAIT'
+                        )
+                      ) +
+                      '</strong><span>' +
                       escapeHtml(
                         executionGuidance.reason ||
                         ''
                       ) +
-                      '</span>'
-                ) +
-                '</div>'
+                      '</span></div>'
+                    )
               )
             : '';
 
@@ -55626,7 +55733,7 @@ function renderShadowDecision(
               : ''
           ) +
           '</div></div>' +
-          '<div class="decisionActionTag ' +
+          '<div class="allocationActionStack"><div class="decisionActionTag ' +
           escapeHtml(
             String(
               item.action ||
@@ -55640,7 +55747,19 @@ function renderShadowDecision(
             )
           ) +
           '</div>' +
-          '</div>'
+          (
+            item.executionGuidance?.orderType === 'LIMIT' &&
+            item.executionGuidance?.maxAcceptablePrice !== null &&
+            item.executionGuidance?.maxAcceptablePrice !== undefined
+              ? '<div class="allocationMaxBuy"><span>MAX BUY PRICE</span><strong>PKR ' +
+                formatNumber(
+                  item.executionGuidance.maxAcceptablePrice,
+                  2
+                ) +
+                '</strong><em>DO NOT EXCEED</em></div>'
+              : ''
+          ) +
+          '</div></div>'
       ).join('');
   } else {
     html +=
