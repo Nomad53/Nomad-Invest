@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.6.8';
+const VERSION = '0.9.6.9';
 
 // Core production hardening: Ask NOMAD remains intentionally disabled so the
 // conversational layer cannot interfere with the production decision path.
@@ -17,6 +17,9 @@ const VERSION = '0.9.6.8';
 // that explicitly permits a purchase may receive capital. It also labels every
 // rendered Decision Center result with the exact horizon/risk profile that was
 // analyzed. Investor/Trader scoring and ranking remain frozen.
+// 0.9.6.9 fixes the Portfolio chart headline performance metric so transaction
+// additions are never presented as investment gains. The chart now reports
+// unrealized P&L versus open cost basis while leaving the live value series intact.
 const NOMAD_ASK_NOMAD_ENABLED = false;
 
 
@@ -43292,15 +43295,19 @@ function portfolioLiveValueChart(series, summary) {
   const y = v => T + (1 - ((v - min) / (max - min))) * uh;
   const poly = points.map((p,i) => x(i).toFixed(1)+','+y(Number(p.v)).toFixed(1)).join(' ');
   const area = L+','+(T+uh)+' '+poly+' '+(L+uw)+','+(T+uh);
-  const first = Number(points[0]?.v || current || 0);
-  const change = first ? ((current - first) / first) * 100 : 0;
+  const unrealizedValue = Number.isFinite(cost) && cost > 0
+    ? current - cost
+    : 0;
+  const unrealizedPct = Number.isFinite(cost) && cost > 0
+    ? (unrealizedValue / cost) * 100
+    : 0;
   const costY = cost > min && cost < max ? y(cost).toFixed(1) : null;
   const startLabel = points[0]?.t ? new Date(Number(points[0].t)).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : '';
   const endLabel = points[points.length-1]?.t ? new Date(Number(points[points.length-1].t)).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : '';
 
   return '<div class="portfolioLiveChart">' +
     '<div class="portfolioChartHead"><div><div class="eyebrow">LIVE VALUE</div><h2>Portfolio session</h2></div>' +
-    '<div class="portfolioChartValue"><strong>'+portfolioMoney(current)+'</strong><span class="'+percentClass(change)+'">'+(change>0?'+':'')+formatNumber(change,2)+'% tracked</span></div></div>' +
+    '<div class="portfolioChartValue"><strong>'+portfolioMoney(current)+'</strong><span class="'+percentClass(unrealizedPct)+'">'+(unrealizedValue>0?'+':'')+portfolioMoney(unrealizedValue)+' · '+(unrealizedPct>0?'+':'')+formatNumber(unrealizedPct,2)+'% unrealized</span></div></div>' +
     '<svg viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none" class="portfolioValueSvg" aria-label="Live portfolio value chart">' +
     '<line x1="'+L+'" x2="'+(W-R)+'" y1="'+T+'" y2="'+T+'" class="portfolioChartGrid" />' +
     '<line x1="'+L+'" x2="'+(W-R)+'" y1="'+(T+uh/2)+'" y2="'+(T+uh/2)+'" class="portfolioChartGrid" />' +
@@ -43330,9 +43337,15 @@ function portfolioOfficialLiveChartMarkup(result, series) {
   }
 
   const values = points.map(point => Number(point.v)).filter(Number.isFinite);
-  const first = Number(values[0] || current);
-  const changeValue = current - first;
-  const changePct = first > 0 ? changeValue / first * 100 : 0;
+  // RM-001: portfolio value can jump when a new holding is recorded. That is a
+  // capital-flow event, not investment performance. The headline therefore
+  // uses open cost basis so deposits/new purchases cannot create fake returns.
+  const unrealizedValue = Number.isFinite(cost) && cost > 0
+    ? current - cost
+    : 0;
+  const unrealizedPct = Number.isFinite(cost) && cost > 0
+    ? (unrealizedValue / cost) * 100
+    : 0;
 
   let min = Math.min(...values, current);
   let max = Math.max(...values, current);
@@ -43373,7 +43386,7 @@ function portfolioOfficialLiveChartMarkup(result, series) {
 
   return '<div class="portfolioLiveChart portfolioBrokerChart">' +
     '<div class="portfolioChartHead"><div><div class="eyebrow">PORTFOLIO PERFORMANCE</div><h2>Intraday value</h2><div class="portfolioChartAsOf">' + escapeHtml(liveLabel) + ' · Updated ' + escapeHtml(ageText) + '</div></div>' +
-    '<div class="portfolioChartValue"><strong>' + portfolioMoney(current) + '</strong><span class="' + percentClass(changePct) + '">' + (changeValue > 0 ? '+' : '') + portfolioMoney(changeValue) + ' · ' + (changePct > 0 ? '+' : '') + formatNumber(changePct, 2) + '%</span></div></div>' +
+    '<div class="portfolioChartValue"><strong>' + portfolioMoney(current) + '</strong><span class="' + percentClass(unrealizedPct) + '">' + (unrealizedValue > 0 ? '+' : '') + portfolioMoney(unrealizedValue) + ' · ' + (unrealizedPct > 0 ? '+' : '') + formatNumber(unrealizedPct, 2) + '% unrealized</span></div></div>' +
     '<div class="portfolioChartToolbar"><div class="portfolioChartToolbarLeft"><span class="portfolioChartRange active">1D</span><span class="portfolioCostBadge">Cost basis ' + portfolioMoney(cost) + '</span></div><span class="portfolioChartSource">' + escapeHtml(holdings.length) + '/' + escapeHtml(holdings.length) + ' holdings · Official PSX portfolio snapshots</span></div>' +
     '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" class="portfolioValueSvg portfolioBrokerSvg" aria-label="Live portfolio value chart">' +
     ticks.map(v => '<line x1="' + L + '" x2="' + (W - R) + '" y1="' + y(v).toFixed(1) + '" y2="' + y(v).toFixed(1) + '" class="portfolioChartGrid" />').join('') +
