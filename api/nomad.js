@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.6.10';
+const VERSION = '0.9.6.11';
 
 // Core production hardening: Ask NOMAD remains intentionally disabled so the
 // conversational layer cannot interfere with the production decision path.
@@ -23,6 +23,10 @@ const VERSION = '0.9.6.10';
 // 0.9.6.10 is an execution-clarity UI patch only. Actionable recommendations now
 // present the MAX BUY PRICE as a prominent hard ceiling in both opportunity cards
 // and allocation rows so a broker order is less likely to exceed NOMAD's plan.
+// 0.9.6.11 hardens real-money portfolio accounting and execution audit UI. New
+// positions opened today use all-in position P&L for Today P&L, trade rows separate
+// actual fill price, fees and all-in cost, and an optional NOMAD max-buy ceiling can
+// be retained with the transaction to show WITHIN PLAN / ABOVE MAX execution status.
 const NOMAD_ASK_NOMAD_ENABLED = false;
 
 
@@ -19930,27 +19934,44 @@ async function getPortfolioSnapshot() {
         marketRow?.previousClose
       );
 
+    const openedToday =
+      String(
+        holding.purchase_date ||
+        ''
+      )
+        .slice(0, 10) ===
+      nomadKarachiDateKey(
+        new Date()
+      );
+
+    // A position opened today has no user-owned previous-close exposure. For
+    // that case, Today P&L is the position's all-in P&L (fill + recorded fees),
+    // which matches how a broker presents a same-day newly opened position.
     const dayPnl =
-      currentPrice !== null &&
-      previousClose !== null
-        ? (
-            currentPrice -
-            previousClose
-          ) *
-          quantity
-        : null;
+      openedToday
+        ? totalPnl
+        : currentPrice !== null &&
+          previousClose !== null
+          ? (
+              currentPrice -
+              previousClose
+            ) *
+            quantity
+          : null;
 
     const dayPnlPct =
-      previousClose !== null &&
-      previousClose > 0 &&
-      currentPrice !== null
-        ? (
-            currentPrice -
-            previousClose
-          ) /
-          previousClose *
-          100
-        : null;
+      openedToday
+        ? totalPnlPct
+        : previousClose !== null &&
+          previousClose > 0 &&
+          currentPrice !== null
+          ? (
+              currentPrice -
+              previousClose
+            ) /
+            previousClose *
+            100
+          : null;
 
     const ledgerState =
       ledger.bySymbol.get(
@@ -41987,10 +42008,11 @@ Next
 <div><label>Transaction</label><select id="transactionSide"><option value="BUY">Buy</option><option value="SELL">Sell</option><option value="DIVIDEND">Dividend received</option></select></div>
 <div><label>PSX symbol</label><input id="transactionSymbol" placeholder="FCL"></div>
 <div class="tradeField"><label>Quantity</label><input id="transactionQuantity" inputmode="decimal" placeholder="100"></div>
-<div class="tradeField"><label>Price / share</label><input id="transactionPrice" inputmode="decimal" placeholder="26.50"></div>
+<div class="tradeField"><label>Actual fill price / share</label><input id="transactionPrice" inputmode="decimal" placeholder="26.50"></div>
 <div class="dividendField" hidden><label>Dividend cash received</label><input id="transactionCashAmount" inputmode="decimal" placeholder="1500"></div>
 <div><label>Trade date</label><input id="transactionDate" type="date"></div>
-<div><label>Fees / charges</label><input id="transactionFees" inputmode="decimal" value="0"></div>
+<div><label>Total fees / charges</label><input id="transactionFees" inputmode="decimal" value="0"></div>
+<div class="tradeField"><label>NOMAD max buy price (optional)</label><input id="transactionNomadMaxPrice" inputmode="decimal" placeholder="Auto-filled when available"></div>
 <div><label>Notes (optional)</label><input id="transactionNotes" placeholder="Broker / contract note reference"></div>
 </div>
 <div id="transactionFormStatus" class="smallStatus"></div>
@@ -42058,6 +42080,20 @@ let lastPortfolioIntradayChartResult =
 
 let portfolioChartRequestId =
   0;
+
+let latestNomadExecutionCeilings = {};
+try {
+  latestNomadExecutionCeilings =
+    JSON.parse(
+      localStorage.getItem(
+        'nomadExecutionCeilingsV1'
+      ) ||
+      '{}'
+    ) ||
+    {};
+} catch {
+  latestNomadExecutionCeilings = {};
+}
 
 
 let selectedHistoryRange =
@@ -43727,7 +43763,7 @@ function renderPortfolioFull(
         0
       ) +
       '</span></div>' +
-      '<div class="portfolioTableScroller"><div class="portfolioPositionHeader"><div>Symbol</div><div>Company</div><div>Qty</div><div>Avg cost</div><div>Live</div><div>Value</div><div>Total P&amp;L</div><div>Weight</div><div>NOMAD</div></div>' +
+      '<div class="portfolioTableScroller"><div class="portfolioPositionHeader"><div>Symbol</div><div>Company</div><div>Qty</div><div>Avg cost (all-in)</div><div>Live</div><div>Value</div><div>Total P&amp;L</div><div>Weight</div><div>NOMAD</div></div>' +
       holdings.map(
         item =>
           '<div class="portfolioPositionRow">' +
@@ -43944,18 +43980,42 @@ function renderPortfolioFull(
               ''
             ).toUpperCase();
 
+          const quantity =
+            Number(item.quantity || 0);
+          const fillPrice =
+            Number(item.price || 0);
+          const fees =
+            Number(item.fees || 0);
+          const nomadMax =
+            portfolioTransactionNomadMaxFromNotes(
+              item.notes
+            );
+          const allInPerShare =
+            side === 'BUY' &&
+            quantity > 0
+              ? fillPrice +
+                fees / quantity
+              : null;
+          const executionState =
+            side === 'BUY' &&
+            nomadMax !== null &&
+            fillPrice > 0
+              ? fillPrice <= nomadMax + 0.000001
+                ? 'WITHIN PLAN'
+                : 'ABOVE MAX'
+              : null;
           const detail =
             side === 'DIVIDEND'
               ? portfolioMoney(
                   item.cash_amount
                 )
               : formatNumber(
-                  item.quantity,
+                  quantity,
                   2
                 ) +
-                ' @ PKR ' +
+                ' · Fill PKR ' +
                 formatNumber(
-                  item.price,
+                  fillPrice,
                   2
                 );
 
@@ -43989,13 +44049,48 @@ function renderPortfolioFull(
             '</div>' +
             '<div>' +
             (
-              Number(
-                item.fees
-              ) > 0
-                ? 'Fees ' +
-                  portfolioMoney(
-                    item.fees
+              fees > 0
+                ? 'Fees PKR ' +
+                  formatNumber(
+                    fees,
+                    2
+                  ) +
+                  (
+                    allInPerShare !== null
+                      ? ' · All-in PKR ' +
+                        formatNumber(
+                          allInPerShare,
+                          2
+                        ) +
+                        '/share'
+                      : ''
                   )
+                : allInPerShare !== null
+                  ? 'All-in PKR ' +
+                    formatNumber(
+                      allInPerShare,
+                      2
+                    ) +
+                    '/share'
+                  : ''
+            ) +
+            (
+              nomadMax !== null
+                ? '<div class="decisionMinor">NOMAD max PKR ' +
+                  formatNumber(
+                    nomadMax,
+                    2
+                  ) +
+                  ' · <strong class="' +
+                  (executionState === 'WITHIN PLAN'
+                    ? 'positive'
+                    : 'negative') +
+                  '">' +
+                  escapeHtml(
+                    executionState ||
+                    ''
+                  ) +
+                  '</strong></div>'
                 : ''
             ) +
             '</div>' +
@@ -52591,9 +52686,19 @@ function openPortfolioTransactionModal(
     preset.fees ??
     0;
 
+  if ($('transactionNomadMaxPrice')) {
+    $('transactionNomadMaxPrice').value =
+      preset.nomadMaxBuyPrice ||
+      '';
+  }
+
   $('transactionNotes').value =
     preset.notes ||
     '';
+
+  if (!preset.nomadMaxBuyPrice) {
+    syncTransactionNomadMaxPrice();
+  }
 
   $('transactionDate').value =
     preset.tradeDate ||
@@ -52616,6 +52721,62 @@ function openPortfolioTransactionModal(
         .focus(),
     0
   );
+}
+
+function portfolioTransactionNomadMaxFromNotes(notes) {
+  const match =
+    String(notes || '')
+      .match(/(?:^|\\s)NOMAD_MAX_BUY=([0-9]+(?:\\.[0-9]+)?)/i);
+  const value =
+    match
+      ? Number(match[1])
+      : NaN;
+  return Number.isFinite(value) && value > 0
+    ? value
+    : null;
+}
+
+function portfolioExecutionCeilingForSymbol(symbol) {
+  const normalized =
+    String(symbol || '')
+      .trim()
+      .toUpperCase();
+  const row =
+    latestNomadExecutionCeilings?.[normalized] ||
+    null;
+  const recordedAt =
+    row?.recordedAt
+      ? new Date(row.recordedAt)
+      : null;
+  const sameSessionDate =
+    recordedAt &&
+    !Number.isNaN(recordedAt.getTime()) &&
+    portfolioKarachiDateKey(recordedAt) ===
+      portfolioKarachiDateKey(new Date());
+  if (!sameSessionDate) {
+    return null;
+  }
+  const value = Number(row?.maxBuyPrice);
+  return Number.isFinite(value) && value > 0
+    ? value
+    : null;
+}
+
+function syncTransactionNomadMaxPrice() {
+  if (
+    !$('transactionNomadMaxPrice') ||
+    !$('transactionSymbol')
+  ) {
+    return;
+  }
+  const ceiling =
+    portfolioExecutionCeilingForSymbol(
+      $('transactionSymbol').value
+    );
+  if (ceiling !== null) {
+    $('transactionNomadMaxPrice').value =
+      ceiling.toFixed(2);
+  }
 }
 
 function closePortfolioTransactionModal() {
@@ -52672,9 +52833,30 @@ async function savePortfolioTransactionFromForm() {
             .value ||
           0,
         notes:
-          $('transactionNotes')
-            .value ||
-          ''
+          (() => {
+            const manualNotes =
+              String(
+                $('transactionNotes')
+                  .value ||
+                ''
+              )
+                .trim();
+            const maxBuy =
+              Number(
+                $('transactionNomadMaxPrice')
+                  ?.value ||
+                0
+              );
+            const marker =
+              Number.isFinite(maxBuy) &&
+              maxBuy > 0
+                ? 'NOMAD_MAX_BUY=' +
+                  maxBuy.toFixed(2)
+                : '';
+            return [manualNotes, marker]
+              .filter(Boolean)
+              .join(' ');
+          })()
       }
     );
 
@@ -53476,6 +53658,14 @@ if ($('closePortfolioTransactionModal')) {
   $('closePortfolioTransactionModal')
     .onclick =
       closePortfolioTransactionModal;
+}
+
+if ($('transactionSymbol')) {
+  $('transactionSymbol')
+    .addEventListener(
+      'input',
+      syncTransactionNomadMaxPrice
+    );
 }
 
 if ($('portfolioTransactionModal')) {
@@ -55341,6 +55531,39 @@ function renderShadowDecision(
     )
       ? result.allocations
       : [];
+
+  const executionCeilings = {};
+  for (const allocation of allocations) {
+    const ceiling = Number(
+      allocation?.executionGuidance
+        ?.maxAcceptablePrice
+    );
+    const symbol = String(
+      allocation?.symbol ||
+      ''
+    )
+      .trim()
+      .toUpperCase();
+    if (symbol && Number.isFinite(ceiling) && ceiling > 0) {
+      executionCeilings[symbol] = {
+        maxBuyPrice: ceiling,
+        horizon: result?.input?.horizon || null,
+        risk: result?.input?.risk || null,
+        recordedAt: new Date().toISOString()
+      };
+    }
+  }
+  if (Object.keys(executionCeilings).length) {
+    latestNomadExecutionCeilings = executionCeilings;
+    try {
+      localStorage.setItem(
+        'nomadExecutionCeilingsV1',
+        JSON.stringify(
+          latestNomadExecutionCeilings
+        )
+      );
+    } catch {}
+  }
 
   const triggerPlan =
     result?.shortTermTriggerPlan ||
