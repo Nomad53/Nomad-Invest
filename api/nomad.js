@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.6.13';
+const VERSION = '0.9.6.14';
 
 // Core production hardening: Ask NOMAD remains intentionally disabled so the
 // conversational layer cannot interfere with the production decision path.
@@ -32,6 +32,11 @@ const VERSION = '0.9.6.13';
 // It is additive: it reads the existing analyst evidence and exposes parallel
 // compounder/dividend diagnostics, but it cannot change ranking, canonical action,
 // allocation, execution guidance, Investor/Trader scores, or ownership actions.
+// 0.9.6.14 promotes Compounder + Dividend Intelligence into the Long-Term Investor
+// with bounded authority. It may modestly adjust long-term thesis/ranking only when
+// evidence coverage is sufficient. Missing dividends never penalize a reinvesting
+// compounder, and the existing analyst, valuation, risk, timing and execution hard
+// gates remain unchanged. Trader NOMAD is untouched.
 // existing holdings are reviewed separately from new-money opportunities, with a
 // persistent thesis state, owner action, new-money action and a concise explanation
 // of what changed. Existing holdings that fall outside the ranked shortlist are
@@ -22525,10 +22530,11 @@ function professionalRiskState(score) {
 
 
 /* =========================================================
-   LONG-TERM COMPOUNDER + DIVIDEND INTELLIGENCE - 0.9.6.13
-   SHADOW ONLY. These functions are deliberately side-channel diagnostics.
-   They never feed professionalLongTermView(), canonical state, ranking,
-   allocation, profile suitability, execution guidance or ownership actions.
+   LONG-TERM COMPOUNDER + DIVIDEND INTELLIGENCE - 0.9.6.14
+   0.9.6.14 keeps the diagnostic model intact, then applies a bounded,
+   evidence-gated activation layer inside professionalLongTermView(). The
+   promoted layer can modestly influence long-term thesis/ranking, but it
+   cannot bypass analyst, valuation, risk, timing or execution hard gates.
 ========================================================= */
 
 function longTermShadowStateScore(
@@ -23114,6 +23120,157 @@ function buildLongTermCompounderDividendShadow(
   };
 }
 
+
+function longTermCompounderDividendActivation(
+  intelligence
+) {
+  if (!intelligence) {
+    return {
+      applied: false,
+      adjustment: 0,
+      compounderAdjustment: 0,
+      dividendAdjustment: 0,
+      yieldTrapAdjustment: 0,
+      reason:
+        'Compounder/dividend intelligence is unavailable, so the stable Investor thesis is unchanged.'
+    };
+  }
+
+  const compounder =
+    intelligence.compounder || {};
+  const dividend =
+    intelligence.dividend || {};
+
+  const compounderEligible =
+    safeNumber(compounder.score) !== null &&
+    safeNumber(compounder.coveragePct) >= 55 &&
+    (
+      compounder.confidence === 'MEDIUM' ||
+      compounder.confidence === 'HIGH'
+    );
+
+  const dividendEligible =
+    dividend.state !== 'NO_DIVIDEND_EVIDENCE' &&
+    safeNumber(dividend.score) !== null &&
+    safeNumber(dividend.coveragePct) >= 55 &&
+    (
+      dividend.confidence === 'MEDIUM' ||
+      dividend.confidence === 'HIGH'
+    );
+
+  const compounderAdjustment =
+    !compounderEligible
+      ? 0
+      : ({
+          STRONG: 3.0,
+          GOOD: 1.5,
+          MIXED: -1.5,
+          WEAK: -4.0
+        })[compounder.state] || 0;
+
+  // Dividends matter for long-term total return, but they are deliberately a
+  // smaller influence than business quality. A company that reinvests well and
+  // pays no dividend receives no dividend penalty at all.
+  const dividendAdjustment =
+    !dividendEligible
+      ? 0
+      : ({
+          STRONG: 1.5,
+          GOOD: 0.75,
+          MIXED: -0.5,
+          WEAK: -1.5
+        })[dividend.state] || 0;
+
+  const yieldTrapAdjustment =
+    dividend.yieldTrapRisk === 'HIGH'
+      ? -3.0
+      : dividend.yieldTrapRisk === 'MEDIUM'
+        ? -1.0
+        : 0;
+
+  const rawAdjustment =
+    compounderAdjustment +
+    dividendAdjustment +
+    yieldTrapAdjustment;
+
+  const adjustment =
+    decisionRound(
+      Math.max(
+        -6,
+        Math.min(
+          4,
+          rawAdjustment
+        )
+      ),
+      2
+    );
+
+  const applied =
+    compounderEligible ||
+    dividendEligible ||
+    yieldTrapAdjustment !== 0;
+
+  let reason =
+    'The active intelligence layer found no evidence-qualified reason to alter the stable Investor thesis.';
+
+  if (applied && adjustment > 0) {
+    reason =
+      'Evidence-qualified compounder/dividend quality modestly strengthens the long-term thesis.';
+  } else if (applied && adjustment < 0) {
+    reason =
+      dividend.yieldTrapRisk === 'HIGH'
+        ? 'Dividend sustainability/yield-trap risk and business-quality evidence reduce long-term conviction.'
+        : 'Evidence-qualified compounder/dividend quality modestly reduces long-term conviction.';
+  } else if (applied) {
+    reason =
+      'Compounder/dividend evidence is active, but positive and negative effects currently offset.';
+  }
+
+  return {
+    applied,
+    adjustment,
+    compounderEligible,
+    dividendEligible,
+    compounderAdjustment,
+    dividendAdjustment,
+    yieldTrapAdjustment,
+    reason
+  };
+}
+
+function buildLongTermCompounderDividendIntelligence(
+  candidate
+) {
+  const diagnostic =
+    buildLongTermCompounderDividendShadow(
+      candidate
+    );
+
+  if (!diagnostic) {
+    return null;
+  }
+
+  const activation =
+    longTermCompounderDividendActivation(
+      diagnostic
+    );
+
+  return {
+    ...diagnostic,
+    version:
+      'LT-COMPOUNDER-DIVIDEND-ACTIVE-0.9.6.14',
+    mode:
+      'ACTIVE_GUARDED',
+    affectsDecision:
+      activation.applied,
+    activation,
+    note:
+      activation.applied
+        ? 'Active with bounded authority in Long-Term Investor thesis/ranking. Core analyst, valuation, risk, timing and execution gates remain unchanged.'
+        : 'Active layer is evidence-gated; current coverage is insufficient to alter the stable Investor thesis.'
+  };
+}
+
 function professionalLongTermEntryExtension(
   candidate
 ) {
@@ -23334,6 +23491,21 @@ function professionalLongTermView(
     safeNumber(candidate?.valuation?.score) || 0;
   const riskScore =
     safeNumber(candidate?.risk?.score) || 0;
+  const longTermIntelligence =
+    buildLongTermCompounderDividendIntelligence(
+      candidate
+    );
+  const intelligenceAdjustment =
+    safeNumber(
+      longTermIntelligence
+        ?.activation
+        ?.adjustment
+    ) || 0;
+  const intelligenceReason =
+    longTermIntelligence
+      ?.activation
+      ?.reason ||
+    'Compounder/dividend intelligence did not alter the stable Investor thesis.';
   // Long-term remains thesis-led, but a professional investor must not
   // confuse a strong business with a good entry after an extreme rerating.
   // This guard only affects entry timing/sizing; it does not rewrite the thesis.
@@ -23358,13 +23530,26 @@ function professionalLongTermView(
           ? 'POOR'
           : 'RISKY';
 
-  const thesisScore =
+  const baseThesisScore =
     decisionRound(
       decisionClamp(
         financialScore * 0.45 +
         valuationScore * 0.25 +
         riskScore * 0.15 +
         evidence.score * 0.15
+      ),
+      2
+    );
+
+  // 0.9.6.14: Compounder + Dividend Intelligence is promoted with bounded
+  // authority. It can move the long-term thesis only a few points and only
+  // when its own evidence coverage is sufficient. Hard safety gates below are
+  // deliberately unchanged.
+  const thesisScore =
+    decisionRound(
+      decisionClamp(
+        baseThesisScore +
+        intelligenceAdjustment
       ),
       2
     );
@@ -23410,7 +23595,12 @@ function professionalLongTermView(
         entryExtension.score,
       entryExtensionReasons:
         entryExtension.reasons,
+      baseThesisScore,
+      thesisScore,
       rankingScore,
+      longTermIntelligence,
+      intelligenceAdjustment,
+      intelligenceReason,
       marketAction: 'RESEARCHING',
       opportunityTier: 'EVIDENCE_RESEARCH',
       reason: analystGate.reason
@@ -23439,7 +23629,12 @@ function professionalLongTermView(
         entryExtension.score,
       entryExtensionReasons:
         entryExtension.reasons,
+      baseThesisScore,
+      thesisScore,
       rankingScore,
+      longTermIntelligence,
+      intelligenceAdjustment,
+      intelligenceReason,
       marketAction: 'AVOID',
       opportunityTier: 'LOW_PRIORITY',
       reason:
@@ -23530,7 +23725,12 @@ function professionalLongTermView(
       entryExtension.score,
     entryExtensionReasons:
       entryExtension.reasons,
+    baseThesisScore,
+    thesisScore,
     rankingScore,
+    longTermIntelligence,
+    intelligenceAdjustment,
+    intelligenceReason,
     marketAction,
     opportunityTier,
     reason
@@ -25062,8 +25262,10 @@ function decisionCenterSummary(
     dataQualityScore:
       candidate.dataQuality?.score ??
       null,
-    longTermIntelligenceShadow:
-      buildLongTermCompounderDividendShadow(
+    longTermIntelligence:
+      canonical.professional
+        ?.longTermIntelligence ||
+      buildLongTermCompounderDividendIntelligence(
         candidate
       ),
     analyst: {
@@ -26419,8 +26621,10 @@ async function buildLongTermOwnershipContinuity(
             canonical?.evidence
               ?.confidence ||
             'UNRESOLVED',
-          longTermIntelligenceShadow:
-            buildLongTermCompounderDividendShadow(
+          longTermIntelligence:
+            canonical?.professional
+              ?.longTermIntelligence ||
+            buildLongTermCompounderDividendIntelligence(
               candidate
             ),
           baseline,
@@ -36038,6 +36242,92 @@ function runDecisionEngineSelfTests() {
     trapShadow.dividend.yieldTrapRisk,
     'HIGH',
     'high yield with weak payout/cash/earnings support must flag high yield-trap risk'
+  );
+
+  // 0.9.6.14: promoted intelligence may influence Long-Term Investor ranking,
+  // but only with bounded, evidence-gated authority.
+  const activeHealthy =
+    buildLongTermCompounderDividendIntelligence(
+      shadowCandidate
+    );
+
+  assert.equal(
+    activeHealthy.mode,
+    'ACTIVE_GUARDED',
+    'promoted compounder/dividend intelligence must declare ACTIVE_GUARDED mode'
+  );
+  assert.equal(
+    activeHealthy.affectsDecision,
+    true,
+    'well-covered compounder/dividend evidence should be eligible to influence the long-term thesis'
+  );
+  assert.ok(
+    activeHealthy.activation.adjustment > 0 &&
+    activeHealthy.activation.adjustment <= 4,
+    'healthy compounder/dividend evidence should modestly strengthen, never dominate, the stable thesis'
+  );
+
+  const activeNoDividend =
+    buildLongTermCompounderDividendIntelligence({
+      ...shadowCandidate,
+      valuation: { dividendYield: 0 },
+      analystCore: {
+        ...shadowCandidate.analystCore,
+        evidence: {
+          payoutRatio: {
+            available: false,
+            latest: null
+          },
+          dividendPerShare: {
+            values: []
+          }
+        }
+      }
+    });
+
+  assert.equal(
+    activeNoDividend.dividend.state,
+    'NO_DIVIDEND_EVIDENCE',
+    'promoted intelligence must preserve the no-dividend state for reinvesting compounders'
+  );
+  assert.ok(
+    activeNoDividend.activation.dividendAdjustment === 0,
+    'a company with no dividend evidence must not receive a dividend penalty'
+  );
+
+  const activeTrap =
+    buildLongTermCompounderDividendIntelligence({
+      ...shadowCandidate,
+      valuation: { dividendYield: 16 },
+      analystCore: {
+        ...shadowCandidate.analystCore,
+        views: {
+          ...shadowCandidate.analystCore.views,
+          epsTrend: { state: 'DETERIORATING' },
+          cashFlowQuality: { state: 'WEAK' }
+        },
+        evidence: {
+          payoutRatio: { latest: { value: 145 } },
+          dividendPerShare: {
+            values: [
+              { period: '2026', value: 4 },
+              { period: '2025', value: 7 },
+              { period: '2024', value: 8 }
+            ]
+          }
+        }
+      }
+    });
+
+  assert.equal(
+    activeTrap.dividend.yieldTrapRisk,
+    'HIGH',
+    'promoted intelligence must retain yield-trap detection'
+  );
+  assert.ok(
+    activeTrap.activation.adjustment < 0 &&
+    activeTrap.activation.adjustment >= -6,
+    'high yield-trap risk must reduce long-term conviction without bypassing bounded authority'
   );
 
   console.log(
@@ -55894,20 +56184,22 @@ function decisionActionLabel(
 }
 
 
-function renderLongTermShadowStrip(
-  shadow
+function renderLongTermIntelligenceStrip(
+  intelligence
 ) {
   if (
-    !shadow ||
-    shadow.mode !== 'SHADOW_ONLY'
+    !intelligence ||
+    intelligence.mode !== 'ACTIVE_GUARDED'
   ) {
     return '';
   }
 
   const compounder =
-    shadow.compounder || {};
+    intelligence.compounder || {};
   const dividend =
-    shadow.dividend || {};
+    intelligence.dividend || {};
+  const activation =
+    intelligence.activation || {};
   const dividendLabel =
     dividend.state === 'NO_DIVIDEND_EVIDENCE'
       ? 'NO DIVIDEND EVIDENCE'
@@ -55917,8 +56209,8 @@ function renderLongTermShadowStrip(
     'UNRESOLVED';
 
   return (
-    '<div class="longTermShadowStrip" title="Shadow intelligence only — does not change the live NOMAD decision">' +
-    '<span>SHADOW · COMPOUNDER + DIVIDEND</span>' +
+    '<div class="longTermShadowStrip" title="Active long-term intelligence with bounded influence on Investor thesis and ranking">' +
+    '<span>ACTIVE · COMPOUNDER + DIVIDEND</span>' +
     '<span class="longTermShadowMetric ' +
     escapeHtml(
       String(compounder.state || '').toLowerCase()
@@ -55948,7 +56240,17 @@ function renderLongTermShadowStrip(
     '">Yield-trap risk <strong>' +
     escapeHtml(trap) +
     '</strong></span>' +
-    '<span class="longTermShadowNote">Diagnostic only. Current Investor ranking and allocation are unchanged.</span>' +
+    '<span class="longTermShadowMetric">Influence <strong>' +
+    (safeNumber(activation.adjustment) > 0 ? '+' : '') +
+    formatNumber(safeNumber(activation.adjustment) || 0, 1) +
+    ' pts</strong></span>' +
+    '<span class="longTermShadowNote">' +
+    escapeHtml(
+      activation.applied
+        ? 'Active with bounded authority. Core analyst, valuation, risk, timing and execution gates remain unchanged.'
+        : 'Evidence-gated: current compounder/dividend coverage is not strong enough to alter the stable Investor thesis.'
+    ) +
+    '</span>' +
     '</div>'
   );
 }
@@ -56235,8 +56537,8 @@ function renderOpportunityList(
               : ''
           ) +
           (!isShortTerm
-            ? renderLongTermShadowStrip(
-                item.longTermIntelligenceShadow
+            ? renderLongTermIntelligenceStrip(
+                item.longTermIntelligence
               )
             : '') +
           '<details class="opportunityDetails"><summary>Why / details</summary>' +
@@ -57304,8 +57606,8 @@ function renderOwnershipContinuity(
           ) +
           '</div>' +
           '</div>' +
-          renderLongTermShadowStrip(
-            item.longTermIntelligenceShadow
+          renderLongTermIntelligenceStrip(
+            item.longTermIntelligence
           ) +
           '<div class="ownershipChange"><span>WHAT CHANGED</span><strong>' +
           escapeHtml(
