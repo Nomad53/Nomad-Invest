@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.6.14.1';
+const VERSION = '0.9.6.15';
 
 // Core production hardening: Ask NOMAD remains intentionally disabled so the
 // conversational layer cannot interfere with the production decision path.
@@ -41,6 +41,12 @@ const VERSION = '0.9.6.14.1';
 // safeNumber helper accidentally referenced by the active Compounder + Dividend
 // client UI. No Investor, Trader, ranking, allocation, ownership, execution or
 // intelligence logic is changed from 0.9.6.14.
+// 0.9.6.15 adds a Long-Term Final Verdict + Exit Intelligence layer without
+// rewriting the stable Investor/Trader scoring engines. It translates the existing
+// scores into clear BUY/STAGED BUY/HOLD/WAIT/REVIEW/REDUCE/EXIT verdicts, monitors
+// long-term price structure as an investigation signal rather than an automatic
+// stop-loss, and carries a purchase/first-tracked thesis snapshot into ownership
+// continuity so a price decline can be separated from a genuinely broken thesis.
 // existing holdings are reviewed separately from new-money opportunities, with a
 // persistent thesis state, owner action, new-money action and a concise explanation
 // of what changed. Existing holdings that fall outside the ranked shortlist are
@@ -25272,6 +25278,14 @@ function decisionCenterSummary(
       buildLongTermCompounderDividendIntelligence(
         candidate
       ),
+    finalVerdict:
+      canonical.professional
+        ?.framework ===
+          'LONG_TERM_INVESTOR'
+        ? decisionLongTermFinalVerdict(
+            candidate
+          )
+        : null,
     analyst: {
       status:
         analyst?.status ||
@@ -25782,6 +25796,658 @@ function decisionOwnershipThesisStrength(
   ] || 0;
 }
 
+
+function decisionLongTermTrendView(
+  candidate
+) {
+  const context =
+    candidate?.historicalContext ||
+    {};
+  const returns =
+    context.returns ||
+    {};
+  const averages =
+    context.movingAverages ||
+    {};
+  const technical =
+    context.technical ||
+    {};
+
+  const price =
+    safeNumber(
+      candidate?.price ??
+      context?.price
+    );
+  const sma50 =
+    safeNumber(
+      averages.sma50
+    );
+  const sma200 =
+    safeNumber(
+      averages.sma200
+    );
+  const m3 =
+    safeNumber(
+      returns.m3
+    );
+  const m6 =
+    safeNumber(
+      returns.m6
+    );
+  const y1 =
+    safeNumber(
+      returns.y1
+    );
+  const maxDrawdown52wPct =
+    safeNumber(
+      technical.maxDrawdown52wPct
+    );
+
+  const below50 =
+    price !== null &&
+    sma50 !== null &&
+    sma50 > 0
+      ? price < sma50
+      : null;
+  const below200 =
+    price !== null &&
+    sma200 !== null &&
+    sma200 > 0
+      ? price < sma200
+      : null;
+
+  let stress = 0;
+  const reasons = [];
+
+  if (below50 === true) {
+    stress += 1;
+    reasons.push(
+      'Price is below the 50-session moving average.'
+    );
+  }
+
+  if (below200 === true) {
+    stress += 2;
+    reasons.push(
+      'Price is below the 200-session moving average.'
+    );
+  }
+
+  if (m3 !== null && m3 <= -12) {
+    stress +=
+      m3 <= -25
+        ? 2
+        : 1;
+    reasons.push(
+      'Three-month price performance is persistently weak.'
+    );
+  }
+
+  if (m6 !== null && m6 <= -18) {
+    stress +=
+      m6 <= -35
+        ? 2
+        : 1;
+    reasons.push(
+      'Six-month price performance is materially weak.'
+    );
+  }
+
+  if (y1 !== null && y1 <= -25) {
+    stress += 1;
+    reasons.push(
+      'One-year price performance is materially negative.'
+    );
+  }
+
+  if (
+    maxDrawdown52wPct !== null &&
+    maxDrawdown52wPct <= -35
+  ) {
+    stress += 1;
+    reasons.push(
+      'The 52-week drawdown is deep enough to require a thesis review.'
+    );
+  }
+
+  const state =
+    stress >= 6
+      ? 'SEVERE_WEAKNESS'
+      : stress >= 4
+        ? 'PERSISTENT_WEAKNESS'
+        : stress >= 2
+          ? 'MIXED'
+          : 'HEALTHY';
+
+  return {
+    state,
+    stressScore:
+      stress,
+    price:
+      decisionRound(
+        price,
+        2
+      ),
+    sma50:
+      decisionRound(
+        sma50,
+        2
+      ),
+    sma200:
+      decisionRound(
+        sma200,
+        2
+      ),
+    below50,
+    below200,
+    return3mPct:
+      decisionRound(
+        m3,
+        2
+      ),
+    return6mPct:
+      decisionRound(
+        m6,
+        2
+      ),
+    return1yPct:
+      decisionRound(
+        y1,
+        2
+      ),
+    maxDrawdown52wPct:
+      decisionRound(
+        maxDrawdown52wPct,
+        2
+      ),
+    reasons:
+      uniqueTextValues(
+        reasons
+      ),
+    note:
+      'Long-term price weakness is an investigation signal. It cannot by itself create an EXIT verdict.'
+  };
+}
+
+function decisionLongTermFundamentalDeterioration(
+  candidate
+) {
+  const analyst =
+    candidate?.analystCore ||
+    null;
+  const views =
+    analyst?.views ||
+    {};
+  const canonical =
+    candidate?.canonicalState ||
+    null;
+  const intelligence =
+    canonical?.professional
+      ?.longTermIntelligence ||
+    buildLongTermCompounderDividendIntelligence(
+      candidate
+    );
+
+  const flags = [];
+
+  const addFlag =
+    (condition, text) => {
+      if (condition) {
+        flags.push(text);
+      }
+    };
+
+  addFlag(
+    ['WEAK', 'MIXED'].includes(
+      String(
+        analyst?.overallFinancialView
+          ?.state ||
+        ''
+      ).toUpperCase()
+    ),
+    'Overall financial quality has weakened.'
+  );
+
+  addFlag(
+    String(
+      views.profitTrend?.state ||
+      ''
+    ).toUpperCase() === 'DETERIORATING',
+    'Profit trend is deteriorating.'
+  );
+
+  addFlag(
+    String(
+      views.epsTrend?.state ||
+      ''
+    ).toUpperCase() === 'DETERIORATING',
+    'EPS trend is deteriorating.'
+  );
+
+  addFlag(
+    ['WEAK', 'QUESTIONABLE'].includes(
+      String(
+        views.cashFlowQuality?.state ||
+        ''
+      ).toUpperCase()
+    ),
+    'Cash-flow quality is weak or questionable.'
+  );
+
+  addFlag(
+    ['WEAK', 'QUESTIONABLE'].includes(
+      String(
+        views.balanceSheet?.state ||
+        ''
+      ).toUpperCase()
+    ),
+    'Balance-sheet quality is weak or questionable.'
+  );
+
+  addFlag(
+    String(
+      intelligence?.compounder?.state ||
+      ''
+    ).toUpperCase() === 'WEAK',
+    'Compounder quality is weak.'
+  );
+
+  addFlag(
+    String(
+      intelligence?.dividend
+        ?.yieldTrapRisk ||
+      ''
+    ).toUpperCase() === 'HIGH',
+    'Dividend yield-trap risk is high.'
+  );
+
+  const thesisState =
+    decisionOwnershipThesisState(
+      candidate
+    );
+
+  addFlag(
+    thesisState === 'BROKEN',
+    'The canonical long-term thesis is broken.'
+  );
+
+  const count =
+    flags.length;
+
+  const state =
+    thesisState === 'BROKEN' &&
+    count >= 2
+      ? 'BROKEN'
+      : count >= 3
+        ? 'WEAKENING'
+        : count >= 1
+          ? 'WATCH'
+          : 'STABLE';
+
+  return {
+    state,
+    flagCount:
+      count,
+    flags:
+      uniqueTextValues(
+        flags
+      )
+  };
+}
+
+function decisionLongTermExitIntelligence(
+  candidate,
+  holding,
+  baseline
+) {
+  if (!candidate) {
+    return {
+      verdict: 'HOLD_RESEARCH',
+      tone: 'neutral',
+      thesisState: 'UNRESOLVED',
+      trend: {
+        state: 'UNRESOLVED',
+        reasons: []
+      },
+      fundamentals: {
+        state: 'UNRESOLVED',
+        flagCount: 0,
+        flags: []
+      },
+      reason:
+        'Fresh long-term evidence is incomplete. NOMAD will not invent a sell signal.'
+    };
+  }
+
+  const canonical =
+    candidate?.canonicalState ||
+    decisionCanonicalCompanyState(
+      candidate
+    );
+  const thesisState =
+    decisionOwnershipThesisState(
+      candidate
+    );
+  const evidenceConfidence =
+    canonical?.evidence
+      ?.confidence ||
+    'UNRESOLVED';
+  const trend =
+    decisionLongTermTrendView(
+      candidate
+    );
+  const fundamentals =
+    decisionLongTermFundamentalDeterioration(
+      candidate
+    );
+  const baselineStrength =
+    decisionOwnershipThesisStrength(
+      baseline?.thesisState
+    );
+  const currentStrength =
+    decisionOwnershipThesisStrength(
+      thesisState
+    );
+  const materialThesisDrop =
+    baselineStrength > 0 &&
+    currentStrength + 1 <
+      baselineStrength;
+
+  let verdict =
+    'HOLD_CONFIRMED';
+  let tone = 'positive';
+  let reason =
+    'The long-term thesis remains intact. Normal market movement does not independently justify selling.';
+
+  const thesisBroken =
+    thesisState === 'BROKEN' ||
+    canonical?.marketAction === 'AVOID';
+  const thesisWeakening =
+    thesisState === 'WEAKENING' ||
+    materialThesisDrop;
+  const trendSevere =
+    trend.state === 'SEVERE_WEAKNESS';
+  const trendPersistent =
+    trend.state === 'PERSISTENT_WEAKNESS';
+  const evidenceUsable =
+    evidenceConfidence !== 'UNRESOLVED';
+
+  // A red chart alone never creates a long-term EXIT. EXIT requires a broken
+  // thesis plus evidence-qualified fundamental deterioration. Price weakness
+  // only changes urgency and confirmation.
+  if (
+    thesisBroken &&
+    evidenceUsable &&
+    fundamentals.flagCount >= 2
+  ) {
+    verdict =
+      trendSevere ||
+      trendPersistent
+        ? 'EXIT_CONFIRMED'
+        : 'EXIT_REVIEW';
+    tone = 'negative';
+    reason =
+      verdict === 'EXIT_CONFIRMED'
+        ? 'The original long-term thesis is broken and multiple fundamental warnings are confirmed. Persistent price weakness reinforces the evidence; review execution of an exit rather than holding solely because the position is down.'
+        : 'The original long-term thesis is broken on fundamental evidence. Review an exit even though price weakness alone is not the reason.';
+  } else if (
+    thesisWeakening &&
+    fundamentals.flagCount >= 2
+  ) {
+    verdict =
+      trendSevere ||
+      trendPersistent
+        ? 'REDUCE'
+        : 'REVIEW_CAUTION';
+    tone = 'warning';
+    reason =
+      verdict === 'REDUCE'
+        ? 'The thesis has weakened on multiple fundamental signals and long-term price structure is persistently weak. NOMAD recommends reducing risk while the thesis is reassessed.'
+        : 'The thesis has weakened on multiple fundamental signals. Review the position closely before adding or continuing to hold unchanged.';
+  } else if (
+    trendSevere ||
+    trendPersistent
+  ) {
+    verdict = 'HOLD_MONITOR';
+    tone = 'warning';
+    reason =
+      'Long-term price structure is weak, but NOMAD does not have enough fundamental evidence to call the thesis broken. Hold/monitor rather than panic-selling on price alone.';
+  } else if (
+    fundamentals.state === 'WATCH' ||
+    canonical?.researchState === 'ACTIVE'
+  ) {
+    verdict = 'HOLD_MONITOR';
+    tone = 'warning';
+    reason =
+      'The position remains a hold, but one or more evidence items deserve monitoring before NOMAD becomes more confident.';
+  }
+
+  const averageCost =
+    safeNumber(
+      holding?.averageCost
+    );
+  const currentPrice =
+    safeNumber(
+      holding?.currentPrice ??
+      candidate?.price
+    );
+  const returnPct =
+    averageCost !== null &&
+    averageCost > 0 &&
+    currentPrice !== null
+      ? (
+          currentPrice -
+          averageCost
+        ) /
+        averageCost *
+        100
+      : null;
+
+  return {
+    verdict,
+    tone,
+    thesisState,
+    evidenceConfidence,
+    fundamentals,
+    trend,
+    returnPct:
+      decisionRound(
+        returnPct,
+        2
+      ),
+    reason,
+    monitoringHorizon:
+      'Continuous evidence review · 50/200-session trend · 3/6/12-month price context',
+    rule:
+      'Price weakness raises review urgency; thesis deterioration determines REDUCE/EXIT.'
+  };
+}
+
+function decisionLongTermFinalVerdict(
+  candidate
+) {
+  if (
+    String(
+      candidate?.horizon ||
+      'long_term'
+    ) !== 'long_term'
+  ) {
+    return null;
+  }
+
+  const canonical =
+    candidate?.canonicalState ||
+    decisionCanonicalCompanyState(
+      candidate
+    );
+  const suitability =
+    candidate?.profileSuitability ||
+    null;
+  const execution =
+    candidate?.executionGuidance ||
+    null;
+  const marketAction =
+    String(
+      canonical?.marketAction ||
+      'WATCH'
+    ).toUpperCase();
+  const executionStatus =
+    String(
+      execution?.status ||
+      ''
+    ).toUpperCase();
+
+  let code = 'WAIT_FOR_ENTRY';
+  let tone = 'warning';
+  let title = 'GOOD COMPANY · WAIT FOR ENTRY';
+  let reason =
+    execution?.reason ||
+    canonical?.reason ||
+    'Current conditions do not justify new capital yet.';
+
+  if (
+    canonical?.researchState === 'ACTIVE' ||
+    marketAction === 'RESEARCHING'
+  ) {
+    code = 'CHECK_EVIDENCE';
+    tone = 'neutral';
+    title = 'CHECK EVIDENCE';
+    reason =
+      'NOMAD is still validating evidence, so it will not confirm a new long-term buy yet.';
+  } else if (
+    marketAction === 'AVOID'
+  ) {
+    code = 'DO_NOT_BUY';
+    tone = 'negative';
+    title = 'DO NOT BUY';
+  } else if (
+    suitability?.state === 'NOT_SUITABLE' ||
+    executionStatus === 'PROFILE_BLOCKED'
+  ) {
+    code = 'DO_NOT_BUY';
+    tone = 'negative';
+    title = 'DO NOT BUY FOR THIS PROFILE';
+  } else if (
+    marketAction === 'BUY' &&
+    executionStatus === 'BUY_NOW'
+  ) {
+    code = 'BUY_CONFIRMED';
+    tone = 'positive';
+    title = 'LONG-TERM BUY CONFIRMED';
+    reason =
+      'Business/thesis, valuation, risk, profile and current execution price all pass NOMAD\'s long-term gates.';
+  } else if (
+    (
+      marketAction === 'BUY' ||
+      marketAction === 'ACCUMULATE'
+    ) &&
+    executionStatus === 'STAGED_BUY'
+  ) {
+    code = 'STAGED_BUY';
+    tone = 'positive';
+    title = 'STAGED BUY';
+    reason =
+      execution?.reason ||
+      'The long-term thesis is actionable, but NOMAD prefers gradual accumulation rather than a full-size entry.';
+  } else if (
+    executionStatus === 'DO_NOT_CHASE'
+  ) {
+    code = 'WAIT_FOR_ENTRY';
+    tone = 'warning';
+    title = 'GOOD COMPANY · DO NOT CHASE';
+  } else if (
+    marketAction === 'WATCH' ||
+    [
+      'WAIT_FOR_ENTRY',
+      'WAIT_FOR_PRICE'
+    ].includes(
+      executionStatus
+    )
+  ) {
+    code = 'WAIT_FOR_ENTRY';
+    tone = 'warning';
+    title = 'GOOD COMPANY · WAIT FOR ENTRY';
+  }
+
+  return {
+    code,
+    tone,
+    title,
+    reason,
+    maxBuyPrice:
+      safeNumber(
+        execution?.maxAcceptablePrice
+      ),
+    referencePrice:
+      safeNumber(
+        execution?.referencePrice
+      ),
+    thesisStatus:
+      canonical?.professional
+        ?.thesisStatus ||
+      canonical?.thesisStatus ||
+      null,
+    confidence:
+      canonical?.evidence
+        ?.confidence ||
+      'UNRESOLVED'
+  };
+}
+
+function decisionOwnershipPurchaseThesisSnapshot(
+  baseline
+) {
+  if (!baseline) {
+    return null;
+  }
+
+  return {
+    label:
+      baseline.label ||
+      'first tracked baseline',
+    asOf:
+      baseline.createdAt ||
+      null,
+    price:
+      safeNumber(
+        baseline.price
+      ),
+    thesisState:
+      baseline.thesisState ||
+      'UNRESOLVED',
+    marketAction:
+      baseline.marketAction ||
+      null,
+    thesisScore:
+      safeNumber(
+        baseline.thesisScore
+      ),
+    financialScore:
+      safeNumber(
+        baseline.financialScore
+      ),
+    valuationScore:
+      safeNumber(
+        baseline.valuationScore
+      ),
+    valuationState:
+      baseline.valuationState ||
+      null,
+    timingState:
+      baseline.timingState ||
+      null,
+    evidenceConfidence:
+      baseline.evidenceConfidence ||
+      'UNRESOLVED',
+    compounder:
+      baseline.compounder ||
+      null,
+    dividend:
+      baseline.dividend ||
+      null
+  };
+}
+
 function decisionOwnershipExistingAction(
   candidate,
   holding,
@@ -25998,6 +26664,13 @@ function decisionOwnershipCandidateFromRun(
     decisionCanonicalCompanyState(
       candidate
     );
+  const professional =
+    canonical?.professional ||
+    {};
+  const intelligence =
+    professional?.longTermIntelligence ||
+    candidate?.longTermIntelligence ||
+    null;
 
   return {
     createdAt:
@@ -26027,7 +26700,54 @@ function decisionOwnershipCandidateFromRun(
     valuationState:
       canonical.professional
         ?.valuationState ||
-      null
+      null,
+    thesisScore:
+      safeNumber(
+        professional.thesisScore
+      ),
+    financialScore:
+      safeNumber(
+        professional.financialScore
+      ),
+    valuationScore:
+      safeNumber(
+        professional.valuationScore
+      ),
+    riskScore:
+      safeNumber(
+        professional.riskScore
+      ),
+    evidenceConfidence:
+      canonical?.evidence
+        ?.confidence ||
+      'UNRESOLVED',
+    compounder:
+      intelligence?.compounder
+        ? {
+            state:
+              intelligence.compounder.state ||
+              'UNRESOLVED',
+            score:
+              safeNumber(
+                intelligence.compounder.score
+              )
+          }
+        : null,
+    dividend:
+      intelligence?.dividend
+        ? {
+            state:
+              intelligence.dividend.state ||
+              'UNRESOLVED',
+            score:
+              safeNumber(
+                intelligence.dividend.score
+              ),
+            yieldTrapRisk:
+              intelligence.dividend.yieldTrapRisk ||
+              'UNRESOLVED'
+          }
+        : null
   };
 }
 
@@ -26473,7 +27193,7 @@ async function buildLongTermOwnershipContinuity(
       ),
       readRecentLongTermDecisionResults(
         risk,
-        30
+        60
       )
     ]);
 
@@ -26538,6 +27258,16 @@ async function buildLongTermOwnershipContinuity(
             },
             baseline,
             holding
+          );
+        const exitIntelligence =
+          decisionLongTermExitIntelligence(
+            candidate,
+            holding,
+            baseline
+          );
+        const purchaseThesis =
+          decisionOwnershipPurchaseThesisSnapshot(
+            baseline
           );
         const weightPct =
           safeNumber(
@@ -26631,6 +27361,10 @@ async function buildLongTermOwnershipContinuity(
             buildLongTermCompounderDividendIntelligence(
               candidate
             ),
+          finalVerdict:
+            exitIntelligence,
+          exitIntelligence,
+          purchaseThesis,
           baseline,
           change,
           analyzed:
@@ -26669,6 +27403,25 @@ async function buildLongTermOwnershipContinuity(
         views.length,
       intactCount,
       reviewCount,
+      exitReviewCount:
+        views.filter(
+          item =>
+            [
+              'EXIT_CONFIRMED',
+              'EXIT_REVIEW',
+              'REDUCE'
+            ].includes(
+              item?.exitIntelligence
+                ?.verdict
+            )
+        ).length,
+      monitorCount:
+        views.filter(
+          item =>
+            item?.exitIntelligence
+              ?.verdict ===
+              'HOLD_MONITOR'
+        ).length,
       checkingCount:
         views.filter(
           item =>
@@ -26679,7 +27432,7 @@ async function buildLongTermOwnershipContinuity(
         ).length
     },
     note:
-      'Ownership status is separate from the new-money ranking. A stock can remain a valid HOLD even when NOMAD would not add fresh capital at today\'s price.'
+      'Ownership status is separate from the new-money ranking. Long-term exit intelligence treats price weakness as a review trigger, not an automatic sell; REDUCE/EXIT requires thesis deterioration.'
   };
 }
 
@@ -36334,6 +37087,132 @@ function runDecisionEngineSelfTests() {
     'high yield-trap risk must reduce long-term conviction without bypassing bounded authority'
   );
 
+
+  const finalVerdictBuyCandidate = {
+    ...ownershipIntactCandidate,
+    horizon: 'long_term',
+    canonicalState: {
+      ...ownershipIntactCandidate.canonicalState,
+      marketAction: 'BUY',
+      researchState: 'CLEAR',
+      evidence: {
+        confidence: 'HIGH'
+      },
+      professional: {
+        ...(ownershipIntactCandidate.canonicalState?.professional || {}),
+        framework: 'LONG_TERM_INVESTOR',
+        thesisStatus: 'STRONG'
+      }
+    },
+    profileSuitability: {
+      state: 'SUITABLE',
+      issues: []
+    },
+    executionGuidance: {
+      status: 'BUY_NOW',
+      orderType: 'LIMIT',
+      referencePrice: 100,
+      maxAcceptablePrice: 101
+    }
+  };
+
+  assert.equal(
+    decisionLongTermFinalVerdict(
+      finalVerdictBuyCandidate
+    ).code,
+    'BUY_CONFIRMED',
+    'long-term final verdict must translate a fully passing BUY_NOW setup into BUY_CONFIRMED'
+  );
+
+  const priceWeakButThesisIntact = {
+    ...ownershipIntactCandidate,
+    price: 80,
+    historicalContext: {
+      available: true,
+      returns: {
+        m3: -28,
+        m6: -38,
+        y1: -35
+      },
+      movingAverages: {
+        sma50: 92,
+        sma200: 98
+      },
+      technical: {
+        maxDrawdown52wPct: -42
+      }
+    },
+    analystCore: {
+      overallFinancialView: {
+        state: 'STRONG'
+      },
+      views: {
+        profitTrend: { state: 'STABLE' },
+        epsTrend: { state: 'STABLE' },
+        cashFlowQuality: { state: 'STRONG' },
+        balanceSheet: { state: 'STRONG' }
+      }
+    }
+  };
+
+  assert.equal(
+    decisionLongTermExitIntelligence(
+      priceWeakButThesisIntact,
+      {
+        averageCost: 100,
+        currentPrice: 80
+      },
+      {
+        thesisState: 'INTACT'
+      }
+    ).verdict,
+    'HOLD_MONITOR',
+    'price weakness alone must never create a long-term REDUCE/EXIT verdict while the thesis remains intact'
+  );
+
+  const brokenExitCandidate = {
+    ...priceWeakButThesisIntact,
+    canonicalState: {
+      ...priceWeakButThesisIntact.canonicalState,
+      marketAction: 'AVOID',
+      thesisStatus: 'WEAK',
+      researchState: 'CLEAR',
+      evidence: {
+        confidence: 'HIGH'
+      },
+      professional: {
+        framework: 'LONG_TERM_INVESTOR',
+        thesisStatus: 'WEAK'
+      }
+    },
+    analystCore: {
+      overallFinancialView: {
+        state: 'WEAK'
+      },
+      views: {
+        profitTrend: { state: 'DETERIORATING' },
+        epsTrend: { state: 'DETERIORATING' },
+        cashFlowQuality: { state: 'WEAK' },
+        balanceSheet: { state: 'QUESTIONABLE' }
+      }
+    }
+  };
+
+  assert.equal(
+    decisionLongTermExitIntelligence(
+      brokenExitCandidate,
+      {
+        averageCost: 100,
+        currentPrice: 80
+      },
+      {
+        thesisState: 'STRONG'
+      }
+    ).verdict,
+    'EXIT_CONFIRMED',
+    'EXIT_CONFIRMED must require a broken thesis plus multiple fundamental warnings; persistent price weakness only reinforces the evidence'
+  );
+
   console.log(
     'NOMAD Decision Engine self-tests passed.'
   );
@@ -42732,6 +43611,93 @@ button:not(.secondary):not(.miniButton):not(.chartModeButton):not(.navButton):no
   flex-basis: 100%;
   color: #657b92;
   font-size: 8px;
+}
+
+.longTermFinalVerdict {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: 1px solid #314b67;
+  border-radius: 7px;
+  background: rgba(13,27,43,.62);
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 7px 10px;
+}
+.longTermFinalVerdict > span {
+  color: #8198ae;
+  font-size: 8px;
+  font-weight: 850;
+  letter-spacing: .09em;
+}
+.longTermFinalVerdict > strong {
+  color: #f3f7fb;
+  font-size: 11px;
+}
+.longTermFinalVerdict > em {
+  color: #f4c542;
+  font-size: 9px;
+  font-style: normal;
+  font-weight: 900;
+  white-space: nowrap;
+}
+.longTermFinalVerdict > small {
+  grid-column: 1 / -1;
+  color: #8196aa;
+  font-size: 9px;
+  line-height: 1.35;
+}
+.longTermFinalVerdict.positive {
+  border-color: rgba(94,182,123,.48);
+  background: rgba(36,99,58,.14);
+}
+.longTermFinalVerdict.positive > strong { color:#82daa1; }
+.longTermFinalVerdict.warning {
+  border-color: rgba(229,198,107,.42);
+  background: rgba(132,103,22,.10);
+}
+.longTermFinalVerdict.warning > strong { color:#e5c66b; }
+.longTermFinalVerdict.negative {
+  border-color: rgba(220,94,94,.46);
+  background: rgba(120,35,35,.12);
+}
+.longTermFinalVerdict.negative > strong { color:#ef8b8b; }
+.longTermFinalVerdict.neutral > strong { color:#c8d7e5; }
+
+.ownershipExitMeta,
+.ownershipPurchaseThesis {
+  margin-top: 7px;
+  padding: 7px 8px;
+  border: 1px solid rgba(75,102,130,.35);
+  border-radius: 6px;
+  background: rgba(8,18,30,.28);
+}
+.ownershipExitMeta span,
+.ownershipPurchaseThesis span,
+.ownershipExitMeta strong,
+.ownershipPurchaseThesis strong,
+.ownershipExitMeta em,
+.ownershipPurchaseThesis em { display:block; }
+.ownershipExitMeta span,
+.ownershipPurchaseThesis span {
+  color:#71889f;
+  font-size:8px;
+  font-weight:850;
+  letter-spacing:.08em;
+}
+.ownershipExitMeta strong,
+.ownershipPurchaseThesis strong {
+  margin-top:2px;
+  color:#dfe9f3;
+  font-size:9px;
+}
+.ownershipExitMeta em,
+.ownershipPurchaseThesis em {
+  margin-top:2px;
+  color:#71879c;
+  font-size:8px;
+  font-style:normal;
+  line-height:1.35;
 }
 
 .ownershipContinuityList {
@@ -56174,7 +57140,16 @@ function decisionActionLabel(
     STAGED_BUY: 'STAGED BUY',
     PROFILE_BLOCKED: 'PROFILE BLOCKED',
     WAIT_FOR_PRICE: 'WAIT FOR PRICE',
-    NO_BUY: 'NO BUY'
+    NO_BUY: 'NO BUY',
+    BUY_CONFIRMED: 'BUY CONFIRMED',
+    HOLD_CONFIRMED: 'HOLD CONFIRMED',
+    HOLD_MONITOR: 'HOLD / MONITOR',
+    REVIEW_CAUTION: 'REVIEW / CAUTION',
+    REDUCE: 'REDUCE',
+    EXIT_REVIEW: 'EXIT REVIEW',
+    EXIT_CONFIRMED: 'EXIT CONFIRMED',
+    CHECK_EVIDENCE: 'CHECK EVIDENCE',
+    DO_NOT_BUY: 'DO NOT BUY'
   };
 
   return labels[action] ||
@@ -56187,6 +57162,84 @@ function decisionActionLabel(
     );
 }
 
+
+
+function renderLongTermFinalVerdict(
+  verdict,
+  contextLabel = 'FINAL VERDICT'
+) {
+  if (!verdict) {
+    return '';
+  }
+
+  const code =
+    String(
+      verdict.code ||
+      verdict.verdict ||
+      'CHECK_EVIDENCE'
+    ).toUpperCase();
+  const tone =
+    String(
+      verdict.tone ||
+      (
+        code.includes('EXIT') ||
+        code === 'DO_NOT_BUY'
+          ? 'negative'
+          : code.includes('WAIT') ||
+              code.includes('MONITOR') ||
+              code.includes('REVIEW') ||
+              code === 'REDUCE'
+            ? 'warning'
+            : code.includes('BUY') ||
+                code.includes('HOLD_CONFIRMED')
+              ? 'positive'
+              : 'neutral'
+      )
+    ).toLowerCase();
+  const title =
+    verdict.title ||
+    decisionActionLabel(
+      code
+    );
+  const reason =
+    verdict.reason ||
+    '';
+  const maxBuy =
+    Number(
+      verdict.maxBuyPrice
+    );
+
+  return (
+    '<div class="longTermFinalVerdict ' +
+    escapeHtml(tone) +
+    '">' +
+    '<span>' +
+    escapeHtml(contextLabel) +
+    '</span><strong>' +
+    escapeHtml(title) +
+    '</strong>' +
+    (
+      Number.isFinite(maxBuy) &&
+      maxBuy > 0 &&
+      [
+        'BUY_CONFIRMED',
+        'STAGED_BUY'
+      ].includes(code)
+        ? '<em>MAX BUY PKR ' +
+          formatNumber(maxBuy, 2) +
+          '</em>'
+        : ''
+    ) +
+    (
+      reason
+        ? '<small>' +
+          escapeHtml(reason) +
+          '</small>'
+        : ''
+    ) +
+    '</div>'
+  );
+}
 
 function renderLongTermIntelligenceStrip(
   intelligence
@@ -56541,8 +57594,13 @@ function renderOpportunityList(
               : ''
           ) +
           (!isShortTerm
-            ? renderLongTermIntelligenceStrip(
-                item.longTermIntelligence
+            ? (
+                renderLongTermFinalVerdict(
+                  item.finalVerdict
+                ) +
+                renderLongTermIntelligenceStrip(
+                  item.longTermIntelligence
+                )
               )
             : '') +
           '<details class="opportunityDetails"><summary>Why / details</summary>' +
@@ -57547,6 +58605,10 @@ function renderOwnershipContinuity(
             )
           ) +
           '</span></div>' +
+          renderLongTermFinalVerdict(
+            item.finalVerdict,
+            'OWNER VERDICT'
+          ) +
           '<div class="ownershipNumbers">' +
           '<div><span>Your avg cost</span><strong>PKR ' +
           formatNumber(
@@ -57612,6 +58674,81 @@ function renderOwnershipContinuity(
           '</div>' +
           renderLongTermIntelligenceStrip(
             item.longTermIntelligence
+          ) +
+          (
+            item.exitIntelligence
+              ? '<div class="ownershipExitMeta"><span>LONG-TERM EXIT CHECK</span><strong>Trend ' +
+                escapeHtml(
+                  item.exitIntelligence?.trend?.state ||
+                  'UNRESOLVED'
+                ) +
+                ' · Fundamentals ' +
+                escapeHtml(
+                  item.exitIntelligence?.fundamentals?.state ||
+                  'UNRESOLVED'
+                ) +
+                '</strong><em>' +
+                escapeHtml(
+                  item.exitIntelligence?.rule ||
+                  ''
+                ) +
+                '</em></div>'
+              : ''
+          ) +
+          (
+            item.purchaseThesis
+              ? '<div class="ownershipPurchaseThesis"><span>THESIS MEMORY</span><strong>' +
+                escapeHtml(
+                  item.purchaseThesis.label ||
+                  'first tracked baseline'
+                ) +
+                ': ' +
+                escapeHtml(
+                  item.purchaseThesis.thesisState ||
+                  'UNRESOLVED'
+                ) +
+                (
+                  Number.isFinite(
+                    Number(
+                      item.purchaseThesis.price
+                    )
+                  )
+                    ? ' @ PKR ' +
+                      formatNumber(
+                        Number(
+                          item.purchaseThesis.price
+                        ),
+                        2
+                      )
+                    : ''
+                ) +
+                '</strong><em>' +
+                (
+                  item.purchaseThesis.compounder
+                    ? 'Compounder ' +
+                      escapeHtml(
+                        item.purchaseThesis.compounder.state ||
+                        'UNRESOLVED'
+                      ) +
+                      (
+                        Number.isFinite(
+                          Number(
+                            item.purchaseThesis.compounder.score
+                          )
+                        )
+                          ? ' ' +
+                            formatNumber(
+                              Number(
+                                item.purchaseThesis.compounder.score
+                              ),
+                              0
+                            )
+                          : ''
+                      )
+                    : 'Purchase thesis score history is limited'
+                ) +
+                '</em></div>'
+              : ''
           ) +
           '<div class="ownershipChange"><span>WHAT CHANGED</span><strong>' +
           escapeHtml(
