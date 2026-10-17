@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.6.12';
+const VERSION = '0.9.6.13';
 
 // Core production hardening: Ask NOMAD remains intentionally disabled so the
 // conversational layer cannot interfere with the production decision path.
@@ -28,6 +28,10 @@ const VERSION = '0.9.6.12';
 // actual fill price, fees and all-in cost, and an optional NOMAD max-buy ceiling can
 // be retained with the transaction to show WITHIN PLAN / ABOVE MAX execution status.
 // 0.9.6.12 adds Long-Term Ownership Continuity without changing Investor ranking:
+// 0.9.6.13 adds Long-Term Compounder + Dividend Intelligence in SHADOW ONLY.
+// It is additive: it reads the existing analyst evidence and exposes parallel
+// compounder/dividend diagnostics, but it cannot change ranking, canonical action,
+// allocation, execution guidance, Investor/Trader scores, or ownership actions.
 // existing holdings are reviewed separately from new-money opportunities, with a
 // persistent thesis state, owner action, new-money action and a concise explanation
 // of what changed. Existing holdings that fall outside the ranked shortlist are
@@ -22519,6 +22523,597 @@ function professionalRiskState(score) {
   return 'HIGH';
 }
 
+
+/* =========================================================
+   LONG-TERM COMPOUNDER + DIVIDEND INTELLIGENCE - 0.9.6.13
+   SHADOW ONLY. These functions are deliberately side-channel diagnostics.
+   They never feed professionalLongTermView(), canonical state, ranking,
+   allocation, profile suitability, execution guidance or ownership actions.
+========================================================= */
+
+function longTermShadowStateScore(
+  state,
+  mapping
+) {
+  const key =
+    String(state || '')
+      .trim()
+      .toUpperCase();
+
+  return Object.prototype.hasOwnProperty.call(
+    mapping,
+    key
+  )
+    ? mapping[key]
+    : null;
+}
+
+function longTermShadowTrendScore(
+  view
+) {
+  return longTermShadowStateScore(
+    view?.state,
+    {
+      IMPROVING: 90,
+      STRONG: 90,
+      GOOD: 82,
+      STABLE: 70,
+      ACCEPTABLE: 68,
+      MIXED: 52,
+      DETERIORATING: 32,
+      QUESTIONABLE: 38,
+      WEAK: 22
+    }
+  );
+}
+
+function longTermShadowQualityScore(
+  values
+) {
+  let weighted = 0;
+  let observedWeight = 0;
+  let totalWeight = 0;
+
+  for (const item of values || []) {
+    const weight =
+      Math.max(
+        0,
+        safeNumber(item?.weight) || 0
+      );
+    totalWeight += weight;
+
+    const value =
+      safeNumber(item?.value);
+
+    if (value === null) {
+      continue;
+    }
+
+    observedWeight += weight;
+    weighted +=
+      decisionClamp(value) * weight;
+  }
+
+  const score =
+    observedWeight > 0
+      ? decisionRound(
+          decisionClamp(
+            weighted / observedWeight
+          ),
+          2
+        )
+      : null;
+
+  const coveragePct =
+    totalWeight > 0
+      ? decisionRound(
+          observedWeight / totalWeight * 100,
+          2
+        )
+      : 0;
+
+  const confidence =
+    coveragePct >= 80
+      ? 'HIGH'
+      : coveragePct >= 55
+        ? 'MEDIUM'
+        : coveragePct >= 30
+          ? 'LOW'
+          : 'UNRESOLVED';
+
+  return {
+    score,
+    coveragePct,
+    confidence
+  };
+}
+
+function longTermShadowRoeScore(
+  candidate
+) {
+  const roe =
+    safeNumber(
+      candidate?.fundamental
+        ?.metrics
+        ?.roe
+        ?.value
+    );
+
+  if (roe === null) {
+    return null;
+  }
+
+  if (roe >= 25) return 95;
+  if (roe >= 20) return 88;
+  if (roe >= 15) return 78;
+  if (roe >= 10) return 66;
+  if (roe >= 5) return 52;
+  if (roe >= 0) return 38;
+  return 18;
+}
+
+function longTermShadowDividendHistory(
+  analyst
+) {
+  const values =
+    Array.isArray(
+      analyst?.evidence
+        ?.dividendPerShare
+        ?.values
+    )
+      ? analyst.evidence
+          .dividendPerShare
+          .values
+          .slice(0, 10)
+      : [];
+
+  const usable =
+    values
+      .map(item => ({
+        period: item?.period || null,
+        value: safeNumber(item?.value)
+      }))
+      .filter(item => item.value !== null);
+
+  if (!usable.length) {
+    return {
+      periods: 0,
+      paidPeriods: 0,
+      consistencyPct: null,
+      latestDps: null,
+      direction: 'UNAVAILABLE',
+      cutCount: null
+    };
+  }
+
+  const paidPeriods =
+    usable.filter(
+      item => item.value > 0
+    ).length;
+
+  let cuts = 0;
+  let rises = 0;
+  let comparisons = 0;
+
+  for (
+    let index = 0;
+    index < usable.length - 1;
+    index++
+  ) {
+    const newer = usable[index].value;
+    const older = usable[index + 1].value;
+    if (
+      newer === null ||
+      older === null
+    ) {
+      continue;
+    }
+    comparisons++;
+    if (newer < older) cuts++;
+    if (newer > older) rises++;
+  }
+
+  let direction = 'STABLE';
+  if (!comparisons) {
+    direction = 'INSUFFICIENT_HISTORY';
+  } else if (cuts === 0 && rises > 0) {
+    direction = 'GROWING';
+  } else if (cuts > rises) {
+    direction = 'DECLINING';
+  } else if (cuts > 0 && rises > 0) {
+    direction = 'MIXED';
+  }
+
+  return {
+    periods: usable.length,
+    paidPeriods,
+    consistencyPct:
+      decisionRound(
+        paidPeriods /
+        usable.length *
+        100,
+        2
+      ),
+    latestDps:
+      decisionRound(
+        usable[0]?.value,
+        4
+      ),
+    direction,
+    cutCount: cuts
+  };
+}
+
+function longTermShadowDividendYieldScore(
+  yieldPct
+) {
+  const value = safeNumber(yieldPct);
+  if (value === null) return null;
+  if (value <= 0) return 35;
+  if (value < 2) return 48;
+  if (value < 4) return 60;
+  if (value <= 8) return 78;
+  if (value <= 12) return 86;
+  if (value <= 15) return 76;
+  return 58;
+}
+
+function longTermShadowPayoutScore(
+  payoutRatio
+) {
+  const value = safeNumber(payoutRatio);
+  if (value === null) return null;
+
+  // PSX ratio tables normally report payout as percentage points. If a source
+  // supplies a unit fraction, normalize only the plausible 0..2 range.
+  const pct =
+    value > 0 && value <= 2
+      ? value * 100
+      : value;
+
+  if (pct < 0) return 15;
+  if (pct <= 25) return 72;
+  if (pct <= 60) return 92;
+  if (pct <= 80) return 82;
+  if (pct <= 100) return 65;
+  if (pct <= 130) return 42;
+  return 20;
+}
+
+function longTermShadowDividendConsistencyScore(
+  history
+) {
+  const pct = safeNumber(history?.consistencyPct);
+  if (pct === null) return null;
+  if (pct >= 95) return 95;
+  if (pct >= 80) return 84;
+  if (pct >= 60) return 68;
+  if (pct >= 40) return 52;
+  return 30;
+}
+
+function longTermShadowDividendTrendScore(
+  history
+) {
+  return ({
+    GROWING: 90,
+    STABLE: 76,
+    MIXED: 56,
+    DECLINING: 32,
+    INSUFFICIENT_HISTORY: 55,
+    UNAVAILABLE: null
+  })[history?.direction || 'UNAVAILABLE'];
+}
+
+function buildLongTermCompounderDividendShadow(
+  candidate
+) {
+  if (
+    String(
+      candidate?.horizon ||
+      'long_term'
+    ) !== 'long_term'
+  ) {
+    return null;
+  }
+
+  const analyst =
+    candidate?.analystCore ||
+    null;
+  const views =
+    analyst?.views ||
+    {};
+  const evidence =
+    analyst?.evidence ||
+    {};
+
+  const financialQuality =
+    analyst
+      ? professionalFinancialQualityScore(
+          analyst
+        )
+      : null;
+
+  const compounderQuality =
+    longTermShadowQualityScore([
+      {
+        value: financialQuality,
+        weight: 25
+      },
+      {
+        value:
+          longTermShadowTrendScore(
+            views.revenueTrend
+          ),
+        weight: 14
+      },
+      {
+        value:
+          longTermShadowTrendScore(
+            views.profitTrend
+          ),
+        weight: 16
+      },
+      {
+        value:
+          longTermShadowTrendScore(
+            views.epsTrend
+          ),
+        weight: 16
+      },
+      {
+        value:
+          longTermShadowTrendScore(
+            views.marginTrend
+          ),
+        weight: 9
+      },
+      {
+        value:
+          longTermShadowRoeScore(
+            candidate
+          ),
+        weight: 10
+      },
+      {
+        value:
+          longTermShadowStateScore(
+            views.cashFlowQuality?.state,
+            {
+              STRONG: 92,
+              GOOD: 84,
+              ACCEPTABLE: 72,
+              EVIDENCE_AVAILABLE: 66,
+              QUESTIONABLE: 40,
+              WEAK: 22
+            }
+          ),
+        weight: 10
+      }
+    ]);
+
+  const compounderState =
+    compounderQuality.score === null
+      ? 'UNRESOLVED'
+      : compounderQuality.score >= 82
+        ? 'STRONG'
+        : compounderQuality.score >= 68
+          ? 'GOOD'
+          : compounderQuality.score >= 54
+            ? 'MIXED'
+            : 'WEAK';
+
+  const dividendYield =
+    safeNumber(
+      candidate?.valuation
+        ?.dividendYield
+    );
+  const payoutRatio =
+    safeNumber(
+      evidence.payoutRatio
+        ?.latest?.value
+    );
+  const dividendHistory =
+    longTermShadowDividendHistory(
+      analyst
+    );
+  const hasDividendEvidence =
+    (dividendYield !== null && dividendYield > 0) ||
+    dividendHistory.paidPeriods > 0 ||
+    safeNumber(
+      dividendHistory.latestDps
+    ) > 0;
+
+  const cashSupport =
+    longTermShadowStateScore(
+      views.cashFlowQuality?.state,
+      {
+        STRONG: 92,
+        GOOD: 84,
+        ACCEPTABLE: 72,
+        EVIDENCE_AVAILABLE: 66,
+        QUESTIONABLE: 38,
+        WEAK: 20
+      }
+    );
+  const earningsSupport =
+    longTermShadowTrendScore(
+      views.epsTrend
+    );
+
+  const dividendQuality =
+    hasDividendEvidence
+      ? longTermShadowQualityScore([
+          {
+            value:
+              longTermShadowDividendYieldScore(
+                dividendYield
+              ),
+            weight: 18
+          },
+          {
+            value:
+              longTermShadowPayoutScore(
+                payoutRatio
+              ),
+            weight: 22
+          },
+          {
+            value:
+              longTermShadowDividendConsistencyScore(
+                dividendHistory
+              ),
+            weight: 20
+          },
+          {
+            value:
+              longTermShadowDividendTrendScore(
+                dividendHistory
+              ),
+            weight: 15
+          },
+          {
+            value: cashSupport,
+            weight: 15
+          },
+          {
+            value: earningsSupport,
+            weight: 10
+          }
+        ])
+      : {
+          score: null,
+          coveragePct: 0,
+          confidence: 'UNRESOLVED'
+        };
+
+  let yieldTrapRisk = 'UNRESOLVED';
+  const payoutScore =
+    longTermShadowPayoutScore(
+      payoutRatio
+    );
+  const weakSupportCount = [
+    payoutScore !== null && payoutScore < 50,
+    cashSupport !== null && cashSupport < 50,
+    earningsSupport !== null && earningsSupport < 50,
+    dividendHistory.direction === 'DECLINING'
+  ].filter(Boolean).length;
+
+  if (!hasDividendEvidence) {
+    yieldTrapRisk = 'NOT_APPLICABLE';
+  } else if (
+    dividendYield !== null &&
+    dividendYield >= 12 &&
+    weakSupportCount >= 2
+  ) {
+    yieldTrapRisk = 'HIGH';
+  } else if (
+    dividendYield !== null &&
+    dividendYield >= 10 &&
+    weakSupportCount >= 1
+  ) {
+    yieldTrapRisk = 'MEDIUM';
+  } else if (
+    dividendQuality.confidence !==
+      'UNRESOLVED'
+  ) {
+    yieldTrapRisk = 'LOW';
+  }
+
+  const dividendState =
+    !hasDividendEvidence
+      ? 'NO_DIVIDEND_EVIDENCE'
+      : dividendQuality.score === null
+        ? 'UNRESOLVED'
+        : dividendQuality.score >= 82
+          ? 'STRONG'
+          : dividendQuality.score >= 68
+            ? 'GOOD'
+            : dividendQuality.score >= 54
+              ? 'MIXED'
+              : 'WEAK';
+
+  let shareholderReturnStyle =
+    'UNRESOLVED';
+
+  if (
+    (compounderState === 'STRONG' ||
+      compounderState === 'GOOD') &&
+    (dividendState === 'STRONG' ||
+      dividendState === 'GOOD')
+  ) {
+    shareholderReturnStyle =
+      'GROWTH_PLUS_INCOME';
+  } else if (
+    (compounderState === 'STRONG' ||
+      compounderState === 'GOOD') &&
+    !hasDividendEvidence
+  ) {
+    shareholderReturnStyle =
+      'REINVESTMENT_COMPOUNDER';
+  } else if (
+    (dividendState === 'STRONG' ||
+      dividendState === 'GOOD') &&
+    compounderState === 'MIXED'
+  ) {
+    shareholderReturnStyle =
+      'INCOME_LED_REVIEW';
+  } else if (
+    compounderState === 'WEAK' ||
+    yieldTrapRisk === 'HIGH'
+  ) {
+    shareholderReturnStyle =
+      'QUALITY_RISK';
+  } else {
+    shareholderReturnStyle =
+      'MIXED';
+  }
+
+  return {
+    version:
+      'LT-COMPOUNDER-DIVIDEND-SHADOW-0.9.6.13',
+    mode: 'SHADOW_ONLY',
+    affectsDecision: false,
+    compounder: {
+      score:
+        compounderQuality.score,
+      state:
+        compounderState,
+      confidence:
+        compounderQuality.confidence,
+      coveragePct:
+        compounderQuality.coveragePct
+    },
+    dividend: {
+      score:
+        dividendQuality.score,
+      state:
+        dividendState,
+      confidence:
+        dividendQuality.confidence,
+      coveragePct:
+        dividendQuality.coveragePct,
+      yieldPct:
+        decisionRound(
+          dividendYield,
+          2
+        ),
+      payoutRatio:
+        decisionRound(
+          payoutRatio,
+          2
+        ),
+      history:
+        dividendHistory,
+      yieldTrapRisk
+    },
+    totalShareholderReturnStyle:
+      shareholderReturnStyle,
+    note:
+      'Shadow intelligence only. It does not change today\'s ranking, allocation or action.'
+  };
+}
+
 function professionalLongTermEntryExtension(
   candidate
 ) {
@@ -24467,6 +25062,10 @@ function decisionCenterSummary(
     dataQualityScore:
       candidate.dataQuality?.score ??
       null,
+    longTermIntelligenceShadow:
+      buildLongTermCompounderDividendShadow(
+        candidate
+      ),
     analyst: {
       status:
         analyst?.status ||
@@ -25820,6 +26419,10 @@ async function buildLongTermOwnershipContinuity(
             canonical?.evidence
               ?.confidence ||
             'UNRESOLVED',
+          longTermIntelligenceShadow:
+            buildLongTermCompounderDividendShadow(
+              candidate
+            ),
           baseline,
           change,
           analyzed:
@@ -35307,6 +35910,136 @@ function runDecisionEngineSelfTests() {
     'a genuinely broken long-term thesis must escalate the existing position to review/reduce rather than reassuring the user'
   );
 
+
+  // 0.9.6.13: Compounder + Dividend Intelligence must remain strictly shadow-only.
+  const shadowCandidate = {
+    horizon: 'long_term',
+    valuation: {
+      dividendYield: 8.5
+    },
+    fundamental: {
+      metrics: {
+        roe: { value: 21 }
+      }
+    },
+    analystCore: {
+      views: {
+        revenueTrend: { state: 'IMPROVING' },
+        profitTrend: { state: 'IMPROVING' },
+        epsTrend: { state: 'IMPROVING' },
+        marginTrend: { state: 'STABLE' },
+        cashFlowQuality: { state: 'GOOD' },
+        earningsQuality: { state: 'GOOD' },
+        balanceSheet: { state: 'ACCEPTABLE' }
+      },
+      overallFinancialView: { state: 'GOOD' },
+      evidence: {
+        payoutRatio: {
+          latest: { value: 55 }
+        },
+        dividendPerShare: {
+          values: [
+            { period: '2026', value: 8 },
+            { period: '2025', value: 7 },
+            { period: '2024', value: 6 },
+            { period: '2023', value: 5 }
+          ]
+        }
+      }
+    }
+  };
+
+  const shadowBefore =
+    JSON.stringify(shadowCandidate);
+  const shadowResult =
+    buildLongTermCompounderDividendShadow(
+      shadowCandidate
+    );
+
+  assert.equal(
+    shadowResult.affectsDecision,
+    false,
+    'compounder/dividend intelligence must be explicitly shadow-only'
+  );
+  assert.equal(
+    shadowResult.mode,
+    'SHADOW_ONLY',
+    'compounder/dividend intelligence must declare SHADOW_ONLY mode'
+  );
+  assert.ok(
+    ['STRONG', 'GOOD'].includes(
+      shadowResult.compounder.state
+    ),
+    'healthy multi-period fundamentals should produce a positive shadow compounder state'
+  );
+  assert.ok(
+    ['STRONG', 'GOOD'].includes(
+      shadowResult.dividend.state
+    ),
+    'consistent sustainable dividends should produce a positive shadow dividend state'
+  );
+  assert.equal(
+    JSON.stringify(shadowCandidate),
+    shadowBefore,
+    'shadow intelligence must not mutate the candidate or live decision inputs'
+  );
+
+  const noDividendShadow =
+    buildLongTermCompounderDividendShadow({
+      ...shadowCandidate,
+      valuation: { dividendYield: 0 },
+      analystCore: {
+        ...shadowCandidate.analystCore,
+        evidence: {
+          payoutRatio: {
+            available: false,
+            latest: null
+          },
+          dividendPerShare: {
+            values: []
+          }
+        }
+      }
+    });
+
+  assert.equal(
+    noDividendShadow.dividend.state,
+    'NO_DIVIDEND_EVIDENCE',
+    'a non-dividend compounder must not be mislabeled as a weak dividend company'
+  );
+
+  const trapShadow =
+    buildLongTermCompounderDividendShadow({
+      ...shadowCandidate,
+      valuation: { dividendYield: 16 },
+      analystCore: {
+        ...shadowCandidate.analystCore,
+        views: {
+          ...shadowCandidate.analystCore.views,
+          epsTrend: { state: 'DETERIORATING' },
+          cashFlowQuality: { state: 'WEAK' }
+        },
+        evidence: {
+          payoutRatio: {
+            latest: { value: 145 }
+          },
+          dividendPerShare: {
+            values: [
+              { period: '2026', value: 4 },
+              { period: '2025', value: 7 },
+              { period: '2024', value: 8 }
+            ]
+          }
+        }
+      }
+    });
+
+  assert.equal(
+    trapShadow.dividend.yieldTrapRisk,
+    'HIGH',
+    'high yield with weak payout/cash/earnings support must flag high yield-trap risk'
+  );
+
   console.log(
     'NOMAD Decision Engine self-tests passed.'
   );
@@ -41672,6 +42405,41 @@ button:not(.secondary):not(.miniButton):not(.chartModeButton):not(.navButton):no
   color: #8fa4ba;
   font-size: 10px;
 }
+
+.longTermShadowStrip {
+  margin-top: 7px;
+  padding: 6px 8px;
+  border: 1px solid rgba(111,145,176,.22);
+  border-radius: 6px;
+  background: rgba(10,20,33,.28);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 9px;
+  color: #8ea4ba;
+}
+.longTermShadowStrip > span:first-child {
+  color: #d6b94e;
+  font-weight: 800;
+  letter-spacing: .08em;
+}
+.longTermShadowMetric strong {
+  color: #e7eef6;
+  margin-left: 3px;
+}
+.longTermShadowMetric.good strong,
+.longTermShadowMetric.strong strong { color: #7fd6a0; }
+.longTermShadowMetric.weak strong,
+.longTermShadowMetric.high strong { color: #ef8b8b; }
+.longTermShadowMetric.mixed strong,
+.longTermShadowMetric.medium strong { color: #e5c66b; }
+.longTermShadowNote {
+  flex-basis: 100%;
+  color: #657b92;
+  font-size: 8px;
+}
+
 .ownershipContinuityList {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -55125,6 +55893,66 @@ function decisionActionLabel(
     );
 }
 
+
+function renderLongTermShadowStrip(
+  shadow
+) {
+  if (
+    !shadow ||
+    shadow.mode !== 'SHADOW_ONLY'
+  ) {
+    return '';
+  }
+
+  const compounder =
+    shadow.compounder || {};
+  const dividend =
+    shadow.dividend || {};
+  const dividendLabel =
+    dividend.state === 'NO_DIVIDEND_EVIDENCE'
+      ? 'NO DIVIDEND EVIDENCE'
+      : dividend.state || 'UNRESOLVED';
+  const trap =
+    dividend.yieldTrapRisk ||
+    'UNRESOLVED';
+
+  return (
+    '<div class="longTermShadowStrip" title="Shadow intelligence only — does not change the live NOMAD decision">' +
+    '<span>SHADOW · COMPOUNDER + DIVIDEND</span>' +
+    '<span class="longTermShadowMetric ' +
+    escapeHtml(
+      String(compounder.state || '').toLowerCase()
+    ) +
+    '">Compounder <strong>' +
+    escapeHtml(
+      compounder.state || 'UNRESOLVED'
+    ) +
+    (compounder.score !== null && compounder.score !== undefined
+      ? ' · ' + formatNumber(compounder.score, 0)
+      : '') +
+    '</strong></span>' +
+    '<span class="longTermShadowMetric ' +
+    escapeHtml(
+      String(dividend.state || '').toLowerCase()
+    ) +
+    '">Dividend <strong>' +
+    escapeHtml(dividendLabel) +
+    (dividend.score !== null && dividend.score !== undefined
+      ? ' · ' + formatNumber(dividend.score, 0)
+      : '') +
+    '</strong></span>' +
+    '<span class="longTermShadowMetric ' +
+    escapeHtml(
+      String(trap).toLowerCase()
+    ) +
+    '">Yield-trap risk <strong>' +
+    escapeHtml(trap) +
+    '</strong></span>' +
+    '<span class="longTermShadowNote">Diagnostic only. Current Investor ranking and allocation are unchanged.</span>' +
+    '</div>'
+  );
+}
+
 function renderOpportunityList(
   targetId,
   items,
@@ -55406,6 +56234,11 @@ function renderOpportunityList(
                 '</div>'
               : ''
           ) +
+          (!isShortTerm
+            ? renderLongTermShadowStrip(
+                item.longTermIntelligenceShadow
+              )
+            : '') +
           '<details class="opportunityDetails"><summary>Why / details</summary>' +
           '<div class="opportunityDetailBody">' +
           detailMeta +
@@ -56471,6 +57304,9 @@ function renderOwnershipContinuity(
           ) +
           '</div>' +
           '</div>' +
+          renderLongTermShadowStrip(
+            item.longTermIntelligenceShadow
+          ) +
           '<div class="ownershipChange"><span>WHAT CHANGED</span><strong>' +
           escapeHtml(
             item?.change?.text ||
