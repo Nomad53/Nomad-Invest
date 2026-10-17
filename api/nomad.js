@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.6.11';
+const VERSION = '0.9.6.12';
 
 // Core production hardening: Ask NOMAD remains intentionally disabled so the
 // conversational layer cannot interfere with the production decision path.
@@ -27,6 +27,11 @@ const VERSION = '0.9.6.11';
 // positions opened today use all-in position P&L for Today P&L, trade rows separate
 // actual fill price, fees and all-in cost, and an optional NOMAD max-buy ceiling can
 // be retained with the transaction to show WITHIN PLAN / ABOVE MAX execution status.
+// 0.9.6.12 adds Long-Term Ownership Continuity without changing Investor ranking:
+// existing holdings are reviewed separately from new-money opportunities, with a
+// persistent thesis state, owner action, new-money action and a concise explanation
+// of what changed. Existing holdings that fall outside the ranked shortlist are
+// analyzed separately so a lower new-money rank is never mistaken for a broken thesis.
 const NOMAD_ASK_NOMAD_ENABLED = false;
 
 
@@ -19128,6 +19133,51 @@ async function readLatestDecisionResult() {
   }
 }
 
+async function readRecentLongTermDecisionResults(
+  riskProfile,
+  limit = 30
+) {
+  if (!continuousMemoryConfigured()) {
+    return [];
+  }
+
+  const risk =
+    String(
+      riskProfile ||
+      'balanced'
+    )
+      .trim()
+      .toLowerCase();
+
+  const cappedLimit =
+    Math.max(
+      1,
+      Math.min(
+        60,
+        Number(limit) || 30
+      )
+    );
+
+  try {
+    const rows =
+      await supabaseRest(
+        'decision_runs?select=raw_result,created_at,horizon,risk_profile' +
+        '&horizon=eq.long_term' +
+        '&risk_profile=eq.' +
+        encodeURIComponent(risk) +
+        '&order=created_at.desc' +
+        '&limit=' +
+        cappedLimit
+      );
+
+    return Array.isArray(rows)
+      ? rows
+      : [];
+  } catch {
+    return [];
+  }
+}
+
 async function savePortfolioHolding(
   input
 ) {
@@ -24689,7 +24739,8 @@ async function buildDecisionPortfolioContext(
         currentValuePkr: 0,
         symbolValues: {},
         sectorValues: {},
-        symbols: []
+        symbols: [],
+        holdings: []
       };
     }
 
@@ -24708,6 +24759,7 @@ async function buildDecisionPortfolioContext(
 
     const symbolValues = {};
     const sectorValues = {};
+    const holdingDetails = {};
     let currentValuePkr = 0;
 
     for (
@@ -24770,6 +24822,39 @@ async function buildDecisionPortfolioContext(
         ) +
         value;
 
+      holdingDetails[symbol] = {
+        symbol,
+        quantity:
+          decisionRound(
+            quantity,
+            6
+          ),
+        averageCost:
+          decisionRound(
+            safeNumber(
+              holding.average_cost
+            ) ||
+            0,
+            4
+          ),
+        purchaseDate:
+          holding.purchase_date ||
+          null,
+        currentPrice:
+          decisionRound(
+            price,
+            4
+          ),
+        currentValuePkr:
+          decisionRound(
+            value,
+            2
+          ),
+        sector,
+        ledgerBacked:
+          holding.ledgerBacked === true
+      };
+
       currentValuePkr +=
         value;
     }
@@ -24797,6 +24882,10 @@ async function buildDecisionPortfolioContext(
       symbols:
         Object.keys(
           symbolValues
+        ),
+      holdings:
+        Object.values(
+          holdingDetails
         )
     };
   } catch {
@@ -24807,9 +24896,980 @@ async function buildDecisionPortfolioContext(
       currentValuePkr: 0,
       symbolValues: {},
       sectorValues: {},
-      symbols: []
+      symbols: [],
+      holdings: []
     };
   }
+}
+
+function decisionOwnershipThesisState(
+  candidate
+) {
+  const canonical =
+    candidate?.canonicalState ||
+    null;
+
+  if (!canonical) {
+    return 'UNRESOLVED';
+  }
+
+  if (
+    canonical.researchState ===
+      'ACTIVE'
+  ) {
+    return 'CHECKING';
+  }
+
+  const raw =
+    String(
+      canonical.thesisStatus ||
+      canonical.professional
+        ?.thesisStatus ||
+      ''
+    )
+      .trim()
+      .toUpperCase();
+
+  if (raw === 'STRONG') {
+    return 'STRONG';
+  }
+
+  if (
+    raw === 'ACCEPTABLE' ||
+    raw === 'GOOD'
+  ) {
+    return 'INTACT';
+  }
+
+  if (
+    raw === 'MIXED'
+  ) {
+    return 'WEAKENING';
+  }
+
+  if (
+    raw === 'WEAK' ||
+    canonical.marketAction ===
+      'AVOID'
+  ) {
+    return canonical.marketAction ===
+      'AVOID'
+        ? 'BROKEN'
+        : 'WEAKENING';
+  }
+
+  return 'INTACT';
+}
+
+function decisionOwnershipThesisStrength(
+  value
+) {
+  return ({
+    STRONG: 5,
+    INTACT: 4,
+    CHECKING: 3,
+    WEAKENING: 2,
+    BROKEN: 1,
+    UNRESOLVED: 0
+  })[
+    String(value || '')
+      .toUpperCase()
+  ] || 0;
+}
+
+function decisionOwnershipExistingAction(
+  candidate,
+  holding,
+  portfolioContext,
+  riskPolicy
+) {
+  const canonical =
+    candidate?.canonicalState ||
+    null;
+  const suitability =
+    candidate?.profileSuitability ||
+    null;
+  const thesis =
+    decisionOwnershipThesisState(
+      candidate
+    );
+
+  if (!canonical) {
+    return {
+      action: 'HOLD_RESEARCH',
+      reason:
+        'NOMAD could not complete a fresh ownership review, so it will not invent an exit or add decision.'
+    };
+  }
+
+  if (
+    canonical.researchState ===
+      'ACTIVE' ||
+    thesis === 'CHECKING'
+  ) {
+    return {
+      action: 'HOLD_RESEARCH',
+      reason:
+        'The position remains owned while NOMAD refreshes missing long-term evidence.'
+    };
+  }
+
+  if (
+    canonical.marketAction ===
+      'AVOID' ||
+    thesis === 'BROKEN'
+  ) {
+    return {
+      action: 'REVIEW_REDUCE',
+      reason:
+        'The current long-term framework is unfavorable. Review the original thesis before deciding whether to reduce or exit.'
+    };
+  }
+
+  if (
+    suitability?.state ===
+      'NOT_SUITABLE'
+  ) {
+    return {
+      action: 'HOLD_NO_ADD',
+      reason:
+        'The position does not automatically become a sell, but the selected profile does not support adding more capital today.'
+    };
+  }
+
+  if (
+    canonical.marketAction ===
+      'WATCH'
+  ) {
+    return {
+      action: 'HOLD',
+      reason:
+        'The long-term thesis does not independently trigger an exit; today\'s conditions simply do not justify adding fresh capital.'
+    };
+  }
+
+  if (
+    canonical.marketAction ===
+      'BUY' ||
+    canonical.marketAction ===
+      'ACCUMULATE'
+  ) {
+    const portfolioValue =
+      safeNumber(
+        portfolioContext
+          ?.currentValuePkr
+      ) ||
+      0;
+    const holdingValue =
+      safeNumber(
+        holding?.currentValuePkr
+      ) ||
+      0;
+    const weight =
+      portfolioValue > 0
+        ? holdingValue /
+          portfolioValue
+        : 0;
+    const hardCap =
+      Math.max(
+        0.01,
+        safeNumber(
+          riskPolicy?.maxStockPct
+        ) ||
+        0.45
+      );
+
+    if (weight >= hardCap) {
+      return {
+        action: 'HOLD_NO_ADD',
+        reason:
+          'The thesis remains actionable, but your existing position is already at the selected profile\'s single-stock concentration ceiling.'
+      };
+    }
+
+    return {
+      action: 'ADD_CANDIDATE',
+      reason:
+        'You already own the company and the current long-term thesis remains actionable; any additional purchase must still pass today\'s entry and portfolio-fit gates.'
+    };
+  }
+
+  return {
+    action: 'HOLD',
+    reason:
+      'No current evidence independently requires an exit from the existing long-term position.'
+  };
+}
+
+function decisionOwnershipNewMoneyAction(
+  candidate,
+  existingAction
+) {
+  const canonical =
+    candidate?.canonicalState ||
+    null;
+
+  if (!canonical) {
+    return 'WAIT_DATA';
+  }
+
+  if (
+    existingAction?.action ===
+      'HOLD_NO_ADD'
+  ) {
+    return 'DO_NOT_ADD';
+  }
+
+  if (
+    canonical.researchState ===
+      'ACTIVE'
+  ) {
+    return 'WAIT_DATA';
+  }
+
+  if (
+    canonical.marketAction ===
+      'AVOID'
+  ) {
+    return 'NO_BUY';
+  }
+
+  if (
+    canonical.marketAction ===
+      'WATCH'
+  ) {
+    return 'WAIT_FOR_ENTRY';
+  }
+
+  const guidance =
+    candidate?.executionGuidance ||
+    null;
+
+  if (guidance?.status) {
+    return guidance.status;
+  }
+
+  return canonical.marketAction ===
+    'BUY'
+      ? 'BUY_NOW'
+      : canonical.marketAction ===
+          'ACCUMULATE'
+        ? 'STAGED_BUY'
+        : 'WAIT_FOR_ENTRY';
+}
+
+function decisionOwnershipCandidateFromRun(
+  run,
+  symbol
+) {
+  const normalized =
+    normalizeSymbol(
+      symbol
+    );
+  const raw =
+    run?.raw_result ||
+    null;
+
+  if (!raw || !normalized) {
+    return null;
+  }
+
+  const candidate =
+    (raw.candidates || [])
+      .find(
+        item =>
+          normalizeSymbol(
+            item?.symbol
+          ) === normalized
+      ) ||
+    null;
+
+  if (!candidate) {
+    return null;
+  }
+
+  const canonical =
+    candidate.canonicalState ||
+    decisionCanonicalCompanyState(
+      candidate
+    );
+
+  return {
+    createdAt:
+      run.created_at ||
+      raw.completedAt ||
+      null,
+    price:
+      safeNumber(
+        candidate.price
+      ),
+    thesisState:
+      decisionOwnershipThesisState({
+        ...candidate,
+        canonicalState:
+          canonical
+      }),
+    marketAction:
+      canonical.marketAction ||
+      null,
+    opportunityTier:
+      canonical.opportunityTier ||
+      null,
+    timingState:
+      canonical.professional
+        ?.timingState ||
+      null,
+    valuationState:
+      canonical.professional
+        ?.valuationState ||
+      null
+  };
+}
+
+function decisionOwnershipBaseline(
+  recentRuns,
+  holding
+) {
+  const matches =
+    (recentRuns || [])
+      .map(
+        run =>
+          decisionOwnershipCandidateFromRun(
+            run,
+            holding?.symbol
+          )
+      )
+      .filter(Boolean)
+      .sort(
+        (a, b) =>
+          Date.parse(a.createdAt || '') -
+          Date.parse(b.createdAt || '')
+      );
+
+  if (!matches.length) {
+    return null;
+  }
+
+  const purchaseDate =
+    holding?.purchaseDate ||
+    null;
+  const purchaseStart =
+    purchaseDate
+      ? Date.parse(
+          String(purchaseDate)
+            .slice(0, 10) +
+          'T00:00:00+05:00'
+        )
+      : NaN;
+
+  const sincePurchase =
+    Number.isFinite(purchaseStart)
+      ? matches.filter(
+          item =>
+            Date.parse(
+              item.createdAt ||
+              ''
+            ) >= purchaseStart
+        )
+      : [];
+
+  const baseline =
+    sincePurchase[0] ||
+    matches[0];
+
+  const baselineDate =
+    baseline?.createdAt
+      ? String(
+          baseline.createdAt
+        ).slice(0, 10)
+      : null;
+
+  return {
+    ...baseline,
+    label:
+      purchaseDate &&
+      baselineDate ===
+        String(purchaseDate).slice(0, 10)
+        ? 'purchase-day baseline'
+        : 'first tracked baseline'
+  };
+}
+
+function decisionOwnershipChangeSummary(
+  current,
+  baseline,
+  holding
+) {
+  const thesis =
+    current?.thesisState ||
+    'UNRESOLVED';
+  const currentPrice =
+    safeNumber(
+      holding?.currentPrice
+    );
+  const averageCost =
+    safeNumber(
+      holding?.averageCost
+    );
+  const returnPct =
+    currentPrice !== null &&
+    averageCost !== null &&
+    averageCost > 0
+      ? (
+          currentPrice -
+          averageCost
+        ) /
+        averageCost *
+        100
+      : null;
+
+  if (!baseline) {
+    return {
+      state: 'BASELINE_CREATED',
+      text:
+        'First tracked ownership continuity snapshot. Future long-term analyses will compare the thesis and entry state against this baseline.',
+      returnPct:
+        decisionRound(
+          returnPct,
+          2
+        )
+    };
+  }
+
+  const currentStrength =
+    decisionOwnershipThesisStrength(
+      thesis
+    );
+  const baselineStrength =
+    decisionOwnershipThesisStrength(
+      baseline.thesisState
+    );
+
+  let text;
+  let state = 'UNCHANGED';
+
+  if (
+    currentStrength + 1 <
+      baselineStrength
+  ) {
+    state = 'WEAKENED';
+    text =
+      'The long-term thesis has weakened versus the ' +
+      baseline.label +
+      '. This is a thesis change, not merely a lower new-money rank.';
+  } else if (
+    currentStrength >
+      baselineStrength
+  ) {
+    state = 'IMPROVED';
+    text =
+      'The long-term thesis has improved versus the ' +
+      baseline.label +
+      '.';
+  } else if (
+    baseline.marketAction ===
+      'BUY' ||
+    baseline.marketAction ===
+      'ACCUMULATE'
+  ) {
+    if (
+      current?.marketAction ===
+        'WATCH'
+    ) {
+      state = 'ENTRY_CHANGED';
+      text =
+        'No material thesis deterioration detected. The ownership case remains intact; only the new-money entry has become less attractive today.';
+    } else {
+      text =
+        'No material thesis deterioration detected versus the ' +
+        baseline.label +
+        '. The current ownership case remains intact.';
+    }
+  } else {
+    text =
+      'The ownership thesis is broadly consistent with the ' +
+      baseline.label +
+      '; today\'s new-money ranking is a separate decision.';
+  }
+
+  return {
+    state,
+    text,
+    returnPct:
+      decisionRound(
+        returnPct,
+        2
+      )
+  };
+}
+
+async function analyzeLongTermOwnershipCandidate(
+  marketRow,
+  eligibleRows,
+  memoryMap,
+  model,
+  riskPolicy
+) {
+  if (!marketRow) {
+    return null;
+  }
+
+  const historicalContext =
+    await decisionHistoricalContext(
+      marketRow,
+      memoryMap
+    );
+
+  const valuation =
+    scoreDecisionValuation(
+      marketRow,
+      eligibleRows
+    );
+
+  const entry =
+    scoreDecisionEntry(
+      historicalContext,
+      'long_term',
+      riskPolicy
+    );
+
+  const riskScore =
+    scoreDecisionRisk(
+      marketRow,
+      historicalContext,
+      eligibleRows
+    );
+
+  const fundamentalEvidence =
+    await decisionLoadFundamentals(
+      marketRow,
+      memoryMap
+    );
+
+  const fundamentals =
+    fundamentalEvidence
+      .fundamentals;
+
+  const fundamental =
+    scoreDecisionFundamentals(
+      fundamentals
+    );
+
+  fundamental.evidenceState =
+    fundamentalEvidence
+      .evidenceState;
+  fundamental.cachedAt =
+    fundamentalEvidence
+      .cachedAt;
+
+  if (fundamentalEvidence.error) {
+    fundamental.risks =
+      uniqueTextValues([
+        ...(fundamental.risks || []),
+        fundamentalEvidence.error
+      ]);
+  }
+
+  const dataQuality =
+    scoreDecisionDataQuality(
+      marketRow,
+      historicalContext,
+      fundamental
+    );
+
+  const overallScore =
+    decisionOverallScore(
+      model,
+      fundamental,
+      valuation,
+      entry,
+      riskScore,
+      dataQuality
+    );
+
+  const candidate = {
+    horizon: 'long_term',
+    recommendationEligible:
+      marketRow.recommendationEligible ===
+        true,
+    symbol:
+      marketRow.symbol,
+    companyName:
+      marketRow.companyName,
+    sector:
+      marketRow.sector,
+    statusCodes:
+      marketRow.statusCodes ||
+      [],
+    price:
+      decisionRound(
+        marketRow.price,
+        4
+      ),
+    marketAsOf:
+      marketRow.asOf ||
+      null,
+    averageVolume30d:
+      decisionRound(
+        marketRow.averageVolume30d,
+        0
+      ),
+    historicalContext,
+    fundamental,
+    analystCore:
+      fundamentals?.analystCore ||
+      null,
+    fundamentalEvidenceState:
+      fundamentalEvidence.evidenceState,
+    fundamentalEvidenceDiagnostics:
+      fundamentalEvidence.diagnostics ||
+      null,
+    valuation,
+    entry,
+    risk:
+      riskScore,
+    dataQuality,
+    overallScore
+  };
+
+  const action =
+    decisionCandidateAction(
+      candidate,
+      model,
+      riskPolicy
+    );
+
+  candidate.action =
+    action.action;
+  candidate.actionReason =
+    action.reason;
+  candidate.narrative =
+    decisionCandidateNarrative(
+      candidate
+    );
+  candidate.canonicalState =
+    decisionCanonicalCompanyState(
+      candidate
+    );
+  candidate.profileSuitability =
+    decisionProfileSuitability(
+      candidate,
+      riskPolicy
+    );
+  candidate.executionGuidance =
+    decisionExecutionGuidance(
+      candidate,
+      riskPolicy
+    );
+
+  return candidate;
+}
+
+async function buildLongTermOwnershipContinuity(
+  candidates,
+  portfolioContext,
+  market,
+  eligibleRows,
+  memoryMap,
+  model,
+  riskPolicy,
+  risk
+) {
+  const holdings =
+    Array.isArray(
+      portfolioContext?.holdings
+    )
+      ? portfolioContext.holdings
+      : [];
+
+  if (!holdings.length) {
+    return {
+      available: false,
+      holdings: [],
+      summary: {
+        holdingCount: 0,
+        intactCount: 0,
+        reviewCount: 0
+      }
+    };
+  }
+
+  const candidateMap =
+    new Map(
+      (candidates || [])
+        .filter(item => item?.symbol)
+        .map(
+          item => [
+            normalizeSymbol(
+              item.symbol
+            ),
+            item
+          ]
+        )
+    );
+
+  const marketMap =
+    new Map(
+      (market?.stocks || [])
+        .filter(item => item?.symbol)
+        .map(
+          item => [
+            normalizeSymbol(
+              item.symbol
+            ),
+            item
+          ]
+        )
+    );
+
+  const missing =
+    holdings
+      .filter(
+        holding =>
+          !candidateMap.has(
+            normalizeSymbol(
+              holding.symbol
+            )
+          )
+      )
+      .map(
+        holding => ({
+          holding,
+          marketRow:
+            marketMap.get(
+              normalizeSymbol(
+                holding.symbol
+              )
+            ) ||
+            null
+        })
+      )
+      .filter(
+        item =>
+          item.marketRow
+      );
+
+  const [
+    supplemental,
+    recentRuns
+  ] =
+    await Promise.all([
+      decisionMapWithConcurrency(
+        missing,
+        2,
+        async item =>
+          analyzeLongTermOwnershipCandidate(
+            item.marketRow,
+            eligibleRows,
+            memoryMap,
+            model,
+            riskPolicy
+          )
+      ),
+      readRecentLongTermDecisionResults(
+        risk,
+        30
+      )
+    ]);
+
+  for (const candidate of supplemental) {
+    if (
+      candidate &&
+      !candidate.error &&
+      candidate.symbol
+    ) {
+      candidateMap.set(
+        normalizeSymbol(
+          candidate.symbol
+        ),
+        candidate
+      );
+    }
+  }
+
+  const views =
+    holdings.map(
+      holding => {
+        const symbol =
+          normalizeSymbol(
+            holding.symbol
+          );
+        const candidate =
+          candidateMap.get(
+            symbol
+          ) ||
+          null;
+        const canonical =
+          candidate?.canonicalState ||
+          null;
+        const thesisState =
+          decisionOwnershipThesisState(
+            candidate
+          );
+        const existingAction =
+          decisionOwnershipExistingAction(
+            candidate,
+            holding,
+            portfolioContext,
+            riskPolicy
+          );
+        const newMoneyAction =
+          decisionOwnershipNewMoneyAction(
+            candidate,
+            existingAction
+          );
+        const baseline =
+          decisionOwnershipBaseline(
+            recentRuns,
+            holding
+          );
+        const change =
+          decisionOwnershipChangeSummary(
+            {
+              thesisState,
+              marketAction:
+                canonical?.marketAction ||
+                null
+            },
+            baseline,
+            holding
+          );
+        const weightPct =
+          safeNumber(
+            portfolioContext
+              ?.currentValuePkr
+          ) > 0
+            ? (
+                safeNumber(
+                  holding.currentValuePkr
+                ) ||
+                0
+              ) /
+              portfolioContext.currentValuePkr *
+              100
+            : 0;
+
+        return {
+          symbol,
+          companyName:
+            candidate?.companyName ||
+            marketMap.get(symbol)
+              ?.companyName ||
+            symbol,
+          sector:
+            holding.sector ||
+            candidate?.sector ||
+            'Unknown',
+          quantity:
+            holding.quantity ||
+            0,
+          averageCost:
+            holding.averageCost ||
+            0,
+          purchaseDate:
+            holding.purchaseDate ||
+            null,
+          currentPrice:
+            holding.currentPrice ||
+            candidate?.price ||
+            null,
+          currentValuePkr:
+            holding.currentValuePkr ||
+            0,
+          portfolioWeightPct:
+            decisionRound(
+              weightPct,
+              2
+            ),
+          thesisState,
+          thesisRaw:
+            canonical?.thesisStatus ||
+            canonical?.professional
+              ?.thesisStatus ||
+            null,
+          marketAction:
+            canonical?.marketAction ||
+            'RESEARCHING',
+          opportunityTier:
+            canonical?.opportunityTier ||
+            'EVIDENCE_RESEARCH',
+          existingAction:
+            existingAction.action,
+          existingReason:
+            existingAction.reason,
+          newMoneyAction,
+          newMoneyReason:
+            candidate?.executionGuidance
+              ?.reason ||
+            canonical?.reason ||
+            '',
+          maxBuyPrice:
+            safeNumber(
+              candidate?.executionGuidance
+                ?.maxAcceptablePrice
+            ),
+          timingState:
+            canonical?.professional
+              ?.timingState ||
+            null,
+          valuationState:
+            canonical?.professional
+              ?.valuationState ||
+            null,
+          evidenceConfidence:
+            canonical?.evidence
+              ?.confidence ||
+            'UNRESOLVED',
+          baseline,
+          change,
+          analyzed:
+            Boolean(candidate)
+        };
+      }
+    );
+
+  const intactCount =
+    views.filter(
+      item =>
+        item.thesisState ===
+          'STRONG' ||
+        item.thesisState ===
+          'INTACT'
+    ).length;
+  const reviewCount =
+    views.filter(
+      item =>
+        item.thesisState ===
+          'WEAKENING' ||
+        item.thesisState ===
+          'BROKEN' ||
+        item.existingAction ===
+          'REVIEW_REDUCE'
+    ).length;
+
+  return {
+    available: true,
+    framework:
+      'LONG_TERM_OWNERSHIP_CONTINUITY',
+    holdings:
+      views,
+    summary: {
+      holdingCount:
+        views.length,
+      intactCount,
+      reviewCount,
+      checkingCount:
+        views.filter(
+          item =>
+            item.thesisState ===
+              'CHECKING' ||
+            item.thesisState ===
+              'UNRESOLVED'
+        ).length
+    },
+    note:
+      'Ownership status is separate from the new-money ranking. A stock can remain a valid HOLD even when NOMAD would not add fresh capital at today\'s price.'
+  };
 }
 
 function decisionProfileSuitability(
@@ -31488,6 +32548,30 @@ async function runDecisionLab(
       candidates
     );
 
+  const ownershipContinuity =
+    horizon === 'long_term' &&
+    portfolioContext?.holdingCount > 0
+      ? await buildLongTermOwnershipContinuity(
+          candidates,
+          portfolioContext,
+          market,
+          eligibleRows,
+          memoryMap,
+          model,
+          riskPolicy,
+          risk
+        )
+      : {
+          available: false,
+          holdings: [],
+          summary: {
+            holdingCount: 0,
+            intactCount: 0,
+            reviewCount: 0,
+            checkingCount: 0
+          }
+        };
+
   const allocation =
     allocateDecisionCenterOpportunities(
       opportunityBoard,
@@ -32028,6 +33112,7 @@ async function runDecisionLab(
         portfolioContext.currentValuePkr ||
         0
     },
+    ownershipContinuity,
     candidates,
     exclusions: {
       unaffordable:
@@ -34143,6 +35228,83 @@ function runDecisionEngineSelfTests() {
     longTermHighVolSuitability.state,
     'NOT_SUITABLE',
     'Long-term volatility profile gate must remain unchanged while the Trader brain uses stop-defined risk'
+  );
+
+  const ownershipIntactCandidate = {
+    canonicalState: {
+      researchState: 'COMPLETE',
+      marketAction: 'WATCH',
+      thesisStatus: 'ACCEPTABLE',
+      professional: {
+        thesisStatus: 'ACCEPTABLE'
+      }
+    },
+    profileSuitability: {
+      state: 'SUITABLE'
+    },
+    executionGuidance: {
+      status: 'WAIT_FOR_ENTRY'
+    }
+  };
+
+  assert.equal(
+    decisionOwnershipThesisState(
+      ownershipIntactCandidate
+    ),
+    'INTACT',
+    'a long-term WATCH must be allowed to preserve an intact ownership thesis instead of implying the company became bad'
+  );
+
+  const ownershipHoldAction =
+    decisionOwnershipExistingAction(
+      ownershipIntactCandidate,
+      {
+        currentValuePkr: 25000
+      },
+      {
+        currentValuePkr: 100000
+      },
+      riskBalanced
+    );
+
+  assert.equal(
+    ownershipHoldAction.action,
+    'HOLD',
+    'an existing long-term holding with an intact thesis but WATCH new-money state must remain HOLD'
+  );
+
+  assert.equal(
+    decisionOwnershipNewMoneyAction(
+      ownershipIntactCandidate,
+      ownershipHoldAction
+    ),
+    'WAIT_FOR_ENTRY',
+    'ownership continuity must separate HOLD on the existing position from WAIT_FOR_ENTRY for new money'
+  );
+
+  const ownershipBrokenCandidate = {
+    canonicalState: {
+      researchState: 'COMPLETE',
+      marketAction: 'AVOID',
+      thesisStatus: 'WEAK',
+      professional: {
+        thesisStatus: 'WEAK'
+      }
+    },
+    profileSuitability: {
+      state: 'SUITABLE'
+    }
+  };
+
+  assert.equal(
+    decisionOwnershipExistingAction(
+      ownershipBrokenCandidate,
+      { currentValuePkr: 25000 },
+      { currentValuePkr: 100000 },
+      riskBalanced
+    ).action,
+    'REVIEW_REDUCE',
+    'a genuinely broken long-term thesis must escalate the existing position to review/reduce rather than reassuring the user'
   );
 
   console.log(
@@ -40481,6 +41643,176 @@ button:not(.secondary):not(.miniButton):not(.chartModeButton):not(.navButton):no
 .stockStrategyCard { margin-top: 14px; }
 .decisionAuditCard { margin-top: 12px; }
 
+/* 0.9.6.12: long-term ownership continuity is deliberately separate from
+   the new-money opportunity board. */
+.ownershipContinuityCard {
+  margin: 14px 0 16px;
+  padding: 14px 16px;
+  border-top: 2px solid rgba(244,197,66,.55);
+}
+.ownershipContinuityHeader {
+  align-items: flex-start;
+  margin-bottom: 10px;
+}
+.ownershipContinuityHeader h2 { margin-bottom: 3px; }
+.ownershipContinuitySummary {
+  min-width: 120px;
+  text-align: right;
+}
+.ownershipContinuitySummary strong,
+.ownershipContinuitySummary span {
+  display: block;
+}
+.ownershipContinuitySummary strong {
+  color: #f4f8fc;
+  font-size: 13px;
+}
+.ownershipContinuitySummary span {
+  margin-top: 2px;
+  color: #8fa4ba;
+  font-size: 10px;
+}
+.ownershipContinuityList {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.ownershipRow {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid #263a52;
+  border-radius: 7px;
+  background: rgba(10,20,33,.34);
+}
+.ownershipIdentity {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: flex-start;
+  padding-bottom: 9px;
+  border-bottom: 1px solid rgba(62,84,108,.5);
+}
+.ownershipIdentity > div strong,
+.ownershipIdentity > div span { display:block; }
+.ownershipIdentity > div strong {
+  color:#f4f8fc;
+  font-size:13px;
+}
+.ownershipIdentity > div span {
+  color:#7f94aa;
+  font-size:9px;
+  margin-top:2px;
+}
+.ownershipThesisBadge {
+  flex: 0 0 auto;
+  padding: 4px 7px;
+  border-radius: 999px;
+  border: 1px solid #34506b;
+  color:#a9bad0;
+  font-size:8px;
+  font-weight:800;
+  letter-spacing:.03em;
+}
+.ownershipThesisBadge.strong,
+.ownershipThesisBadge.intact {
+  color:#67dda1;
+  border-color:rgba(45,178,110,.45);
+  background:rgba(45,178,110,.08);
+}
+.ownershipThesisBadge.weakening,
+.ownershipThesisBadge.checking {
+  color:#f0c75c;
+  border-color:rgba(240,199,92,.4);
+  background:rgba(240,199,92,.06);
+}
+.ownershipThesisBadge.broken {
+  color:#ff8b8b;
+  border-color:rgba(211,74,74,.5);
+  background:rgba(211,74,74,.08);
+}
+.ownershipNumbers {
+  display:grid;
+  grid-template-columns: repeat(3, minmax(0,1fr));
+  gap:7px;
+  margin-top:9px;
+}
+.ownershipNumbers > div,
+.ownershipActions > div {
+  min-width:0;
+  padding:7px 8px;
+  border:1px solid rgba(45,65,86,.72);
+  border-radius:5px;
+  background:rgba(8,17,29,.34);
+}
+.ownershipNumbers span,
+.ownershipActions span {
+  display:block;
+  color:#71879d;
+  font-size:8px;
+  text-transform:uppercase;
+  letter-spacing:.04em;
+}
+.ownershipNumbers strong,
+.ownershipActions strong {
+  display:block;
+  margin-top:3px;
+  color:#f3f7fb;
+  font-size:10px;
+}
+.ownershipActions {
+  display:grid;
+  grid-template-columns: repeat(2,minmax(0,1fr));
+  gap:7px;
+  margin-top:7px;
+}
+.ownershipActions em {
+  display:block;
+  margin-top:3px;
+  color:#f4c542;
+  font-size:8px;
+  font-style:normal;
+  font-weight:800;
+}
+.ownershipChange {
+  margin-top:8px;
+  padding:8px 9px;
+  border-left:2px solid #3c6b91;
+  background:rgba(29,57,82,.13);
+}
+.ownershipChange span,
+.ownershipChange strong,
+.ownershipChange em { display:block; }
+.ownershipChange span {
+  color:#6fa6d0;
+  font-size:8px;
+  font-weight:800;
+  letter-spacing:.05em;
+}
+.ownershipChange strong {
+  margin-top:3px;
+  color:#cbd7e3;
+  font-size:9px;
+  line-height:1.45;
+  font-weight:600;
+}
+.ownershipChange em {
+  margin-top:4px;
+  color:#60778d;
+  font-size:8px;
+  font-style:normal;
+}
+@media (max-width: 900px) {
+  .ownershipContinuityList { grid-template-columns: 1fr; }
+  .ownershipNumbers { grid-template-columns: repeat(3, minmax(0,1fr)); }
+}
+@media (max-width: 560px) {
+  .ownershipContinuityHeader { display:block; }
+  .ownershipContinuitySummary { text-align:left; margin-top:8px; }
+  .ownershipNumbers { grid-template-columns: 1fr 1fr; }
+  .ownershipNumbers > div:last-child { grid-column:1/-1; }
+  .ownershipActions { grid-template-columns: 1fr; }
+}
+
 /* Portfolio: add a real theme-aware session chart and theme the horizontal scrollbar. */
 .portfolioLiveChart {
   margin: 10px 0 12px;
@@ -41311,9 +42643,17 @@ Checking connection...
 </div>
 </div>
 
+<div id="ownershipContinuitySection" class="terminalCard ownershipContinuityCard" hidden>
+<div class="panelHeader ownershipContinuityHeader">
+<div><div class="eyebrow">YOUR CURRENT HOLDINGS</div><h2>What you already own</h2><p class="muted">A holding can remain good even when today is not the right price to add more.</p></div>
+<div id="ownershipContinuitySummary" class="ownershipContinuitySummary"></div>
+</div>
+<div id="ownershipContinuityList" class="ownershipContinuityList"></div>
+</div>
+
 <div class="decisionBoardHeader">
-<div><div class="eyebrow">OPPORTUNITIES</div><h2>Best options right now</h2></div>
-<div class="decisionBoardNote">Market view and your suitability are shown separately.</div>
+<div><div class="eyebrow">OPPORTUNITIES</div><h2 id="decisionBoardTitle">Best options right now</h2></div>
+<div id="decisionBoardNote" class="decisionBoardNote">Market view and your suitability are shown separately.</div>
 </div>
 
 <div class="opportunityBoardGrid">
@@ -53745,6 +55085,7 @@ function decisionActionLabel(
     RESEARCHING: 'RESEARCHING',
     NO_ACTION_YET: 'NO ACTION YET',
     HOLD_RESEARCH: 'HOLD / RESEARCH',
+    HOLD_NO_ADD: 'HOLD / NO ADD',
     ADD_CANDIDATE: 'ADD',
     REVIEW_REDUCE: 'REVIEW / REDUCE',
     WAIT: 'WAIT',
@@ -54904,6 +56245,246 @@ async function loadStockStrategy(
         original;
     }
   }
+}
+
+function ownershipThesisLabel(
+  state
+) {
+  const labels = {
+    STRONG: 'THESIS STRONG',
+    INTACT: 'THESIS INTACT',
+    CHECKING: 'THESIS CHECKING',
+    WEAKENING: 'THESIS WEAKENING',
+    BROKEN: 'THESIS BROKEN',
+    UNRESOLVED: 'THESIS UNRESOLVED'
+  };
+
+  return labels[
+    String(state || '')
+      .toUpperCase()
+  ] || 'THESIS UNRESOLVED';
+}
+
+function renderOwnershipContinuity(
+  result
+) {
+  const section =
+    $('ownershipContinuitySection');
+  const listTarget =
+    $('ownershipContinuityList');
+  const summaryTarget =
+    $('ownershipContinuitySummary');
+  const boardTitle =
+    $('decisionBoardTitle');
+  const boardNote =
+    $('decisionBoardNote');
+
+  const isLongTerm =
+    result?.input?.horizon ===
+      'long_term';
+  const continuity =
+    result?.ownershipContinuity ||
+    null;
+  const holdings =
+    Array.isArray(
+      continuity?.holdings
+    )
+      ? continuity.holdings
+      : [];
+
+  if (boardTitle) {
+    boardTitle.textContent =
+      isLongTerm
+        ? 'Best options for new money right now'
+        : 'Best options right now';
+  }
+
+  if (boardNote) {
+    boardNote.textContent =
+      isLongTerm
+        ? 'New-money ranking is separate from whether your existing holdings remain good to own.'
+        : 'Market view and your suitability are shown separately.';
+  }
+
+  if (
+    !section ||
+    !listTarget ||
+    !isLongTerm ||
+    !continuity?.available ||
+    !holdings.length
+  ) {
+    if (section) {
+      section.hidden = true;
+    }
+    return;
+  }
+
+  section.hidden = false;
+
+  const summary =
+    continuity.summary ||
+    {};
+
+  if (summaryTarget) {
+    summaryTarget.innerHTML =
+      '<strong>' +
+      formatNumber(
+        summary.holdingCount ||
+        holdings.length,
+        0
+      ) +
+      ' reviewed</strong><span>' +
+      formatNumber(
+        summary.intactCount ||
+        0,
+        0
+      ) +
+      ' intact/strong' +
+      (
+        Number(
+          summary.reviewCount ||
+          0
+        ) > 0
+          ? ' · ' +
+            formatNumber(
+              summary.reviewCount,
+              0
+            ) +
+            ' need review'
+          : ''
+      ) +
+      '</span>';
+  }
+
+  listTarget.innerHTML =
+    holdings.map(
+      item => {
+        const thesisClass =
+          String(
+            item.thesisState ||
+            'UNRESOLVED'
+          )
+            .toLowerCase();
+        const returnPct =
+          item?.change?.returnPct;
+        const returnText =
+          returnPct !== null &&
+          returnPct !== undefined
+            ? (
+                (Number(returnPct) > 0 ? '+' : '') +
+                formatNumber(
+                  returnPct,
+                  2
+                ) +
+                '% vs your cost'
+              )
+            : 'Return unavailable';
+        const baselineText =
+          item?.baseline?.label
+            ? 'Compared with ' +
+              item.baseline.label
+            : 'Baseline starts here';
+
+        return (
+          '<div class="ownershipRow">' +
+          '<div class="ownershipIdentity"><div><strong>' +
+          escapeHtml(
+            item.symbol ||
+            ''
+          ) +
+          '</strong><span>' +
+          escapeHtml(
+            item.companyName ||
+            ''
+          ) +
+          '</span></div><span class="ownershipThesisBadge ' +
+          escapeHtml(
+            thesisClass
+          ) +
+          '">' +
+          escapeHtml(
+            ownershipThesisLabel(
+              item.thesisState
+            )
+          ) +
+          '</span></div>' +
+          '<div class="ownershipNumbers">' +
+          '<div><span>Your avg cost</span><strong>PKR ' +
+          formatNumber(
+            item.averageCost ||
+            0,
+            2
+          ) +
+          '</strong></div>' +
+          '<div><span>Current</span><strong>PKR ' +
+          formatNumber(
+            item.currentPrice ||
+            0,
+            2
+          ) +
+          '</strong></div>' +
+          '<div><span>Position</span><strong class="' +
+          percentClass(
+            returnPct
+          ) +
+          '">' +
+          escapeHtml(
+            returnText
+          ) +
+          '</strong></div>' +
+          '</div>' +
+          '<div class="ownershipActions">' +
+          '<div><span>What to do with what you own</span><strong>' +
+          escapeHtml(
+            decisionActionLabel(
+              item.existingAction
+            )
+          ) +
+          '</strong></div>' +
+          '<div><span>If adding new money today</span><strong>' +
+          escapeHtml(
+            decisionActionLabel(
+              item.newMoneyAction
+            )
+          ) +
+          '</strong>' +
+          (
+            item.maxBuyPrice !== null &&
+            item.maxBuyPrice !== undefined &&
+            [
+              'BUY_NOW',
+              'STAGED_BUY',
+              'BUY'
+            ].includes(
+              String(
+                item.newMoneyAction ||
+                ''
+              )
+            )
+              ? '<em>MAX PKR ' +
+                formatNumber(
+                  item.maxBuyPrice,
+                  2
+                ) +
+                '</em>'
+              : ''
+          ) +
+          '</div>' +
+          '</div>' +
+          '<div class="ownershipChange"><span>WHAT CHANGED</span><strong>' +
+          escapeHtml(
+            item?.change?.text ||
+            'NOMAD has not completed a continuity comparison yet.'
+          ) +
+          '</strong><em>' +
+          escapeHtml(
+            baselineText
+          ) +
+          '</em></div>' +
+          '</div>'
+        );
+      }
+    ).join('');
 }
 
 function renderOpportunityBoard(
@@ -56097,6 +57678,10 @@ function renderShadowDecision(
     html;
 
   startDecisionTriggerMonitor();
+
+  renderOwnershipContinuity(
+    result
+  );
 
   renderOpportunityBoard(
     result
