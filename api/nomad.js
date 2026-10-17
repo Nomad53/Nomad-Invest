@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.6.14';
+const VERSION = '0.9.6.14.1';
 
 // Core production hardening: Ask NOMAD remains intentionally disabled so the
 // conversational layer cannot interfere with the production decision path.
@@ -37,6 +37,10 @@ const VERSION = '0.9.6.14';
 // evidence coverage is sufficient. Missing dividends never penalize a reinvesting
 // compounder, and the existing analyst, valuation, risk, timing and execution hard
 // gates remain unchanged. Trader NOMAD is untouched.
+// 0.9.6.14.1 is a browser-runtime hotfix only. It replaces the server-only
+// safeNumber helper accidentally referenced by the active Compounder + Dividend
+// client UI. No Investor, Trader, ranking, allocation, ownership, execution or
+// intelligence logic is changed from 0.9.6.14.
 // existing holdings are reviewed separately from new-money opportunities, with a
 // persistent thesis state, owner action, new-money action and a concise explanation
 // of what changed. Existing holdings that fall outside the ranked shortlist are
@@ -56241,8 +56245,8 @@ function renderLongTermIntelligenceStrip(
     escapeHtml(trap) +
     '</strong></span>' +
     '<span class="longTermShadowMetric">Influence <strong>' +
-    (safeNumber(activation.adjustment) > 0 ? '+' : '') +
-    formatNumber(safeNumber(activation.adjustment) || 0, 1) +
+    (Number.isFinite(Number(activation.adjustment)) && Number(activation.adjustment) > 0 ? '+' : '') +
+    formatNumber(Number.isFinite(Number(activation.adjustment)) ? Number(activation.adjustment) : 0, 1) +
     ' pts</strong></span>' +
     '<span class="longTermShadowNote">' +
     escapeHtml(
