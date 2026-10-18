@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.6.16.1';
+const VERSION = '0.9.6.16.3';
 
 // Core production hardening: Ask NOMAD remains intentionally disabled so the
 // conversational layer cannot interfere with the production decision path.
@@ -44,6 +44,9 @@ const VERSION = '0.9.6.16.1';
 // 0.9.6.16.1 is a deployment-safe UI-only refinement built directly from 0.9.6.15.
 // It changes staged-buy wording to BUY CONFIRMED and shows funded LIMIT-order
 // share quantity on long-term opportunity cards. Investor/Trader logic is unchanged.
+// 0.9.6.16.3 is a minimal UI-only quantity-display hotfix built from 0.9.6.16.1.
+// It only exposes the active capital-plan allocation map before rendering lower
+// opportunity cards, so funded Priority 1 cards can repeat the exact share count.
 // 0.9.6.15 adds a Long-Term Final Verdict + Exit Intelligence layer without
 // rewriting the stable Investor/Trader scoring engines. It translates the existing
 // scores into clear BUY/STAGED BUY/HOLD/WAIT/REVIEW/REDUCE/EXIT verdicts, monitors
@@ -59452,6 +59455,18 @@ function renderShadowDecision(
     )
       ? result.allocations
       : [];
+
+  // 0.9.6.16.3: expose the active capital-plan allocation to the lower
+  // opportunity cards so funded Priority 1 names repeat the exact share count.
+  decisionFundedAllocationBySymbol =
+    new Map(
+      allocations
+        .filter(item => item?.symbol)
+        .map(item => [
+          String(item.symbol).trim().toUpperCase(),
+          item
+        ])
+    );
 
   const executionCeilings = {};
   for (const allocation of allocations) {
