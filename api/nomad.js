@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.6.16.3';
+const VERSION = '0.9.6.16.4';
 
 // Core production hardening: Ask NOMAD remains intentionally disabled so the
 // conversational layer cannot interfere with the production decision path.
@@ -47,6 +47,10 @@ const VERSION = '0.9.6.16.3';
 // 0.9.6.16.3 is a minimal UI-only quantity-display hotfix built from 0.9.6.16.1.
 // It only exposes the active capital-plan allocation map before rendering lower
 // opportunity cards, so funded Priority 1 cards can repeat the exact share count.
+// 0.9.6.16.4 restores portfolio Today P&L when Market Watch LDCP is missing:
+// derive the previous close strictly from canonical Official PSX session price
+// and change percentage. Missing official evidence displays unavailable, not zero.
+// Investor/Trader logic, allocation, MAX BUY and existing cost basis are unchanged.
 // 0.9.6.15 adds a Long-Term Final Verdict + Exit Intelligence layer without
 // rewriting the stable Investor/Trader scoring engines. It translates the existing
 // scores into clear BUY/STAGED BUY/HOLD/WAIT/REVIEW/REDUCE/EXIT verdicts, monitors
@@ -19631,6 +19635,32 @@ async function getPortfolioIntradayChart() {
   };
 }
 
+function portfolioOfficialPreviousClose(marketRow, currentPrice) {
+  // Prefer the explicit prior close from Official PSX Market Watch when valid.
+  const marketWatchClose = safeNumber(marketRow?.previousClose);
+  if (marketWatchClose !== null && marketWatchClose > 0) {
+    return marketWatchClose;
+  }
+
+  // Official PSX screener / Market Watch session change is the safe fallback.
+  // Never substitute pyPSX's secondary daily percentage into portfolio P&L.
+  const officialPrice = safeNumber(marketRow?.canonicalMarketPrice);
+  const officialChangePct = safeNumber(marketRow?.canonicalDayChangePct);
+  if (
+    currentPrice === null || currentPrice <= 0 ||
+    officialPrice === null || officialPrice <= 0 ||
+    Math.abs(currentPrice - officialPrice) > 0.0001 ||
+    officialChangePct === null || officialChangePct <= -100
+  ) {
+    return null;
+  }
+
+  const previousClose = officialPrice / (1 + officialChangePct / 100);
+  return Number.isFinite(previousClose) && previousClose > 0
+    ? previousClose
+    : null;
+}
+
 async function getPortfolioSnapshot() {
   const [
     holdingsResult,
@@ -20005,8 +20035,9 @@ async function getPortfolioSnapshot() {
         : null;
 
     const previousClose =
-      safeNumber(
-        marketRow?.previousClose
+      portfolioOfficialPreviousClose(
+        marketRow,
+        currentPrice
       );
 
     const openedToday =
@@ -20237,12 +20268,19 @@ async function getPortfolioSnapshot() {
         100
       : null;
 
+  // Do not show a false zero if one or more owned positions lack an
+  // official daily reference price. A partial total would be misleading.
+  if (enriched.some(item => item.dayPnl === null)) {
+    summary.dayPnl = null;
+  }
+
   const previousValue =
-    summary.currentValue -
-    summary.dayPnl;
+    summary.dayPnl === null
+      ? null
+      : summary.currentValue - summary.dayPnl;
 
   summary.dayPnlPct =
-    previousValue > 0
+    previousValue !== null && previousValue > 0
       ? summary.dayPnl /
         previousValue *
         100
@@ -46637,6 +46675,18 @@ function renderMarketBreadth(
     );
 }
 
+function portfolioTodayPnlText(summary) {
+  if (
+    summary?.dayPnl === null || summary?.dayPnl === undefined ||
+    summary?.dayPnlPct === null || summary?.dayPnlPct === undefined
+  ) {
+    return 'Unavailable';
+  }
+  return portfolioMoney(summary.dayPnl) + ' · ' +
+    (Number(summary.dayPnlPct) > 0 ? '+' : '') +
+    formatNumber(summary.dayPnlPct, 2) + '%';
+}
+
 function portfolioMoney(
   value
 ) {
@@ -47069,22 +47119,8 @@ function renderPortfolioFull(
       summary.dayPnlPct
     ) +
     '">' +
-    portfolioMoney(
-      summary.dayPnl
-    ) +
-    ' · ' +
-    (
-      Number(
-        summary.dayPnlPct
-      ) > 0
-        ? '+'
-        : ''
-    ) +
-    formatNumber(
-      summary.dayPnlPct,
-      2
-    ) +
-    '%</strong></div>' +
+    portfolioTodayPnlText(summary) +
+    '</strong></div>' +
     '<div class="portfolioMetric"><span>Unrealized P&amp;L</span><strong class="' +
     percentClass(
       summary.totalPnlPct
@@ -47617,22 +47653,8 @@ function renderPortfolioSnapshot(
     '<div class="portfolioMetric"><span>Today / session</span><strong class="' +
     dayClass +
     '">' +
-    portfolioMoney(
-      summary.dayPnl
-    ) +
-    ' · ' +
-    (
-      Number(
-        summary.dayPnlPct
-      ) > 0
-        ? '+'
-        : ''
-    ) +
-    formatNumber(
-      summary.dayPnlPct,
-      2
-    ) +
-    '%</strong></div>' +
+    portfolioTodayPnlText(summary) +
+    '</strong></div>' +
     '<div class="portfolioMetric"><span>Total P&amp;L</span><strong class="' +
     totalClass +
     '">' +
