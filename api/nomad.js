@@ -9,8 +9,11 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.6.16.5';
+const VERSION = '0.9.6.16.6';
 
+// 0.9.6.16.6 keeps the decision engines frozen and automates intelligence
+// refresh when Home is open, supports unattended Vercel Cron, preserves
+// historical context across rotating scans and hides old change alerts.
 // Core production hardening: Ask NOMAD remains intentionally disabled so the
 // conversational layer cannot interfere with the production decision path.
 // 0.9.6.8 hardens the execution-to-allocation handoff: only an execution state
@@ -95,6 +98,10 @@ const NOMAD_SCANNER_SECRET =
     process.env.NOMAD_SCANNER_SECRET ||
     ''
   ).trim();
+
+// Vercel Cron sends CRON_SECRET as a Bearer token. Never expose it to the client.
+const NOMAD_CRON_SECRET =
+  String(process.env.CRON_SECRET || '').trim();
 
 const PSX_API_BASE =
   process.env.PSX_API_BASE ||
@@ -37402,7 +37409,8 @@ function runDecisionEngineSelfTests() {
 
 function scannerSecretConfigured() {
   return Boolean(
-    NOMAD_SCANNER_SECRET
+    NOMAD_SCANNER_SECRET ||
+    NOMAD_CRON_SECRET
   );
 }
 
@@ -37447,10 +37455,9 @@ function scannerRequestAuthorized(
 
   return Boolean(
     supplied &&
-    safeEqual(
-      supplied,
-      NOMAD_SCANNER_SECRET
-    )
+    [NOMAD_SCANNER_SECRET, NOMAD_CRON_SECRET]
+      .filter(Boolean)
+      .some(secret => safeEqual(supplied, secret))
   );
 }
 
@@ -37637,7 +37644,16 @@ function buildScannerSecurityState(
       roundMemoryNumber(
         scanChangePct,
         4
-      )
+      ),
+    // Preserve previously fetched history for symbols not in this scan's
+    // small rotation batch. Old scans inadvertently wiped this context.
+    ...(previous?.market_state?.historicalContext
+      ? {
+          historicalContext: previous.market_state.historicalContext,
+          historicalContextUpdatedAt:
+            previous.market_state.historicalContextUpdatedAt || null
+        }
+      : {})
   };
 
   const state = {
@@ -38256,8 +38272,8 @@ async function runMarketSnapshotScan(
           state.market_state ||
           {}
         ),
-        historicalContext:
-          item.context
+        historicalContext: item.context,
+        historicalContextUpdatedAt: evaluatedAt
       };
 
       state.state_hash =
@@ -38378,6 +38394,54 @@ async function runMarketSnapshotScan(
 
     throw error;
   }
+}
+
+// Browser-triggered and scheduled scans share this freshness guard. Manual
+// scans remain available. Database checks protect against routine duplicates
+// across serverless instances (simultaneous first hits are still best-effort).
+async function runAutomaticMarketSnapshotScan(runType = 'automatic') {
+  if (!continuousMemoryConfigured()) {
+    bad('Continuous intelligence database is not configured.', 503);
+  }
+  const recent = await supabaseRest(
+    'intelligence_runs?select=id,run_type,status,started_at,completed_at,metadata&order=started_at.desc&limit=12'
+  );
+  const latest = (Array.isArray(recent) ? recent : [])
+    .find(item => item?.metadata?.scanner === 'CORE_EQUITY_MARKET_SNAPSHOT');
+  const now = Date.now();
+  const started = Date.parse(latest?.started_at || '') || 0;
+  const completed = Date.parse(latest?.completed_at || '') || 0;
+  if (latest?.status === 'running' && now - started < 25 * 60 * 1000) {
+    return {status:'SKIPPED', reason:'SCAN_ALREADY_RUNNING', runId:latest.id};
+  }
+  // Karachi has UTC+05 year-round. A weekday after-close scan should run
+  // only once after the PSX close; when trading, run at most hourly.
+  const karachiNow = new Date(now + 5 * 60 * 60 * 1000);
+  const dow = karachiNow.getUTCDay();
+  const minuteOfDay = karachiNow.getUTCHours() * 60 + karachiNow.getUTCMinutes();
+  const workday = dow >= 1 && dow <= 5;
+  const openWindow = workday && minuteOfDay >= 9 * 60 + 30 && minuteOfDay < 15 * 60 + 45;
+  const afterCloseWindow = workday && minuteOfDay >= 15 * 60 + 45 && minuteOfDay < 20 * 60;
+  if (completed) {
+    const age = now - completed;
+    const localCompleted = new Date(completed + 5 * 60 * 60 * 1000);
+    const sameKarachiDay = karachiNow.toISOString().slice(0, 10) ===
+      localCompleted.toISOString().slice(0, 10);
+    const completedMinute = localCompleted.getUTCHours() * 60 + localCompleted.getUTCMinutes();
+    if (openWindow && age < 60 * 60 * 1000) {
+      return {status:'SKIPPED', reason:'RECENT_OPEN_SCAN', runId:latest.id};
+    }
+    if (afterCloseWindow && sameKarachiDay && completedMinute >= 15 * 60 + 45) {
+      return {status:'SKIPPED', reason:'AFTER_CLOSE_ALREADY_SCANNED', runId:latest.id};
+    }
+    if (!openWindow && !afterCloseWindow && age < 18 * 60 * 60 * 1000) {
+      return {status:'SKIPPED', reason:'SESSION_ALREADY_CAPTURED', runId:latest.id};
+    }
+  }
+  if (!openWindow && !afterCloseWindow) {
+    return {status:'SKIPPED', reason:'OUTSIDE_MARKET_SCAN_WINDOW', runId:latest?.id || null};
+  }
+  return runMarketSnapshotScan(runType);
 }
 
 function buildMarketPulseFromRows(
@@ -38583,15 +38647,10 @@ async function getIntelligenceFeed() {
         ? changes
         : []
     )
-      .filter(
-        item =>
-          [
-            'medium',
-            'high',
-            'critical'
-          ].includes(
-            item.significance
-          )
+      .filter(item =>
+        ['medium','high','critical'].includes(item.significance) &&
+        Number.isFinite(Date.parse(item.detected_at)) &&
+        Date.now() - Date.parse(item.detected_at) <= 72 * 60 * 60 * 1000
       )
       .slice(0, 20);
 
@@ -38787,6 +38846,11 @@ async function getIntelligenceFeed() {
     configured: true,
     scannerSecretConfigured:
       scannerSecretConfigured(),
+    scheduledScanEnabledBySecret: Boolean(NOMAD_CRON_SECRET),
+    latestScheduledRun:
+      (Array.isArray(runs) ? runs : []).find(
+        run => run.run_type === 'scheduled' && run?.metadata?.scanner === 'CORE_EQUITY_MARKET_SNAPSHOT'
+      ) || null,
     latestRun:
       Array.isArray(runs) &&
       runs.length
@@ -39080,6 +39144,13 @@ async function handler(
     }
 
     if (
+      request.method === 'GET' &&
+      action === 'intelligence-scan-auto'
+    ) {
+      return sendJSON(response, await runAutomaticMarketSnapshotScan('automatic'));
+    }
+
+    if (
       request.method ===
         'GET' &&
       action ===
@@ -39103,11 +39174,9 @@ async function handler(
     ) {
       return sendJSON(
         response,
-        await runMarketSnapshotScan(
-          scannerAuthorized
-            ? 'scheduled'
-            : 'manual'
-        )
+        scannerAuthorized
+          ? await runAutomaticMarketSnapshotScan('scheduled')
+          : await runMarketSnapshotScan('manual')
       );
     }
 
@@ -44788,7 +44857,7 @@ Checking connection...
 <div class="marketRibbon">
 <div class="ribbonMetric"><span>Core monitored</span><strong id="homeStateCoverage">0 / ${PSX_UNIVERSE_MASTER.summary.coreEquity}</strong></div>
 <div class="ribbonMetric"><span>Historical context</span><strong id="homeHistoryCoverage">0 / ${PSX_UNIVERSE_MASTER.summary.coreEquity}</strong></div>
-<div class="ribbonMetric"><span>Last scan</span><strong id="homeLastScan">Waiting</strong></div>
+<div class="ribbonMetric"><span>Intelligence scan</span><strong id="homeLastScan">Checking...</strong></div>
 <div class="ribbonMetric"><span>Portfolio</span><strong id="homePortfolioCount">Not added</strong></div>
 </div>
 
@@ -45235,7 +45304,7 @@ NOMAD now uses a frozen, versioned security master for identity and recommendati
 <div class="summaryGrid">
 <div class="metric"><div class="metricLabel">Core universe</div><div class="metricValue">${PSX_UNIVERSE_MASTER.summary.coreEquity}</div></div>
 <div class="metric"><div class="metricLabel">Scanner</div><div id="scannerSystemState" class="metricValue">Ready</div><div class="metricSub">Market + rotating historical context</div></div>
-<div class="metric"><div class="metricLabel">Autonomous schedule</div><div id="scannerScheduleState" class="metricValue">Pending</div><div class="metricSub">Configured separately after scan verification</div></div>
+<div class="metric"><div class="metricLabel">Autonomous schedule</div><div id="scannerScheduleState" class="metricValue">Checking</div><div class="metricSub">While Home is open: hourly during trading. Unattended scans require Vercel Cron.</div></div>
 </div>
 
 <div class="actions"><button id="runIntelligenceScan">Refresh market + context now</button></div>
@@ -45676,6 +45745,46 @@ let liveRefreshTimer = null;
 let portfolioRefreshTimer = null;
 let exploreRefreshTimer = null;
 let homeRefreshTimer = null;
+let homeAutoScanInFlight = false;
+let homeAutoScanLastAttemptAt = 0;
+
+function maybeRunHomeAutoScan(feed) {
+  if (homeAutoScanInFlight || !continuousHomeAutoScanWindow()) return;
+  if (Date.now() - homeAutoScanLastAttemptAt < 15 * 60 * 1000) return;
+  const run = feed?.latestRun;
+  const age = Date.now() - (Date.parse(run?.completed_at || run?.started_at || '') || 0);
+  const marketOpen = feed?.marketPulse?.marketStatus?.isOpen === true;
+  const karachiNow = new Date(Date.now() + 5 * 60 * 60 * 1000);
+  const today = karachiNow.toISOString().slice(0, 10);
+  const last = new Date(Date.parse(run?.completed_at || run?.started_at || 0) + 5 * 60 * 60 * 1000);
+  const scannedToday = last.toISOString().slice(0, 10) === today;
+  const closeMinutes = last.getUTCHours() * 60 + last.getUTCMinutes();
+  const nowMinutes = karachiNow.getUTCHours() * 60 + karachiNow.getUTCMinutes();
+  const stale = !run || (marketOpen && age > 60 * 60 * 1000) ||
+    (!marketOpen && nowMinutes >= 15 * 60 + 45 &&
+      (!scannedToday || closeMinutes < 15 * 60 + 45));
+  if (!stale) return;
+  homeAutoScanLastAttemptAt = Date.now();
+  homeAutoScanInFlight = true;
+  if ($('homeLastScan')) $('homeLastScan').textContent = 'Updating...';
+  api('intelligence-scan-auto')
+    .then(() => loadDecisionCenter())
+    .catch(error => {
+      if ($('homeLastScan')) $('homeLastScan').textContent = 'Auto scan unavailable';
+      if ($('homeLastScanMeta')) $('homeLastScanMeta').textContent =
+        'Previous intelligence remains visible. ' + String(error.message || 'Scan failed');
+    })
+    .finally(() => { homeAutoScanInFlight = false; });
+}
+
+function continuousHomeAutoScanWindow() {
+  if (document.visibilityState !== 'visible' ||
+      !document.querySelector('[data-page="home"].active')) return false;
+  const now = new Date(Date.now() + 5 * 60 * 60 * 1000);
+  const day = now.getUTCDay();
+  const mins = now.getUTCHours() * 60 + now.getUTCMinutes();
+  return day >= 1 && day <= 5 && mins >= 9 * 60 + 30 && mins < 20 * 60;
+}
 let decisionTriggerRefreshTimer = null;
 let exploreRefreshInFlight = false;
 let explorePreviousPrices = new Map();
@@ -48306,12 +48415,15 @@ async function loadDecisionCenter() {
     }
 
     if ($('scannerScheduleState')) {
-      $('scannerScheduleState')
-        .textContent =
-          result.scannerSecretConfigured
-            ? 'Ready to schedule'
-            : 'Secret not configured';
+      $('scannerScheduleState').textContent = result.latestScheduledRun
+        ? result.latestScheduledRun.status === 'running'
+          ? 'Scheduled scan running'
+          : 'Last scheduled: ' + relativeTime(result.latestScheduledRun.completed_at || result.latestScheduledRun.started_at)
+        : result.scheduledScanEnabledBySecret
+          ? 'Cron credentials set; verify schedule in Vercel'
+          : 'Home auto-refresh active; background schedule not configured';
     }
+    maybeRunHomeAutoScan(result);
   } catch (error) {
     if ($('attentionFeed')) {
       $('attentionFeed')
