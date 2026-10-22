@@ -9,7 +9,7 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.6.16.4';
+const VERSION = '0.9.6.16.5';
 
 // Core production hardening: Ask NOMAD remains intentionally disabled so the
 // conversational layer cannot interfere with the production decision path.
@@ -44,6 +44,10 @@ const VERSION = '0.9.6.16.4';
 // 0.9.6.16.1 is a deployment-safe UI-only refinement built directly from 0.9.6.15.
 // It changes staged-buy wording to BUY CONFIRMED and shows funded LIMIT-order
 // share quantity on long-term opportunity cards. Investor/Trader logic is unchanged.
+// 0.9.6.16.5 adds advisory long-term Suggested Limit Price for funded orders.
+// It uses fresh historical ATR / nearby support when available; never changes
+// MAX BUY, legacy limitPrice, quantity, allocation, brain, PSX price, or Trader.
+// If execution evidence is missing or stale, no suggested bid is invented.
 // 0.9.6.16.3 is a minimal UI-only quantity-display hotfix built from 0.9.6.16.1.
 // It only exposes the active capital-plan allocation map before rendering lower
 // opportunity cards, so funded Priority 1 cards can repeat the exact share count.
@@ -24175,6 +24179,104 @@ function decisionTraderPlanPriceState(
   };
 }
 
+// 0.9.6.16.5: advisory entry price only. This is deliberately not an
+// allocation input, a new order trigger or a replacement for MAX BUY.
+// History supports the preference; the official PSX quote remains the anchor.
+function decisionSuggestedLongTermLimit(
+  candidate,
+  referencePrice,
+  maxBuyPrice
+) {
+  const unavailable = reason => ({
+    suggestedLimitPrice: null,
+    suggestedLimitStatus: 'UNAVAILABLE',
+    suggestedLimitMethod: null,
+    suggestedLimitReason: reason
+  });
+
+  const current = safeNumber(referencePrice);
+  const ceiling = safeNumber(maxBuyPrice);
+  if (
+    current === null || current <= 0 ||
+    ceiling === null || ceiling <= 0 ||
+    current > ceiling
+  ) {
+    return unavailable('Current official price or approved MAX BUY is unavailable.');
+  }
+
+  const marketAsOf = Date.parse(candidate?.marketAsOf || '');
+  const marketAgeDays = (Date.now() - marketAsOf) / 86400000;
+  if (
+    !Number.isFinite(marketAgeDays) ||
+    marketAgeDays < -1 || marketAgeDays > 4
+  ) {
+    return unavailable('The official market reference is stale or undated.');
+  }
+
+  const history = candidate?.historicalContext || {};
+  const action = history.priceAction || {};
+  const atr = safeNumber(action.atr14);
+  const sessions = safeNumber(history.validSessions);
+  if (
+    history.available !== true ||
+    action.available !== true ||
+    sessions === null || sessions < 30 ||
+    atr === null || atr <= 0
+  ) {
+    return unavailable('Reliable recent ATR history is not available.');
+  }
+
+  const historyDate = String(history.asOf || action.asOf || '').slice(0, 10);
+  const historyTime = /^\d{4}-\d{2}-\d{2}$/.test(historyDate)
+    ? Date.parse(historyDate + 'T00:00:00+05:00')
+    : NaN;
+  const ageDays = (Date.now() - historyTime) / 86400000;
+  if (!Number.isFinite(ageDays) || ageDays < -1 || ageDays > 8) {
+    return unavailable('Historical entry evidence is stale or undated.');
+  }
+
+  // Reject malformed/extreme ATR rather than creating a false sense of precision.
+  const atrPct = atr / current * 100;
+  if (atrPct < 0.10 || atrPct > 15) {
+    return unavailable('Recent volatility is outside the reliable execution range.');
+  }
+
+  // Look for a small pullback, never a chase. Discount is bounded between
+  // 0.15% and 0.75% of the canonical price even for high-volatility stocks.
+  const discountPct = decisionClamp(atrPct * 0.20, 0.15, 0.75);
+  let preferred = current * (1 - discountPct / 100);
+  let method = 'ATR_PULLBACK';
+  const support = safeNumber(action.support);
+  if (
+    support !== null && support > 0 && support < current &&
+    Math.abs(support - preferred) <= atr * 0.35
+  ) {
+    // A nearby technical support may improve the limit; never lift the bid.
+    const supportBid = support * 1.001;
+    if (supportBid < preferred) {
+      preferred = supportBid;
+      method = 'ATR_NEAR_SUPPORT';
+    }
+  }
+
+  // Downward two-decimal rounding is intentional: a preferred bid cannot
+  // accidentally be rounded above current/reference price or MAX BUY.
+  const suggested = Math.floor((Math.min(preferred, current, ceiling) + 1e-8) * 100) / 100;
+  if (suggested <= 0 || suggested >= current || suggested > ceiling) {
+    return unavailable('No distinct executable bid is supported by the available precision.');
+  }
+
+  return {
+    suggestedLimitPrice: suggested,
+    suggestedLimitStatus: 'AVAILABLE',
+    suggestedLimitMethod: method,
+    suggestedLimitReason:
+      method === 'ATR_NEAR_SUPPORT'
+        ? 'Preferred limit uses recent volatility and nearby historical support; execution is not guaranteed.'
+        : 'Preferred limit uses a bounded recent-volatility pullback; execution is not guaranteed.'
+  };
+}
+
 function decisionExecutionGuidance(
   candidate,
   riskPolicy
@@ -24700,6 +24802,8 @@ function decisionExecutionGuidance(
     limitPrice:
       maxAcceptablePrice,
     maxAcceptablePrice,
+    // Advisory only: preserve legacy limitPrice/MAX BUY semantics and sizing.
+    ...decisionSuggestedLongTermLimit(candidate, currentPrice, maxAcceptablePrice),
     maxChasePct,
     reason:
       extensionState === 'HIGH' ||
@@ -36306,6 +36410,35 @@ function runDecisionEngineSelfTests() {
     );
   }
 
+  // 0.9.6.16.5: the execution suggestion is advisory and evidence-gated.
+  const suggestionFixture = {
+    marketAsOf: new Date().toISOString(),
+    historicalContext: {
+      available: true,
+      validSessions: 90,
+      asOf: new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Karachi', year: 'numeric', month: '2-digit', day: '2-digit'
+      }).format(new Date()),
+      priceAction: { available: true, atr14: 2.5, support: 99.0 }
+    }
+  };
+  const suggestedExecution = decisionSuggestedLongTermLimit(suggestionFixture, 100, 101);
+  assert.equal(suggestedExecution.suggestedLimitStatus, 'AVAILABLE');
+  assert.ok(suggestedExecution.suggestedLimitPrice < 100);
+  assert.ok(suggestedExecution.suggestedLimitPrice <= 101);
+  assert.equal(decisionSuggestedLongTermLimit({ historicalContext: {} }, 100, 101).suggestedLimitPrice, null);
+  assert.equal(decisionSuggestedLongTermLimit({
+    ...suggestionFixture, marketAsOf: '2020-01-01T09:30:00+05:00'
+  }, 100, 101).suggestedLimitPrice, null);
+  assert.equal(decisionSuggestedLongTermLimit(suggestionFixture, 102, 101).suggestedLimitPrice, null);
+  assert.equal(
+    decisionSuggestedLongTermLimit({ historicalContext: {
+      ...suggestionFixture.historicalContext, asOf: '2020-01-01'
+    } }, 100, 101).suggestedLimitPrice,
+    null
+  );
+  assert.ok(decisionSuggestedLongTermLimit(suggestionFixture, 100, 101).suggestedLimitPrice <= 101);
+
   const shortTermAllocationCandidate = {
     ...longTermProfessionalCandidate,
     symbol: 'TRADER1',
@@ -41531,6 +41664,79 @@ tbody tr:hover {
   font-size:9px;
   font-style:normal;
   font-weight:700;
+}
+/* 0.9.6.16.5: compact advisory Suggested Limit; MAX BUY remains the hard cap. */
+.executionGuideLine.executionActionable.hasSuggested {
+  display:grid;
+  grid-template-columns:repeat(2,minmax(0,1fr));
+  gap:7px;
+}
+.executionGuideLine.hasSuggested .executionGuideAction { grid-column:1/-1; }
+.executionGuideLine.hasSuggested .executionLimitBox {
+  margin-left:0;
+  min-width:0;
+  width:auto;
+}
+.executionGuideLine.hasSuggested .executionSuggestedLimit {
+  min-width:0;
+  width:auto;
+}
+@media (max-width:440px) {
+  .executionGuideLine.executionActionable.hasSuggested {grid-template-columns:1fr;}
+  .executionGuideLine.hasSuggested .executionGuideAction {grid-column:auto;}
+}
+.executionSuggestedLimit {
+  flex:1 1 150px;
+  min-width:125px;
+  padding:6px 9px;
+  border:1px solid rgba(52,211,153,.28);
+  border-radius:7px;
+  background:rgba(52,211,153,.035);
+}
+.executionSuggestedLimit span,
+.allocationSuggestedLimit span {
+  display:block;
+  color:#74e0b2;
+  font-size:9px;
+  font-weight:800;
+  letter-spacing:.06em;
+}
+.executionSuggestedLimit strong {
+  display:block;
+  margin-top:2px;
+  font-size:16px;
+  color:#c5f6dd !important;
+}
+.executionSuggestedLimit small {
+  display:block;
+  margin-top:3px;
+  color:#8ca5af;
+  font-size:9px;
+}
+.allocationSuggestedLimit {
+  min-width:116px;
+  padding:6px 8px;
+  border:1px solid rgba(52,211,153,.26);
+  border-radius:6px;
+  background:rgba(52,211,153,.035);
+  text-align:right;
+}
+.allocationSuggestedLimit strong {
+  display:block;
+  color:#c5f6dd;
+  font-size:13px;
+  margin-top:2px;
+}
+.allocationSuggestedLimit em {
+  display:block;
+  margin-top:2px;
+  color:#9fb7ac;
+  font-size:8px;
+  font-style:normal;
+}
+@media (max-width:760px) {
+  .executionSuggestedLimit { width:100%; min-width:0; }
+  .allocationSuggestedLimit { text-align:left; }
 }
 .allocationActionStack {
   display:flex;
@@ -57537,6 +57743,26 @@ function renderOpportunityList(
                           : longTermOrderLabel
                       ) +
                       '</span></div>' +
+                      (
+                        !isShortTerm && fundedShares > 0
+                          ? '<div class="executionSuggestedLimit"><span>SUGGESTED LIMIT</span><strong>' +
+                            (
+                              Number.isFinite(Number(executionGuidance.suggestedLimitPrice)) &&
+                              Number(executionGuidance.suggestedLimitPrice) > 0
+                                ? 'PKR ' + formatNumber(executionGuidance.suggestedLimitPrice, 2)
+                                : 'Unavailable'
+                            ) +
+                            '</strong><small>Current PKR ' +
+                            formatNumber(executionGuidance.referencePrice, 2) +
+                            ' · ' +
+                            escapeHtml(
+                              executionGuidance.suggestedLimitStatus === 'AVAILABLE'
+                                ? 'Preferred bid, fill not guaranteed'
+                                : 'Do not use MAX BUY as the bid'
+                            ) +
+                            '</small></div>'
+                          : ''
+                      ) +
                       '<div class="executionLimitBox"><span>MAX BUY PRICE</span><strong>PKR ' +
                       formatNumber(
                         executionGuidance.maxAcceptablePrice,
@@ -59855,7 +60081,7 @@ function renderShadowDecision(
                   item.executionGuidance.orderType === 'LIMIT' &&
                   item.executionGuidance.maxAcceptablePrice !== null &&
                   item.executionGuidance.maxAcceptablePrice !== undefined
-                    ? ' · LIMIT ≤ PKR ' +
+                    ? ' · ' + (result?.input?.horizon === 'long_term' ? 'MAX BUY ≤ PKR ' : 'LIMIT ≤ PKR ') +
                       formatNumber(
                         item.executionGuidance.maxAcceptablePrice,
                         2
@@ -59928,6 +60154,25 @@ function renderShadowDecision(
             )
           ) +
           '</div>' +
+          (
+            result?.input?.horizon === 'long_term' &&
+            item.executionGuidance?.orderType === 'LIMIT' &&
+            Number(item.shares) > 0
+              ? '<div class="allocationSuggestedLimit"><span>SUGGESTED LIMIT</span><strong>' +
+                (
+                  Number.isFinite(Number(item.executionGuidance.suggestedLimitPrice)) &&
+                  Number(item.executionGuidance.suggestedLimitPrice) > 0
+                    ? 'PKR ' + formatNumber(item.executionGuidance.suggestedLimitPrice, 2)
+                    : 'Unavailable'
+                ) +
+                '</strong><em>' +
+                escapeHtml(
+                  item.executionGuidance.suggestedLimitStatus === 'AVAILABLE'
+                    ? 'Preferred bid · not guaranteed'
+                    : 'MAX BUY is not the bid'
+                ) + '</em></div>'
+              : ''
+          ) +
           (
             item.executionGuidance?.orderType === 'LIMIT' &&
             item.executionGuidance?.maxAcceptablePrice !== null &&
