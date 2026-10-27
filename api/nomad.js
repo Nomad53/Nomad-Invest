@@ -9,9 +9,14 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.6.16.6';
+const VERSION = '0.9.6.16.8';
 
-// 0.9.6.16.6 keeps the decision engines frozen and automates intelligence
+// 0.9.6.16.8 adds a non-ranking Trader execution safety veto when an
+// official PSX session low crosses the proposed trade stop, and clarifies that
+// individual stock verdicts are not funded capital-plan orders. The scan
+// schedule improvements from 0.9.6.16.7 are retained. No Investor logic,
+// ranking, allocation, portfolio accounting, or PSX price hierarchy changed.
+// 0.9.6.16.7 keeps the decision engines frozen and enables daily intelligence
 // refresh when Home is open, supports unattended Vercel Cron, preserves
 // historical context across rotating scans and hides old change alerts.
 // Core production hardening: Ask NOMAD remains intentionally disabled so the
@@ -24186,6 +24191,39 @@ function decisionTraderPlanPriceState(
   };
 }
 
+// 0.9.6.16.8: execution-only session safety, no scoring/ranking effect.
+// An intraday OHLC low does not reveal whether a stop breach happened before
+ // or after a recovery/breakout. Hold a fresh buy rather than assume the order
+ // was safe. The next session must produce fresh trade evidence to requalify.
+function decisionTraderSessionStopCheck(candidate, plan) {
+  const stop = safeNumber(plan?.stop);
+  const low = safeNumber(candidate?.officialSessionLow);
+  const rawTime = String(candidate?.officialSessionAsOf || '');
+  const time = Date.parse(rawTime);
+  if (plan?.complete !== true || stop === null || stop <= 0) {
+    return { state: 'NOT_APPLICABLE', blockNewBuy: false, low, stop };
+  }
+  if (low === null || low <= 0 || !Number.isFinite(time)) {
+    return { state: 'UNVERIFIED', blockNewBuy: false, low, stop };
+  }
+  // PSX official session quotes may remain the latest completed session on
+  // holidays/weekends. Avoid treating very old lows as a new live stop event.
+  const age = (Date.now() - time) / 86400000;
+  if (age < -1 || age > 4) {
+    return { state: 'STALE', blockNewBuy: false, low, stop };
+  }
+  if (low <= stop) {
+    return {
+      state: 'SESSION_STOP_BREACH', blockNewBuy: true, low, stop,
+      reason: 'Official PSX session low PKR ' + decisionRound(low, 2) +
+        ' crossed the proposed stop PKR ' + decisionRound(stop, 2) +
+        '. The available OHLC data does not establish the sequence of the ' +
+        'breach and recovery. NO NEW BUY until a fresh session/setup confirms entry.'
+    };
+  }
+  return { state: 'CLEAR', blockNewBuy: false, low, stop };
+}
+
 // 0.9.6.16.5: advisory entry price only. This is deliberately not an
 // allocation input, a new order trigger or a replacement for MAX BUY.
 // History supports the preference; the official PSX quote remains the anchor.
@@ -24371,6 +24409,17 @@ function decisionExecutionGuidance(
 
     const plan =
       selection.plan;
+
+    const sessionStopCheck = decisionTraderSessionStopCheck(candidate, plan);
+    if (sessionStopCheck.blockNewBuy) {
+      return {
+        horizon: 'short_term', status: 'WAIT_FOR_RECONFIRMATION',
+        action: 'WAIT', orderType: null,
+        referencePrice: decisionRound(currentPrice, 2),
+        limitPrice: null, maxAcceptablePrice: null,
+        sessionStopCheck, reason: sessionStopCheck.reason
+      };
+    }
 
     if (!plan?.complete) {
       return {
@@ -24925,6 +24974,7 @@ function professionalShortTermView(
   const activePlanOpen =
     activePlanPriceState.state === 'OPEN' ||
     activePlanPriceState.state === 'UNKNOWN';
+  const sessionStopCheck = decisionTraderSessionStopCheck(candidate, tradePlan);
 
   // 0.9.5.0: short-term ranking is deliberately execution-first. Long-term
   // valuation/fundamental weights do not leak into the Trader brain.
@@ -25009,6 +25059,17 @@ function professionalShortTermView(
   const definedTradePlan =
     tradePlan?.complete === true &&
     rewardRisk !== null;
+
+  if (sessionStopCheck.blockNewBuy) {
+    return {
+      framework: 'SHORT_TERM_TRADER', thesisStatus: 'SESSION_STOP_BREACH',
+      timingScore, timingState: priceAction.timingState, setup, setupFamily,
+      rewardRisk, riskScore, riskState: professionalRiskState(riskScore),
+      rankingScore, technicalEvidence: traderEvidence, tradePlan,
+      conditionalTradePlan, sessionStopCheck, marketAction: 'WATCH',
+      opportunityTier: 'PRIORITY_2', reason: sessionStopCheck.reason
+    };
+  }
 
   const actionableSetup =
     (
@@ -28486,6 +28547,14 @@ function shortTermProfileExecutionDecision(
   const currentPlanOpen =
     currentPlanPriceState.state === 'OPEN' ||
     currentPlanPriceState.state === 'UNKNOWN';
+  const sessionStopCheck = decisionTraderSessionStopCheck(candidate, currentPlan);
+  if (sessionStopCheck.blockNewBuy) {
+    return {
+      policyId: policy.id, state: 'SESSION_STOP_BREACH', action: 'PASS',
+      marketAction: 'WATCH', actionableNow: false, reservationEligible: false,
+      sizeMultiplier: 0, sessionStopCheck, reason: sessionStopCheck.reason
+    };
+  }
 
   const conditionalStopRiskPct =
     safeNumber(
@@ -32888,6 +32957,8 @@ async function runSingleStockStrategy(
         marketRow.averageVolume30d,
         0
       ),
+    officialSessionLow: safeNumber(marketRow.sessionLow),
+    officialSessionAsOf: marketRow.marketWatchAsOf || null,
     historicalContext,
     fundamental,
     analystCore:
@@ -33177,6 +33248,12 @@ async function runSingleStockStrategy(
     execution:
       candidate.executionGuidance ||
       null,
+    sessionSafety: horizon === 'short_term'
+      ? decisionTraderSessionStopCheck(candidate, strategyTraderPlan)
+      : null,
+    fundingContext: horizon === 'short_term'
+      ? 'Single-stock analysis does not allocate shares or reserve capital. The capital plan analyzes a limited ranked shortlist, then applies profile and portfolio constraints. A BUY verdict here does not mean BUY NOW in the funded plan.'
+      : null,
     evidence:
       canonical.evidence,
     financial: {
@@ -34108,6 +34185,8 @@ async function runDecisionLab(
                 item.row.averageVolume30d,
                 0
               ),
+            officialSessionLow: safeNumber(item.row.sessionLow),
+            officialSessionAsOf: item.row.marketWatchAsOf || null,
             screeningScore:
               item.screeningScore,
             historicalContext:
@@ -37397,6 +37476,63 @@ function runDecisionEngineSelfTests() {
     'EXIT_CONFIRMED must require a broken thesis plus multiple fundamental warnings; persistent price weakness only reinforces the evidence'
   );
 
+  const intradayItanzFixture = {
+    price: 37.20, officialSessionLow: 35.50,
+    officialSessionAsOf: new Date().toISOString(),
+    historicalContext: {
+      available: true, asOf: new Date().toISOString().slice(0, 10),
+      validSessions: 120,
+      priceAction: {
+        available: true, setup: 'CONFIRMED_BREAKOUT',
+        timingScore: 85, timingState: 'GOOD', atr14: 1.2,
+        support: 36.0, resistance: 39.0,
+        tradePlan: {
+          complete: true, entryLow: 37.22, entryHigh: 38.31,
+          stop: 36.27, target1: 41.80, rewardRisk: 2.7
+        }
+      }
+    }, risk: { score: 82, liquidityScore: 82 }
+  };
+  const intradayStopCheck = decisionTraderSessionStopCheck(
+    intradayItanzFixture, intradayItanzFixture.historicalContext.priceAction.tradePlan
+  );
+  assert.equal(intradayStopCheck.state, 'SESSION_STOP_BREACH',
+    'ITANZ synthetic: official 35.50 session low must block a new buy with stop 36.27');
+  assert.equal(intradayStopCheck.blockNewBuy, true,
+    'Trader must hold fresh execution after a documented session stop breach');
+  assert.equal(professionalShortTermView(intradayItanzFixture, null, {
+    framework: 'TRADER_TECHNICAL_EVIDENCE', confidence: 'HIGH', score: 90
+  }).marketAction, 'WATCH',
+    'Main and single-stock professional verdicts must both hold after an official session stop breach');
+  assert.equal(decisionTraderSessionStopCheck({
+    ...intradayItanzFixture, officialSessionLow: 36.50
+  }, intradayItanzFixture.historicalContext.priceAction.tradePlan).blockNewBuy, false,
+    'Unbreached session low must not alter Trader decisions');
+  assert.equal(decisionTraderSessionStopCheck({
+    ...intradayItanzFixture, officialSessionLow: null
+  }, intradayItanzFixture.historicalContext.priceAction.tradePlan).state, 'UNVERIFIED',
+    'Missing official low must never be fabricated');
+  assert.equal(decisionTraderSessionStopCheck({
+    ...intradayItanzFixture, officialSessionLow: 35.50,
+    officialSessionAsOf: '2020-01-01T10:00:00Z'
+  }, intradayItanzFixture.historicalContext.priceAction.tradePlan).blockNewBuy, false,
+    'Stale quote lows must not be treated as a new stop event');
+  const guardedFixture = {
+    ...intradayItanzFixture, horizon: 'short_term',
+    profileSuitability: { state: 'SUITABLE', issues: [] },
+    canonicalState: { professional: {
+      framework: 'SHORT_TERM_TRADER',
+      setup: 'CONFIRMED_BREAKOUT', marketAction: 'BUY',
+      tradePlan: intradayItanzFixture.historicalContext.priceAction.tradePlan
+    } }
+  };
+  assert.equal(decisionExecutionGuidance(guardedFixture, riskAggressive).status,
+    'WAIT_FOR_RECONFIRMATION', 'Direct stock card must not say BUY NOW after an official stop breach');
+  assert.equal(decisionExecutionGuidance(guardedFixture, riskAggressive).orderType,
+    null, 'Stop-breached stock cannot carry a limit order');
+  assert.equal(shortTermProfileExecutionDecision(guardedFixture, riskAggressive).actionableNow,
+    false, 'Aggressive profile must not override official session stop safety');
+
   console.log(
     'NOMAD Decision Engine self-tests passed.'
   );
@@ -38422,6 +38558,9 @@ async function runAutomaticMarketSnapshotScan(runType = 'automatic') {
   const workday = dow >= 1 && dow <= 5;
   const openWindow = workday && minuteOfDay >= 9 * 60 + 30 && minuteOfDay < 15 * 60 + 45;
   const afterCloseWindow = workday && minuteOfDay >= 15 * 60 + 45 && minuteOfDay < 20 * 60;
+  // Weekend refreshes update stored historical context from the most recent
+  // official PSX session. Weekend prices are NOT new trading-session prices.
+  const weekendContextWindow = !workday && minuteOfDay >= 9 * 60 + 30 && minuteOfDay < 20 * 60;
   if (completed) {
     const age = now - completed;
     const localCompleted = new Date(completed + 5 * 60 * 60 * 1000);
@@ -38434,11 +38573,14 @@ async function runAutomaticMarketSnapshotScan(runType = 'automatic') {
     if (afterCloseWindow && sameKarachiDay && completedMinute >= 15 * 60 + 45) {
       return {status:'SKIPPED', reason:'AFTER_CLOSE_ALREADY_SCANNED', runId:latest.id};
     }
-    if (!openWindow && !afterCloseWindow && age < 18 * 60 * 60 * 1000) {
+    if (weekendContextWindow && sameKarachiDay) {
+      return {status:'SKIPPED', reason:'WEEKEND_CONTEXT_ALREADY_SCANNED', runId:latest.id};
+    }
+    if (!openWindow && !afterCloseWindow && !weekendContextWindow && age < 18 * 60 * 60 * 1000) {
       return {status:'SKIPPED', reason:'SESSION_ALREADY_CAPTURED', runId:latest.id};
     }
   }
-  if (!openWindow && !afterCloseWindow) {
+  if (!openWindow && !afterCloseWindow && !weekendContextWindow) {
     return {status:'SKIPPED', reason:'OUTSIDE_MARKET_SCAN_WINDOW', runId:latest?.id || null};
   }
   return runMarketSnapshotScan(runType);
@@ -45760,8 +45902,10 @@ function maybeRunHomeAutoScan(feed) {
   const scannedToday = last.toISOString().slice(0, 10) === today;
   const closeMinutes = last.getUTCHours() * 60 + last.getUTCMinutes();
   const nowMinutes = karachiNow.getUTCHours() * 60 + karachiNow.getUTCMinutes();
+  const weekend = [0, 6].includes(karachiNow.getUTCDay());
   const stale = !run || (marketOpen && age > 60 * 60 * 1000) ||
-    (!marketOpen && nowMinutes >= 15 * 60 + 45 &&
+    (weekend && !scannedToday) ||
+    (!weekend && !marketOpen && nowMinutes >= 15 * 60 + 45 &&
       (!scannedToday || closeMinutes < 15 * 60 + 45));
   if (!stale) return;
   homeAutoScanLastAttemptAt = Date.now();
@@ -45783,7 +45927,8 @@ function continuousHomeAutoScanWindow() {
   const now = new Date(Date.now() + 5 * 60 * 60 * 1000);
   const day = now.getUTCDay();
   const mins = now.getUTCHours() * 60 + now.getUTCMinutes();
-  return day >= 1 && day <= 5 && mins >= 9 * 60 + 30 && mins < 20 * 60;
+  // Allow one context refresh per weekend day, even when PSX is closed.
+  return mins >= 9 * 60 + 30 && mins < 20 * 60;
 }
 let decisionTriggerRefreshTimer = null;
 let exploreRefreshInFlight = false;
@@ -58410,6 +58555,21 @@ function renderStockStrategy(
       ) +
       '</p>' +
       '</div>';
+  }
+
+  if (isShortTerm) {
+    html += '<p class="strategyReason"><strong>Capital-plan distinction:</strong> ' +
+      escapeHtml(result?.fundingContext || 'Single-stock analysis is not a funded order.') +
+      '</p>';
+    if (result?.sessionSafety?.state === 'SESSION_STOP_BREACH') {
+      html += '<p class="strategyReason"><strong>Session stop check:</strong> ' +
+        escapeHtml(result?.sessionSafety?.reason || 'Wait for fresh confirmation.') +
+        '</p>';
+    } else if (result?.sessionSafety?.state === 'UNVERIFIED') {
+      html += '<p class="strategyReason"><strong>Session stop check:</strong> ' +
+        'Official PSX session low could not be verified for this setup. ' +
+        'Do not treat the snapshot alone as independent stop-safety confirmation.</p>';
+    }
   }
 
   html +=
