@@ -1,16 +1,9 @@
-
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "rewrites": [
-    {
-      "source": "/",
-      "destination": "/api/nomad"
-    }
+    { "source": "/", "destination": "/api/nomad" }
   ],
   "crons": [
-    {
-      "path": "/api/nomad-scan",
-      "schedule": "15 11 * * 1-5"
-    }
+    { "path": "/api/nomad-scan", "schedule": "0 5 * * *" }
   ]
 }
