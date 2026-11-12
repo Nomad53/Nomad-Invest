@@ -9,8 +9,17 @@ const PSX_UNIVERSE_BY_SYMBOL = new Map(
   (PSX_UNIVERSE_MASTER.entries || []).map(entry => [String(entry.symbol || '').trim().toUpperCase(), entry])
 );
 
-const VERSION = '0.9.6.16.8';
+const VERSION = '0.9.6.16.10';
 
+// 0.9.6.16.10: Complete Home holdings, show exact Suggested Limit
+// unavailability reasons and existing-holding funding explanations; apply
+// explicit, configurable fee-economics gate to Long-term new-money orders;
+// flag drawdowns for review without creating automatic sell verdicts.
+// Investor scores, thesis, ranking, market data, Trader logic and scanning
+// are not modified. Based on 0.9.6.16.9 with its Trader safety fixes intact.
+// 0.9.6.16.9: Short-term display always includes funded orders; unverified
+// or stale official session-low data holds new Trader BUY execution. No
+// changes to Investor logic, ranking or allocation.
 // 0.9.6.16.8 adds a non-ranking Trader execution safety veto when an
 // official PSX session low crosses the proposed trade stop, and clarifies that
 // individual stock verdicts are not funded capital-plan orders. The scan
@@ -20770,6 +20779,42 @@ const DECISION_MIN_MEANINGFUL_POSITION_PKR = 1000;
 const DECISION_MAX_MEANINGFUL_POSITION_FLOOR_PKR = 50000;
 const DECISION_MEANINGFUL_POSITION_BUDGET_PCT = 0.05;
 
+// Estimated broker costs are an execution-feasibility guard, not a return forecast.
+// Defaults are conservative approximations based on small actual tickets; users
+// should set the environment variables to their own broker tariff if different.
+// No impact on Investor scoring/ranking or the Short-term Trader.
+function decisionEstimatedBuyFeePkr() {
+  const configured = safeNumber(process.env.NOMAD_ESTIMATED_BUY_FEE_PKR);
+  return decisionRound(
+    configured !== null && configured >= 0
+      ? Math.min(1000, configured)
+      : 5.5,
+    2
+  );
+}
+
+function decisionMaximumEstimatedEntryFeePct() {
+  const configured = safeNumber(process.env.NOMAD_MAX_ESTIMATED_ENTRY_FEE_PCT);
+  return configured !== null && configured > 0 && configured <= 20
+    ? configured
+    : 2.0;
+}
+
+function decisionEntryFeeEconomics(principalPkr, feePkr = decisionEstimatedBuyFeePkr()) {
+  const principal = Math.max(0, safeNumber(principalPkr) || 0);
+  const fee = Math.max(0, safeNumber(feePkr) || 0);
+  const estimatedPct = principal > 0 ? fee / principal * 100 : null;
+  const limitPct = decisionMaximumEstimatedEntryFeePct();
+  return {
+    estimatedFeePkr: decisionRound(fee, 2),
+    estimatedFeePct: estimatedPct === null ? null : decisionRound(estimatedPct, 2),
+    maximumFeePct: limitPct,
+    requiredPrincipalPkr: fee > 0 ? decisionRound(fee / (limitPct / 100), 2) : 0,
+    passes: principal > 0 && (fee <= 0 || estimatedPct <= limitPct + 1e-8)
+  };
+}
+
+
 function decisionClamp(
   value,
   minimum = 0,
@@ -24204,13 +24249,22 @@ function decisionTraderSessionStopCheck(candidate, plan) {
     return { state: 'NOT_APPLICABLE', blockNewBuy: false, low, stop };
   }
   if (low === null || low <= 0 || !Number.isFinite(time)) {
-    return { state: 'UNVERIFIED', blockNewBuy: false, low, stop };
+    return {
+      state: 'UNVERIFIED', blockNewBuy: true, low, stop,
+      reason: 'Official PSX session-low evidence is unavailable. ' +
+        'A fresh short-term BUY cannot be confirmed. WAIT / NO ORDER until ' +
+        'the official session-low check is available.'
+    };
   }
   // PSX official session quotes may remain the latest completed session on
   // holidays/weekends. Avoid treating very old lows as a new live stop event.
   const age = (Date.now() - time) / 86400000;
   if (age < -1 || age > 4) {
-    return { state: 'STALE', blockNewBuy: false, low, stop };
+    return {
+      state: 'STALE', blockNewBuy: true, low, stop,
+      reason: 'Official PSX session-low evidence is stale or dated in the future. ' +
+        'WAIT / NO ORDER until a current official session check is available.'
+    };
   }
   if (low <= stop) {
     return {
@@ -24413,7 +24467,9 @@ function decisionExecutionGuidance(
     const sessionStopCheck = decisionTraderSessionStopCheck(candidate, plan);
     if (sessionStopCheck.blockNewBuy) {
       return {
-        horizon: 'short_term', status: 'WAIT_FOR_RECONFIRMATION',
+        horizon: 'short_term',
+        status: sessionStopCheck.state === 'SESSION_STOP_BREACH'
+          ? 'WAIT_FOR_RECONFIRMATION' : 'WAIT_FOR_SESSION_CHECK',
         action: 'WAIT', orderType: null,
         referencePrice: decisionRound(currentPrice, 2),
         limitPrice: null, maxAcceptablePrice: null,
@@ -25062,7 +25118,7 @@ function professionalShortTermView(
 
   if (sessionStopCheck.blockNewBuy) {
     return {
-      framework: 'SHORT_TERM_TRADER', thesisStatus: 'SESSION_STOP_BREACH',
+      framework: 'SHORT_TERM_TRADER', thesisStatus: sessionStopCheck.state,
       timingScore, timingState: priceAction.timingState, setup, setupFamily,
       rewardRisk, riskScore, riskState: professionalRiskState(riskScore),
       rankingScore, technicalEvidence: traderEvidence, tradePlan,
@@ -25667,6 +25723,48 @@ function buildDecisionOpportunityBoard(
       ),
     all:
       enriched
+  };
+}
+
+// Trader-only UI repair. Never used for scoring or allocation.
+// Keep the original top five, plus every funded BUY, without duplicates.
+function decisionShortTermFundedDisplayBoard(board, allocations) {
+  const original = Array.isArray(board?.priority1) ? board.priority1 : [];
+  const all = Array.isArray(board?.all) ? board.all : [];
+  const bySymbol = new Map(all.filter(x => x?.symbol).map(x => [
+    String(x.symbol).trim().toUpperCase(), x
+  ]));
+  const result = [];
+  const seen = new Set();
+  const push = item => {
+    const symbol = String(item?.symbol || '').trim().toUpperCase();
+    if (!symbol || seen.has(symbol)) return;
+    seen.add(symbol);
+    result.push(item);
+  };
+  for (const allocation of (allocations || [])) {
+    if (!(Number(allocation?.shares) > 0)) continue;
+    const symbol = String(allocation.symbol || '').trim().toUpperCase();
+    const candidate = bySymbol.get(symbol);
+    if (candidate) push(decisionCenterSummary(candidate, 0));
+  }
+  original.forEach(push);
+  const fundedSymbols = new Set(
+    (allocations || []).filter(x => Number(x?.shares) > 0)
+      .map(x => String(x.symbol || '').trim().toUpperCase())
+  );
+  const withoutFunded = list =>
+    (Array.isArray(list) ? list : []).filter(
+      x => !fundedSymbols.has(String(x?.symbol || '').trim().toUpperCase())
+    );
+  const research = withoutFunded(board?.evidenceResearch || board?.researchRequired);
+  return {
+    ...board,
+    priority1: result.map((item, index) => ({ ...item, rank: index + 1 })),
+    priority2: withoutFunded(board?.priority2),
+    evidenceResearch: research,
+    researchRequired: research,
+    avoid: withoutFunded(board?.avoid)
   };
 }
 
@@ -28550,7 +28648,7 @@ function shortTermProfileExecutionDecision(
   const sessionStopCheck = decisionTraderSessionStopCheck(candidate, currentPlan);
   if (sessionStopCheck.blockNewBuy) {
     return {
-      policyId: policy.id, state: 'SESSION_STOP_BREACH', action: 'PASS',
+      policyId: policy.id, state: sessionStopCheck.state, action: 'PASS',
       marketAction: 'WATCH', actionableNow: false, reservationEligible: false,
       sizeMultiplier: 0, sessionStopCheck, reason: sessionStopCheck.reason
     };
@@ -29893,6 +29991,24 @@ function allocateDecisionCenterOpportunities(
     portfolioContext?.sectorValues ||
     {};
 
+  const existingHoldingSymbols = new Set([
+    ...((portfolioContext?.holdings || []).map(holding =>
+      String(holding?.symbol || '').trim().toUpperCase()).filter(Boolean)),
+    ...Object.entries(existingSymbolValues)
+      .filter(([, value]) => (safeNumber(value) || 0) > 0)
+      .map(([symbol]) => String(symbol).trim().toUpperCase())
+  ]);
+  const startingHoldingCount = Math.max(
+    existingHoldingSymbols.size,
+    Number(portfolioContext?.holdingCount || 0)
+  );
+  // Existing small portfolios should not be expanded into more and more
+  // stock names simply to absorb new cash. The absolute ceiling is 8;
+  // under PKR 25k we cap new distinct ownership at 6. No forced sells.
+  const maxDistinctHoldings = traderMode
+    ? null
+    : (postFundingCapitalBasePaisa < 25000 * 100 ? 6 : 8);
+
   let candidates =
     decisionCenterAllocationCandidatePool(
       opportunityBoard,
@@ -30117,6 +30233,15 @@ function allocateDecisionCenterOpportunities(
       Math.max(1, targetPositionCount) *
       100;
 
+  // Only long-term funding uses this approximate per-order fee guard.
+  // A separate cap prevents tiny buys from consuming excessive fee percentage.
+  const entryFeePaisa = traderMode
+    ? 0
+    : Math.round(decisionEstimatedBuyFeePkr() * 100);
+  const maximumEstimatedEntryFeePct = traderMode
+    ? null
+    : decisionMaximumEstimatedEntryFeePct();
+
   const minimumMeaningfulPositionPkr =
     decisionMinimumMeaningfulPositionPkr(
       amount,
@@ -30212,6 +30337,10 @@ function allocateDecisionCenterOpportunities(
           ? 'This plan is intentionally restricted to ' + sectorConstraint + '. Cross-sector diversification is disabled by user choice; stock-level evidence, risk and sizing gates remain active.'
           : null,
       minimumMeaningfulPositionPkr,
+      maxDistinctHoldings,
+      estimatedFeePerOrderPkr: traderMode ? null : entryFeePaisa / 100,
+      maximumEstimatedEntryFeePct,
+      estimatedBuyFeesPkr: 0,
       smallCapitalWholeShareMode,
       marketableLotPolicy:
         'PSX_REGULAR_ONE_SHARE',
@@ -30277,6 +30406,25 @@ function allocateDecisionCenterOpportunities(
         targetPositionCount
     ) {
       break;
+    }
+
+    if (!traderMode && !existingHoldingSymbols.has(String(candidate.symbol).toUpperCase())) {
+      const newNames = allocations.filter(
+        item => !existingHoldingSymbols.has(String(item.symbol).toUpperCase())
+      ).length;
+      if (startingHoldingCount + newNames >= maxDistinctHoldings) {
+        personalActions.push({
+          symbol: candidate.symbol,
+          marketView: candidate.decisionCenterView,
+          portfolioAction: 'NO_ADD',
+          allocationTier: candidate.allocationTier,
+          existingWeightPct: 0,
+          reason: 'Your portfolio already has ' + (startingHoldingCount + newNames) +
+            ' stock names. NOMAD limits a portfolio below PKR 25,000 to ' +
+            maxDistinctHoldings + ' names and retains cash rather than force another tiny position. Existing holdings can still receive additions when other checks permit.'
+        });
+        continue;
+      }
     }
 
     if (
@@ -30515,7 +30663,7 @@ function allocateDecisionCenterOpportunities(
       Math.max(
         0,
         Math.min(
-          remainingDeploy,
+          Math.max(0, remainingDeploy - entryFeePaisa),
           proportionalTarget,
           stockGap,
           sectorGap,
@@ -30637,8 +30785,28 @@ function allocateDecisionCenterOpportunities(
       shares *
       pricePaisa;
 
-    remainingDeploy -=
-      spent;
+    const entryFeeCheck = shortTermCandidate
+      ? null
+      : decisionEntryFeeEconomics(spent / 100, entryFeePaisa / 100);
+    if (entryFeeCheck && !entryFeeCheck.passes) {
+      personalActions.push({
+        symbol: candidate.symbol,
+        marketView: candidate.decisionCenterView,
+        portfolioAction: 'NO_ADD',
+        allocationTier: candidate.allocationTier,
+        existingWeightPct: decisionRound(existingStockWeightPct, 2),
+        targetWeightPct: decisionRound(stockTotalCap / Math.max(1, postFundingCapitalBasePaisa) * 100, 2),
+        reason: 'Ranked, but this order is too small after estimated buy charges: PKR ' +
+          entryFeeCheck.estimatedFeePkr + ' (~' + entryFeeCheck.estimatedFeePct +
+          '% of PKR ' + decisionRound(spent / 100, 2) + '). NOMAD limits estimated entry fees to ' +
+          entryFeeCheck.maximumFeePct + '% per ticket. Keep cash or increase the investment amount; broker fees may differ.'
+      });
+      continue;
+    }
+
+    // Reserve the estimated order fee alongside principal. This is a
+    // feasibility estimate, not a broker quote or a change to cost basis.
+    remainingDeploy -= spent + entryFeePaisa;
 
     sectorSpent.set(
       candidate.sector,
@@ -30746,6 +30914,10 @@ function allocateDecisionCenterOpportunities(
           100,
           2
         ),
+      estimatedEntryFeePkr:
+        shortTermCandidate ? null : entryFeeCheck.estimatedFeePkr,
+      estimatedEntryFeePct:
+        shortTermCandidate ? null : entryFeeCheck.estimatedFeePct,
       targetWeightPct:
         decisionRound(
           stockTotalCap /
@@ -31042,6 +31214,11 @@ function allocateDecisionCenterOpportunities(
             100,
           2
         );
+      if (!traderMode) {
+        const feeReview = decisionEntryFeeEconomics(allocation.principalPkr, entryFeePaisa / 100);
+        allocation.estimatedEntryFeePkr = feeReview.estimatedFeePkr;
+        allocation.estimatedEntryFeePct = feeReview.estimatedFeePct;
+      }
       allocation.newMoneyWeightPct =
         decisionRound(
           allocation.principalPkr /
@@ -31083,6 +31260,10 @@ function allocateDecisionCenterOpportunities(
       }
     }
   }
+
+  const estimatedBuyFeesPaisa = traderMode
+    ? 0
+    : entryFeePaisa * allocations.length;
 
   const investedPaisa =
     allocations.reduce(
@@ -31130,10 +31311,14 @@ function allocateDecisionCenterOpportunities(
         ' passed the professional allocation gate after deeper research. NOMAD will not force a weaker third position; the remainder stays in cash.';
     } else {
       diversificationExceptionReason =
-        'At least three actionable stocks passed research, but whole-share affordability, existing holdings, stock caps, or sector caps prevented three prudent funded positions. NOMAD retains the remainder in cash rather than forcing exposure.';
+        'At least three actionable stocks passed research, but whole-share affordability, estimated buy fees, existing holdings or diversification caps prevented three prudent funded positions. NOMAD retains the remainder in cash rather than forcing exposure.';
     }
   }
 
+  const personalReasonBySymbol = new Map(
+    personalActions.filter(item => item?.symbol && item?.reason)
+      .map(item => [String(item.symbol).toUpperCase(), item.reason])
+  );
   const unfundedPriorityOne =
     candidates
       .filter(
@@ -31151,9 +31336,10 @@ function allocateDecisionCenterOpportunities(
           price:
             candidate.price,
           reason:
-            Boolean(portfolioContext?.holdingCount)
-              ? 'Priority 1 remains valid, but your existing holding/sector exposure or whole-share feasibility leaves no prudent room to add it with this capital.'
-              : 'Priority 1 remains valid, but whole-share feasibility or the dynamic diversification cap prevents a prudent allocation with this amount.'
+            personalReasonBySymbol.get(String(candidate.symbol).toUpperCase()) ||
+            (Boolean(portfolioContext?.holdingCount)
+              ? 'Priority 1 remains valid, but existing stock/sector exposure, entry fees, affordability or funding order leaves no prudent room to add it.'
+              : 'Priority 1 remains valid, but portfolio, price, fee and whole-share caps prevent a prudent allocation with this amount.')
       }));
 
   return {
@@ -31169,7 +31355,8 @@ function allocateDecisionCenterOpportunities(
         Math.max(
           0,
           budgetPaisa -
-            investedPaisa
+            investedPaisa -
+            estimatedBuyFeesPaisa
         ) /
         100,
         2
@@ -31183,6 +31370,11 @@ function allocateDecisionCenterOpportunities(
           : 0,
         2
       ),
+    estimatedBuyFeesPkr:
+      traderMode ? null : decisionRound(estimatedBuyFeesPaisa / 100, 2),
+    estimatedFeePerOrderPkr:
+      traderMode ? null : entryFeePaisa / 100,
+    maximumEstimatedEntryFeePct,
     deploymentCapPct:
       deploymentPlan.targetDeploymentPct,
     portfolioAware:
@@ -31253,12 +31445,46 @@ function allocateDecisionCenterOpportunities(
         ? 'This plan is intentionally restricted to ' + sectorConstraint + '. Cross-sector diversification is disabled by user choice; stock-level evidence, risk and sizing gates remain active.'
         : null,
     minimumMeaningfulPositionPkr,
+    maxDistinctHoldings,
     smallCapitalWholeShareMode,
     marketableLotPolicy:
       'PSX_REGULAR_ONE_SHARE',
     unfundedPriorityOne,
     personalActions
   };
+}
+
+// Explain holdings versus newly funded orders without changing any rankings.
+// A HOLD is a separate ownership decision, not a promise to add more capital.
+function decisionLongTermHoldingFundingExplanations(portfolioContext, opportunityBoard, allocation) {
+  const holdings = Array.isArray(portfolioContext?.holdings) ? portfolioContext.holdings : [];
+  const all = Array.isArray(opportunityBoard?.all) ? opportunityBoard.all : [];
+  const candidates = new Map(all.filter(item => item?.symbol)
+    .map(item => [String(item.symbol).toUpperCase(), item]));
+  const funded = new Map((allocation?.allocations || [])
+    .filter(item => Number(item?.shares) > 0)
+    .map(item => [String(item.symbol).toUpperCase(), item]));
+  const personal = new Map((allocation?.personalActions || [])
+    .filter(item => item?.symbol).map(item => [String(item.symbol).toUpperCase(), item]));
+  return holdings.map(holding => {
+    const symbol = String(holding.symbol || '').toUpperCase();
+    const fundedOrder = funded.get(symbol);
+    const actionable = candidates.get(symbol);
+    const action = personal.get(symbol);
+    let reason;
+    if (fundedOrder) {
+      reason = 'New money funded: ' + fundedOrder.shares + ' shares. This is separate from holding existing shares.';
+    } else if (action?.reason) {
+      reason = action.reason;
+    } else if (!actionable) {
+      reason = 'This holding is reviewed for ownership, but it was not selected in the current comparable new-money shortlist. A HOLD does not create a new BUY order.';
+    } else if (!decisionExecutionAllowsAllocation(actionable.executionGuidance || {})) {
+      reason = 'Not a new-money order: ' + (actionable.executionGuidance?.reason || 'the current entry or evidence gate does not permit allocation.');
+    } else {
+      reason = 'Eligible as a market opportunity but not funded within this budget and the ranked funding shortlist. Existing stock/sector exposure, order size and higher-ranked opportunities may consume available capacity.';
+    }
+    return { symbol, funded: Boolean(fundedOrder), reason };
+  });
 }
 
 async function decisionMapWithConcurrency(
@@ -34382,6 +34608,10 @@ async function runDecisionLab(
       }
     );
 
+  const holdingFundingExplanations = horizon === 'long_term'
+    ? decisionLongTermHoldingFundingExplanations(portfolioContext, opportunityBoard, allocation)
+    : [];
+
   const shortTermTriggerPlan =
     horizon === 'short_term'
       ? buildShortTermTriggerPlan(
@@ -34401,6 +34631,13 @@ async function runDecisionLab(
           riskPolicy
         )
       : null;
+
+  // 0.9.6.16.9: presentation only. The allocation above is already final.
+  // Include any funded Trader opportunity omitted by the five-card shortlist.
+  // Investor (long-term) cards and the allocator keep their original inputs.
+  const displayOpportunityBoard = horizon === 'short_term'
+    ? decisionShortTermFundedDisplayBoard(opportunityBoard, allocation.allocations)
+    : opportunityBoard;
 
   let action = 'WATCH';
   let headline =
@@ -34803,6 +35040,7 @@ async function runDecisionLab(
       reason,
       amountInvestedPkr:
         allocation.amountInvestedPkr,
+      estimatedBuyFeesPkr: allocation.estimatedBuyFeesPkr,
       cashRemainingPkr:
         allocation.cashRemainingPkr,
       investedPct:
@@ -34819,15 +35057,15 @@ async function runDecisionLab(
     shortTermStability,
     opportunityBoard: {
       priority1:
-        opportunityBoard.priority1,
+        displayOpportunityBoard.priority1,
       priority2:
-        opportunityBoard.priority2,
+        displayOpportunityBoard.priority2,
       evidenceResearch:
-        opportunityBoard.evidenceResearch,
+        displayOpportunityBoard.evidenceResearch,
       researchRequired:
-        opportunityBoard.evidenceResearch,
+        displayOpportunityBoard.evidenceResearch,
       avoid:
-        opportunityBoard.avoid
+        displayOpportunityBoard.avoid
     },
     allocationDiagnostics: {
       deploymentCapPct:
@@ -34893,6 +35131,10 @@ async function runDecisionLab(
       minimumMeaningfulPositionPkr:
         allocation.minimumMeaningfulPositionPkr ||
         0,
+      estimatedBuyFeesPkr: allocation.estimatedBuyFeesPkr,
+      estimatedFeePerOrderPkr: allocation.estimatedFeePerOrderPkr,
+      maximumEstimatedEntryFeePct: allocation.maximumEstimatedEntryFeePct,
+      maxDistinctHoldings: allocation.maxDistinctHoldings,
       marketableLotPolicy:
         allocation.marketableLotPolicy ||
         'PSX_REGULAR_ONE_SHARE',
@@ -34900,7 +35142,8 @@ async function runDecisionLab(
         allocation.personalActions ||
         [],
       unfundedPriorityOne:
-        allocation.unfundedPriorityOne
+        allocation.unfundedPriorityOne,
+      holdingFundingExplanations
     },
     portfolioContext: {
       holdingCount:
@@ -34925,7 +35168,7 @@ async function runDecisionLab(
     },
     warnings: [
       'SHADOW MODE: this model has not passed historical and forward validation for real-money use.',
-      'Allocations are planning principals only. Brokerage, levies, taxes and execution slippage are not yet included.',
+      'Allocations are planning principals. Long-term only reserves an estimated minimum buy fee; actual brokerage, levies, taxes, sell charges and slippage may differ.',
       'No order-execution capability exists. The user remains the final decision maker.',
       'Current scoring rules remain supporting evidence only; Priority 1 now also requires the Financial Analyst evidence gate.',
       'Opportunity ranking is independent of the entered budget. Portfolio construction targets at least three funded stocks and scales up to eight, but never forces a weak, unresolved, profile-unsuitable, unaffordable, or portfolio-incompatible name merely to hit the count.',
@@ -35753,10 +35996,11 @@ function runDecisionEngineSelfTests() {
       assert.ok(
         Math.abs(
           hardeningAllocation.amountInvestedPkr +
+          (hardeningAllocation.estimatedBuyFeesPkr || 0) +
           hardeningAllocation.cashRemainingPkr -
           hardeningBudget
         ) <= 0.02,
-        'production allocation accounting must reconcile invested cash plus retained cash to the entered capital'
+        'production allocation must reconcile invested principal, estimated entry fees and retained cash'
       );
 
       assert.ok(
@@ -35776,6 +36020,33 @@ function runDecisionEngineSelfTests() {
       );
     }
   }
+
+  const sixHoldingsFixture = {
+    currentValuePkr: 3000,
+    holdingCount: 6,
+    holdings: ['H1','H2','H3','H4','H5','H6'].map(symbol => ({ symbol })),
+    symbolValues: Object.fromEntries(['H1','H2','H3','H4','H5','H6'].map(symbol => [symbol, 500])),
+    sectorValues: Object.fromEntries(['H1','H2','H3','H4','H5','H6'].map(symbol => [symbol, 500]))
+  };
+  const smallSixHoldingsAllocation = allocateDecisionCenterOpportunities(
+    breadthBoard, 1500, riskBalanced, sixHoldingsFixture
+  );
+  assert.equal(smallSixHoldingsAllocation.allocations.length, 0,
+    'Small portfolios with six existing symbols must not expand into seventh and eighth names');
+  assert.equal(smallSixHoldingsAllocation.maxDistinctHoldings, 6);
+  assert.equal(
+    decisionLongTermHoldingFundingExplanations(
+      sixHoldingsFixture, breadthBoard, smallSixHoldingsAllocation
+    ).length,
+    6,
+    'Every owned stock needs a funding explanation even when excluded from the new-money shortlist'
+  );
+
+  assert.equal(decisionEntryFeeEconomics(209.20, 5.5).passes, false,
+    'A single small-capital share must not pass when estimated entry costs exceed the configured ceiling');
+  assert.equal(decisionEntryFeeEconomics(500, 5.5).passes, true,
+    'A meaningful whole-share position must remain feasible under the estimated fee guard');
+  assert.ok(hardeningBudgets.every(value => value > 0), 'test budget matrix remains valid');
 
   const smallCapitalBroadAllocation =
     allocateDecisionCenterOpportunities(
@@ -36209,6 +36480,9 @@ function runDecisionEngineSelfTests() {
     decisionCanonicalCompanyState({
       ...longTermProfessionalCandidate,
       horizon: 'short_term',
+      // Verified official session data is required for an actionable Trader test.
+      officialSessionLow: 98,
+      officialSessionAsOf: new Date().toISOString(),
       historicalContext: {
         available: true,
         contextSchemaVersion:
@@ -36307,6 +36581,8 @@ function runDecisionEngineSelfTests() {
     ...longTermProfessionalCandidate,
     horizon: 'short_term',
     price: 113,
+    officialSessionLow: 104,
+    officialSessionAsOf: new Date().toISOString(),
     averageVolume30d: 500000,
     entry: { score: 82 },
     risk: { score: 72, liquidityScore: 85 },
@@ -37513,10 +37789,19 @@ function runDecisionEngineSelfTests() {
   }, intradayItanzFixture.historicalContext.priceAction.tradePlan).state, 'UNVERIFIED',
     'Missing official low must never be fabricated');
   assert.equal(decisionTraderSessionStopCheck({
+    ...intradayItanzFixture, officialSessionLow: null
+  }, intradayItanzFixture.historicalContext.priceAction.tradePlan).blockNewBuy, true,
+    'Missing official low must block an unqualified new Trader BUY');
+  assert.equal(decisionTraderSessionStopCheck({
     ...intradayItanzFixture, officialSessionLow: 35.50,
     officialSessionAsOf: '2020-01-01T10:00:00Z'
-  }, intradayItanzFixture.historicalContext.priceAction.tradePlan).blockNewBuy, false,
-    'Stale quote lows must not be treated as a new stop event');
+  }, intradayItanzFixture.historicalContext.priceAction.tradePlan).state, 'STALE',
+    'Stale quote lows must not be treated as a fresh breach');
+  assert.equal(decisionTraderSessionStopCheck({
+    ...intradayItanzFixture, officialSessionLow: 35.50,
+    officialSessionAsOf: '2020-01-01T10:00:00Z'
+  }, intradayItanzFixture.historicalContext.priceAction.tradePlan).blockNewBuy, true,
+    'Stale quote lows also cannot authorize a fresh Trader BUY');
   const guardedFixture = {
     ...intradayItanzFixture, horizon: 'short_term',
     profileSuitability: { state: 'SUITABLE', issues: [] },
@@ -37532,6 +37817,36 @@ function runDecisionEngineSelfTests() {
     null, 'Stop-breached stock cannot carry a limit order');
   assert.equal(shortTermProfileExecutionDecision(guardedFixture, riskAggressive).actionableNow,
     false, 'Aggressive profile must not override official session stop safety');
+
+  const fundedDisplayFixture = decisionShortTermFundedDisplayBoard({
+    priority1: [
+      { symbol: 'AAA', rank: 1 }, { symbol: 'BBB', rank: 2 }
+    ],
+    priority2: [{ symbol: 'PACE', rank: 1 }],
+    all: [
+      { symbol: 'AAA' }, { symbol: 'BBB' }, {
+        symbol: 'PACE', companyName: 'PACE', price: 9.15,
+        canonicalState: { marketAction: 'BUY', opportunityTier: 'PRIORITY_1',
+          professional: { framework: 'SHORT_TERM_TRADER' },
+          evidence: {} }
+      }
+    ]
+  }, [{ symbol: 'PACE', shares: 44, principalPkr: 404 }]);
+  assert.deepEqual(fundedDisplayFixture.priority1.map(x => x.symbol),
+    ['PACE', 'AAA', 'BBB'], 'Funded PACE must be visible ahead of truncated Trader cards');
+  assert.equal(fundedDisplayFixture.priority1.filter(x => x.symbol === 'PACE').length, 1,
+    'Funded Trader stock must not be duplicated in Action Now');
+  assert.equal(fundedDisplayFixture.priority2.some(x => x.symbol === 'PACE'), false,
+    'A funded Trader stock cannot also remain in Ready Setups');
+  const unverifiedFixture = {
+    ...guardedFixture, officialSessionLow: null
+  };
+  assert.equal(decisionExecutionGuidance(unverifiedFixture, riskAggressive).orderType, null,
+    'Unverified Trader session cannot display an executable limit order');
+  assert.equal(decisionExecutionGuidance(unverifiedFixture, riskAggressive).status,
+    'WAIT_FOR_SESSION_CHECK', 'Unverified Trader session must say WAIT');
+  assert.equal(shortTermProfileExecutionDecision(unverifiedFixture, riskAggressive).actionableNow,
+    false, 'Unverified session must block Trader funding even for Aggressive');
 
   console.log(
     'NOMAD Decision Engine self-tests passed.'
@@ -42190,6 +42505,8 @@ tbody tr:hover {
 
 .portfolioHome {
   margin-top: 8px;
+  max-height: none;
+  overflow: visible;
 }
 
 .portfolioSummaryStrip {
@@ -42239,6 +42556,13 @@ tbody tr:hover {
 
 .portfolioRow .symbolName {
   font-weight: 800;
+}
+
+.portfolioCostReview {
+  margin-top: 4px;
+  font-size: 10px;
+  color: #f2af69;
+  line-height: 1.35;
 }
 
 .portfolioRow .companyMini {
@@ -48143,10 +48467,8 @@ function renderPortfolioSnapshot(
     '</div>' +
     '<div class="portfolioRows">';
 
-  const rows =
-    full
-      ? holdings
-      : holdings.slice(0, 5);
+  // Home is an overview, not a truncated or internally scrollable shortlist.
+  const rows = holdings;
 
   html +=
     rows
@@ -48208,7 +48530,13 @@ function renderPortfolioSnapshot(
                   '%'
                 : ''
             ) +
-            '</span></div>' +
+            '</span>' +
+            (Number.isFinite(Number(item.totalPnlPct)) && Number(item.totalPnlPct) <= -15
+              ? '<div class="portfolioCostReview">COST-BASIS REVIEW: ' +
+                formatNumber(Math.abs(Number(item.totalPnlPct)), 1) +
+                '% below recorded cost</div>'
+              : '') +
+            '</div>' +
             '<div class="hideMobile">' +
             formatNumber(
               item.quantity,
@@ -57951,7 +58279,7 @@ function renderOpportunityList(
               : '';
 
         const fundedAllocation =
-          !isShortTerm && item?.symbol
+          item?.symbol
             ? decisionFundedAllocationBySymbol.get(
                 String(item.symbol).trim().toUpperCase()
               ) || null
@@ -57996,7 +58324,7 @@ function renderOpportunityList(
                       '</strong><span>' +
                       escapeHtml(
                         isShortTerm
-                          ? 'LIMIT ORDER'
+                          ? (fundedShares > 0 ? longTermOrderLabel : 'NO ORDER IN THIS PLAN')
                           : longTermOrderLabel
                       ) +
                       '</span></div>' +
@@ -58015,7 +58343,7 @@ function renderOpportunityList(
                             escapeHtml(
                               executionGuidance.suggestedLimitStatus === 'AVAILABLE'
                                 ? 'Preferred bid, fill not guaranteed'
-                                : 'Do not use MAX BUY as the bid'
+                                : (executionGuidance.suggestedLimitReason || 'Insufficient fresh evidence for a preferred bid; MAX BUY is not the bid')
                             ) +
                             '</small></div>'
                           : ''
@@ -58027,7 +58355,7 @@ function renderOpportunityList(
                       ) +
                       '</strong><em>' +
                       escapeHtml(
-                        !isShortTerm && fundedShares > 0
+                        fundedShares > 0
                           ? (
                               formatNumber(fundedShares, 0) +
                               ' shares funded' +
@@ -58040,7 +58368,7 @@ function renderOpportunityList(
                             )
                           : !isShortTerm
                             ? 'Approved entry ceiling; this capital plan did not fund an order for this stock.'
-                            : 'Do not place an order above this price'
+                            : 'No funded order in this plan; do not treat the MAX BUY ceiling as a bid.'
                       ) +
                       '</em></div></div>'
                     )
@@ -58565,10 +58893,11 @@ function renderStockStrategy(
       html += '<p class="strategyReason"><strong>Session stop check:</strong> ' +
         escapeHtml(result?.sessionSafety?.reason || 'Wait for fresh confirmation.') +
         '</p>';
-    } else if (result?.sessionSafety?.state === 'UNVERIFIED') {
+    } else if (['UNVERIFIED', 'STALE'].includes(result?.sessionSafety?.state)) {
       html += '<p class="strategyReason"><strong>Session stop check:</strong> ' +
-        'Official PSX session low could not be verified for this setup. ' +
-        'Do not treat the snapshot alone as independent stop-safety confirmation.</p>';
+        escapeHtml(result?.sessionSafety?.reason ||
+          'Official PSX session-low evidence is unverified. WAIT / NO ORDER.') +
+        '</p>';
     }
   }
 
@@ -59260,6 +59589,14 @@ function renderOwnershipContinuity(
             item.longTermIntelligence
           ) +
           (
+            Number.isFinite(Number(item?.exitIntelligence?.returnPct)) &&
+            Number(item.exitIntelligence.returnPct) <= -15
+              ? '<div class="ownershipExitMeta"><span>COST-BASIS RISK REVIEW</span><strong>Down ' +
+                formatNumber(Math.abs(Number(item.exitIntelligence.returnPct)), 2) +
+                '% versus recorded average cost</strong><em>Reassess earnings, leverage, recent disclosures and position size. A HOLD verdict is not a guarantee of recovery; the loss alone is not an automatic sell instruction.</em></div>'
+              : ''
+          ) +
+          (
             item.exitIntelligence
               ? '<div class="ownershipExitMeta"><span>LONG-TERM EXIT CHECK</span><strong>Trend ' +
                 escapeHtml(
@@ -59694,6 +60031,10 @@ function homeDecisionSummaryData(
     priority2Count:
       (board.priority2 || [])
         .length,
+    estimatedBuyFeesPkr:
+      result?.input?.horizon === 'long_term'
+        ? (result?.allocationDiagnostics?.estimatedBuyFeesPkr ?? null)
+        : null,
     researchCount:
       (board.researchRequired || [])
         .length
@@ -59744,7 +60085,11 @@ function renderHomeDecisionSummary(
       summary.cash,
       0
     ) +
-    ' cash · Priority 2: ' +
+    ' cash' +
+    (summary.estimatedBuyFeesPkr !== null && summary.estimatedBuyFeesPkr !== undefined
+      ? ' · Est. buy fees PKR ' + formatNumber(summary.estimatedBuyFeesPkr, 2)
+      : '') +
+    ' · Priority 2: ' +
     formatNumber(
       summary.priority2Count,
       0
@@ -60087,7 +60432,7 @@ function renderShadowDecision(
           0
         ) +
         '</strong></div>'
-      : '<div class="moneyCash"><span>Cash retained</span><strong>PKR ' +
+      : '<div class="moneyCash"><span>Cash retained after est. buy fees</span><strong>PKR ' +
         formatNumber(
           decision.cashRemainingPkr ||
           0,
@@ -60212,6 +60557,18 @@ function renderShadowDecision(
             '.'
       ) +
       '</div>';
+
+    if (result?.input?.horizon === 'long_term') {
+      html += '<div class="decisionMetaLine"><strong>Estimated order costs:</strong> PKR ' +
+        formatNumber(result?.allocationDiagnostics?.estimatedBuyFeesPkr ?? 0, 2) +
+        ' reserved across funded BUY tickets; provisional minimum fee PKR ' +
+        formatNumber(result?.allocationDiagnostics?.estimatedFeePerOrderPkr ?? 0, 2) +
+        ' each, entry fee ceiling ' +
+        formatNumber(result?.allocationDiagnostics?.maximumEstimatedEntryFeePct ?? 2.0, 2) +
+        '% of position principal. Maximum distinct holdings at this account size: ' +
+        formatNumber(result?.allocationDiagnostics?.maxDistinctHoldings ?? 8, 0) +
+        '. Set NOMAD_ESTIMATED_BUY_FEE_PKR to your actual broker minimum. Taxes, sell fees and slippage remain excluded.</div>';
+    }
 
     if (
       result?.allocationDiagnostics
@@ -60441,7 +60798,7 @@ function renderShadowDecision(
                 escapeHtml(
                   item.executionGuidance.suggestedLimitStatus === 'AVAILABLE'
                     ? 'Preferred bid · not guaranteed'
-                    : 'MAX BUY is not the bid'
+                    : (item.executionGuidance.suggestedLimitReason || 'No verified preferred bid; MAX BUY is not the bid')
                 ) + '</em></div>'
               : ''
           ) +
@@ -60500,19 +60857,29 @@ function renderShadowDecision(
   if (unfunded.length) {
     html +=
       '<div class="decisionMetaLine"><strong>Priority 1 not fitted:</strong> ' +
-      unfunded.map(
-        item =>
-          escapeHtml(
-            item.symbol
-          )
-      ).join(', ') +
-      '. NOMAD kept these ranked instead of replacing them with weaker cheaper stocks.</div>';
+      unfunded.slice(0, 8).map(
+        item => escapeHtml(item.symbol) + ': ' + escapeHtml(item.reason || 'No feasible allocation')
+      ).join(' | ') +
+      '.</div>';
   }
 
   const personalActions =
     result?.allocationDiagnostics
       ?.personalActions ||
     [];
+
+  const holdingFundingExplanations =
+    result?.input?.horizon === 'long_term'
+      ? (result?.allocationDiagnostics?.holdingFundingExplanations || [])
+      : [];
+  if (holdingFundingExplanations.length) {
+    html += '<details class="decisionMethodDetails"><summary>Why my existing stocks were or were not funded</summary><div class="decisionMethodBody">' +
+      holdingFundingExplanations.map(item =>
+        '<div class="decisionMetaLine"><strong>' + escapeHtml(item.symbol) +
+        (item.funded ? ' · FUNDED' : ' · NOT FUNDED') +
+        ':</strong> ' + escapeHtml(item.reason) + '</div>'
+      ).join('') + '</div></details>';
+  }
 
   const existingPortfolioActions =
     personalActions.filter(
@@ -60566,7 +60933,7 @@ function renderShadowDecision(
           )
     ) +
     '</div>' +
-    '<div class="decisionMetaLine">Execution guidance now uses LIMIT ceilings and no-chase/invalidation guards. Brokerage, taxes and exchange charges are not included yet; confirm the final order cost before execution. This remains shadow decision intelligence.</div>';
+    '<div class="decisionMetaLine">Execution guidance uses LIMIT ceilings and no-chase/invalidation guards. Long-term capital plans reserve an estimated minimum buy fee and reject fee-heavy tiny tickets; actual broker charges, sell costs, taxes, levies and slippage are not guaranteed. This remains shadow decision intelligence.</div>';
 
   target.innerHTML =
     html;
